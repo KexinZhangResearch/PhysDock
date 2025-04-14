@@ -1,0 +1,8 @@
+c1cccc(c1C#N)[N-]C(=O)c2cc(ccc2)NC(=O)C(C)C
+c1cccc(c1C#N)NC(=S)NC(=O)c2ccc(o2)-c3ccc(Br)cc3
+c1cccc(c1C#N)NC(=S)[N-]C(=O)c2ccc(o2)-c3ccc(Br)cc3
+c1cccc(c1C#N)Sc(cccc2)c2C(=O)Nc(c3C(F)(F)F)cccc3
+c1cccc(c1C(=O)C)NC(=O)C2CCCCC2
+c1cccc(c1C(=O)N)NC(=O)/C=C/c2cccc(c23)cccc3
+c1cccc(c1C(=O)N)NC(=O)Cc2cccc(c23)cccc3
+c1cccc(c1C(=O)N)NC(=O)c2cc(Cl)c(cc2)OC

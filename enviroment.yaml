@@ -1,0 +1,38 @@
+name: PhysDock
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - openmmforcefields
+  - openff-toolkit
+  - pdbfixer
+  - pip:
+      - torch
+      - torchvision
+      - torchaudio
+      - numpy
+      - pandas
+      - scipy
+      - matplotlib
+      - accelerate
+      - diffusers
+      - transformers
+      - tokenizers
+      - einops
+      - deepspeed
+      - huggingface-hub
+      - lightning
+      - numba
+      - sympy
+      - wandb
+      - lmdb
+      - scikit-learn
+      - absl-py==2.1.0
+      - biopython==1.84
+      - dm-tree==0.1.8
+      - rdkit==2024.3.3
+      - ml-collections==0.1.1
+      - typing_extensions==4.11.0
+      - posebusters
+      - mdtraj
+      - OpenMM==8.2.0
