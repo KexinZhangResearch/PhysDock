@@ -283,7 +283,7 @@ class FeatureLoader:
 
         chain_feature_update = {
             "x_gt": x_gt,
-            "atom_id_to_conformer_atom_id": atom_id_to_conformer_atom_id,
+            "c": atom_id_to_conformer_atom_id,
             "residue_index": residue_index,
             "conformer_id_to_chunk_sizes": conformer_id_to_chunk_sizes,
             "restype": restype,
