@@ -1,4 +1,4 @@
-# PhysDock: Physics-Guided All-Atom Diffusion Model for Accurate Protein-Ligand Complex Prediction
+# PhysDock: A Physics-Guided All-Atom Diffusion Model for Accurate Protein-Ligand Complex Prediction
 
 ---
 
@@ -13,13 +13,13 @@
 ****************************************************************************
 ```
 
+`PhysDock` is a **physics-guided** **all-atom** **denoising diffusion model** designed for predicting flexible protein-ligand complex structures. 
 
+This repo is Implemented by KexinZhang (zhangkx2022@shanghaitech.edu.cn) & JialeYu (yujl2022@shanghaitech.edu.cn).
 
-Implemented by KexinZhang (zhangkx2022@shanghaitech.edu.cn) & JialeYu (yujl2022@shanghaitech.edu.cn).
+## Overview
 
-## Introduction
-
-PhysDock is a non-equivariant **physics-guided** all-atom denoising diffusion model designed for predicting flexible protein-ligand complex structures. The architechture is inspired by **AlphaFold3**, Llama3 and **StableDiffusion3**.
+PhysDock is a non-equivariant **physics-guided** all-atom denoising diffusion model designed for predicting flexible protein-ligand complex structures. 
 
 ![](./figs/PhysDockOverview.png)
 
@@ -169,7 +169,19 @@ sh scripts/download_dataset.sh
 
 ## Citation
 
-To be continued.
+If you want to cite this work, please use the following `bibtex`
 
+```text
+@article{zhang2025physdock,
+  title={PhysDock: A Physics-Guided All-Atom Diffusion Model for Protein-Ligand Complex Prediction},
+  author={Zhang, Kexin and Ma, Yuanyuan and Yu, Jiale and Luo, Huiting and Lin, Jinyu and Qin, Yifan and Li, Xiangcheng and Jiang, Qian and Bai, Fang and Dou, Jiayi and others},
+  journal={bioRxiv},
+  pages={2025--04},
+  year={2025},
+  publisher={Cold Spring Harbor Laboratory}
+}
+```
 
+### License
 
+[MIT License](./License)
