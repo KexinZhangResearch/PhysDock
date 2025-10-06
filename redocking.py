@@ -196,12 +196,12 @@ def redocking(
                         ref_mol_num_error = True
 
                     weights = (tensors["s_mask"] * tensors["is_protein"])[tensors["atom_id_to_token_id"].long()]
-                    # if use_pocket:
                     if align_mode == "pocket_ca":
-                        weights = tensors["pocket_res_feat"][tensors["atom_id_to_token_id"].long()] * weights
-                    # else:
-                    #     if align_mode == "pocket_ca":
-                    #         raise NotImplementedError()
+                        if use_pocket:
+                            weights = tensors["pocket_res_feat"][tensors["atom_id_to_token_id"].long()] * weights
+                    else:
+                        # if align_mode == "pocket_ca":
+                        raise NotImplementedError()
 
                     x_gt = tensors["x_gt"][None]
                     os.makedirs(f"{output_dir}/{sample_id}", exist_ok=True)

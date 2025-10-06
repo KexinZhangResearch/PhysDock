@@ -1,0 +1,11 @@
+python ./screening.py \
+  -i /home/zhangkexin/Downloads/test_cache/3lck_noshift/systems/Apo_3LCK_A_1.pkl.gz \
+  -f /home/zhangkexin/Downloads/test_cache/features \
+  -s /home/zhangkexin/Downloads/test_cache/LHL.txt \
+   --max_samples 10 \
+   --max_rounds 5 \
+   --num_samples_per_round 20 \
+    --enable_ranking \
+     --enable_sidechain_relaxation \
+      --enable_physics_correction \
+      --output_dir ./no_pocket_no_shift
