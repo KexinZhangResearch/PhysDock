@@ -114,8 +114,7 @@ python -m torch.distributed.run \
   --use-bf16 \
   --interaction-aware \
   --templ-dim 40 \
-  --compile
-
+#  --compile
 
 # --reset-optimizer \
 # --init-from-ckpt /2022133002/zkx/stfold/stfold_v7.1.4/tasks/ligand_af3_fp32/output/checkpoint_1_11500.pt \
