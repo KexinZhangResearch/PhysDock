@@ -1,8 +1,8 @@
 BASE=$(dirname $0)
 
 python $BASE/redocking.py \
-  -i $BASE/demo/redocking/Posebusters_subset \
-  -f $BASE/demo/redocking/features \
+  -i $BASE/data/demo/redocking/Posebusters_subset \
+  -f $BASE/data/demo/redocking/features \
   --max_samples 40 \
   --max_rounds 5 \
   --num_samples_per_round 20 \

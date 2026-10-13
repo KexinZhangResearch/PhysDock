@@ -202,3 +202,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 params/params.pt
+out/
+
+# Downloaded data (scripts/download_*.py): everything under data/ is ignored except the bundled demo and the CCD metadata
+
+data/*
+!data/demo/
+!data/ccd_id_meta_data.pkl.gz

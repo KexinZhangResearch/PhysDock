@@ -35,8 +35,10 @@ Currently, PhysDock supports **multi protein chains** and **only one small molec
 # Install Bio Tools
 apt install hhsuite hmmer
 
-# Download Databases
-sh scripts/download_homo_datasets.sh <target_databases> # For example, $HOME/libs
+# Download Databases (UniRef90, MGnify, UniProt, Uniclust30, BFD) -> data/homo_data
+# ~465 GB download, ~2.3 TB after extraction; parallel, resumable, checksum-verified
+python scripts/download_homo_data.py                       # all five
+python scripts/download_homo_data.py --only uniref90 bfd   # or a subset
 ```
 
 * We provide a conda `.yaml` file to create environment to run PhysDock
@@ -49,13 +51,23 @@ conda env create -f enviroment.yaml
 conda activate PhysDock
 ```
 
-* Download model params from zenedo and move it to `params` dir.
+* Download model params from Zenodo into `data/params` (`--link` makes `params/params.pt`, which the
+  inference scripts load, a symlink to the download).
 
 ```shell
-# Download latest EMA Params
-cd params
-wget https://zenodo.org/records/15178859/files/params.pt
+# Download latest EMA Params (params.pt) and the params used in the paper (params_2418.pt)
+python scripts/download_params.py --link
 ```
+
+All `scripts/download_*.py` share the same engine (`scripts/downloader.py`): every file is fetched with up to
+`--workers` (default 96) parallel connections, each fetching small byte ranges, progress is checkpointed so an interrupted run resumes when
+the same command is re-executed, every file is verified against the checksum published by its host (md5, or
+crc32c / gzip-CRC where that is all the host provides), and archives are merged/extracted as soon as they are
+verified. Source archives are kept under `data/<section>/tmp` unless `--delete-archives` is given. Use
+`--dry-run` to see what would be downloaded and `python scripts/download_all.py` to fetch params, benchmarks and
+the training dataset at once (`--all` adds the sequence databases). Everything lands in `<repo>/data`; only
+`data/demo` is tracked by git.
+`pip install google-crc32c` enables fast crc32c verification of the MGnify database.
 
 ## Inference
 
@@ -74,20 +86,20 @@ BASE=$(dirname $0)
 # The receptor pdb and ligand sdf and ligand CCD id are inputs.
 # The output is a system `pkl.gz`
 python $BASE/prepare_system.py \
-  --receptor_pdb_path $BASE/demo/system_preparation/receptor.pdb \
-  --ligand_sdf_path $BASE/demo/system_preparation/EJQ.sdf \
+  --receptor_pdb_path $BASE/data/demo/system_preparation/receptor.pdb \
+  --ligand_sdf_path $BASE/data/demo/system_preparation/EJQ.sdf \
   --ligand_ccd_id EJQ \
-  --systems_dir $BASE/demo/system_preparation/systems
+  --systems_dir $BASE/data/demo/system_preparation/systems
 
 # Get MSA features
 python $BASE/run_homo_search.py \
-  --input_fasta_path $BASE/demo/system_preparation/systems/fastas \
-  --features_dir $BASE/demo/system_preparation/features \
-  --bfd_database_path <target_databases>/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt \
-  --uniclust30_database_path <target_databases>/uniclust30/uniclust30_2018_08/uniclust30_2018_08 \
-  --uniref90_database_path <target_databases>/uniref90.fasta \
-  --mgnify_database_path <target_databases>/mgy_clusters.fa \
-  --uniprot_database_path <target_databases>/uniprot.fasta \
+  --input_fasta_path $BASE/data/demo/system_preparation/systems/fastas \
+  --features_dir $BASE/data/demo/system_preparation/features \
+  --bfd_database_path $BASE/data/homo_data/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt \
+  --uniclust30_database_path $BASE/data/homo_data/uniclust30/uniclust30_2018_08/uniclust30_2018_08 \
+  --uniref90_database_path $BASE/data/homo_data/uniref90.fasta \
+  --mgnify_database_path $BASE/data/homo_data/mgy_clusters_2022_05.fa \
+  --uniprot_database_path $BASE/data/homo_data/uniprot.fasta \
   --jackhmmer_binary_path /usr/bin/jackhmmer \
   --hhblits_binary_path /usr/bin/hhblits
 
@@ -107,8 +119,8 @@ sh redocking_demo.sh
 BASE=$(dirname $0)
 
 python $BASE/redocking.py \
-  -i $BASE/examples/demo/Posebusters_subset \
-  -f $BASE/examples/demo/features \
+  -i $BASE/data/demo/redocking/Posebusters_subset \
+  -f $BASE/data/demo/redocking/features \
   --crop_size 256 \
   --atom_crop_size 2048 \
   --enable_physics_correction \
@@ -156,13 +168,16 @@ The training dataset, the preprocessed benchmark dataset, and the prediction res
 
 ```shell
 # Download all the preprocessed benchmark dataset including Posebusters, DeepDockingDare and PhiBench.
-sh scripts/download_benchmarks.sh
+# -> data/benchmarks/{PoseBusters,DeepDockingDare,PhiBench,features}
+python scripts/download_benchmarks.py
 ```
 
 * The training and validation dataset can be download by the following scripts
 
 ```shell
-sh scripts/download_dataset.sh
+# -> data/v1/{train_val, train_val_samples_weights.json, msa_features, uniprot_msa_features}  (~145 GB)
+python scripts/download_dataset.py
+python scripts/download_dataset.py --only train_val weights   # or a subset
 ```
 
 

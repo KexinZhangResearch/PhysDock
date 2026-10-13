@@ -3,16 +3,16 @@ BASE=$(dirname $0)
 
 # Generate systems pkl.gz
 python $BASE/prepare_system.py \
-  --receptor_pdb_path $BASE/demo/system_preparation/receptor.pdb \
-  --ligand_sdf_path $BASE/demo/system_preparation/EJQ.sdf \
+  --receptor_pdb_path $BASE/data/demo/system_preparation/receptor.pdb \
+  --ligand_sdf_path $BASE/data/demo/system_preparation/EJQ.sdf \
   --ligand_ccd_id EJQ \
-  --systems_dir $BASE/demo/system_preparation/systems
+  --systems_dir $BASE/data/demo/system_preparation/systems
 
 #
 # Get MSA features
 python $BASE/run_homo_search.py \
-  --input_fasta_path $BASE/demo/system_preparation/systems/fastas \
-  --features_dir $BASE/demo/system_preparation/features \
+  --input_fasta_path $BASE/data/demo/system_preparation/systems/fastas \
+  --features_dir $BASE/data/demo/system_preparation/features \
   --bfd_database_path /2022133193/data/libs/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt \
   --uniclust30_database_path /2022133193/data/libs/uniclust30/uniclust30_2018_08/uniclust30_2018_08 \
   --uniref90_database_path /2022133193/data/libs/uniref90.fasta \
@@ -23,8 +23,8 @@ python $BASE/run_homo_search.py \
 
 # Docking
 python $BASE/redocking.py \
-  -i $BASE/demo/system_preparation/systems \
-  -f $BASE/demo/system_preparation/features \
+  -i $BASE/data/demo/system_preparation/systems \
+  -f $BASE/data/demo/system_preparation/features \
   --max_samples 40 \
   --max_rounds 5 \
   --num_samples_per_round 20 \
