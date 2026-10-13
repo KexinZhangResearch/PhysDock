@@ -209,3 +209,6 @@ out/
 data/*
 !data/demo/
 !data/ccd_id_meta_data.pkl.gz
+
+
+third_party/

@@ -30,9 +30,7 @@ The sampling procedure is the one of ``redocking.py``.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import copy
-import importlib
 import json
 import os
 import random
@@ -50,6 +48,7 @@ from rdkit.Geometry import Point3D
 from PhysDock import PhysDock, PhysDockConfig
 from PhysDock.data.constants.PDBData import protein_letters_3to1_extended
 from PhysDock.data.feature_loader import FeatureLoader
+from PhysDock.models.primitives import skip_weight_init
 from PhysDock.utils.io_utils import convert_md5_string, dump_json, dump_txt, load_pkl
 from PhysDock.utils.tensor_utils import weighted_rigid_align
 
@@ -122,25 +121,8 @@ def inspect_system(input_pkl: Path, msa_dir: Path, uniprot_dir: Path):
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
-@contextlib.contextmanager
-def skip_random_weight_init():
-    """``Linear.__init__`` samples a truncated normal with scipy for every weight (~40 s for this 153M-parameter
-    model on 224 cores) and the checkpoint then overwrites all of it.  Skipping that sampling while the model is
-    built leaves the loaded weights untouched (``load_state_dict`` below is strict, so every parameter must come
-    from the checkpoint).  If the name ever disappears this is a harmless no-op."""
-    linear = importlib.import_module("PhysDock.models.primitives.linear")
-    original = getattr(linear, "trunc_normal_init_", None)
-    if original is not None:
-        linear.trunc_normal_init_ = lambda *args, **kwargs: None
-    try:
-        yield
-    finally:
-        if original is not None:
-            linear.trunc_normal_init_ = original
-
-
 def load_model(params_path: Path, device: torch.device) -> PhysDock:
-    with skip_random_weight_init():
+    with skip_weight_init():   # random init (~40 s) is pointless: the strict load below overwrites everything
         model = PhysDock(PhysDockConfig(model_name="medium"))
     state = torch.load(str(params_path), map_location="cpu", weights_only=False)
     state = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in state.items()}

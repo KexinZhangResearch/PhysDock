@@ -1,35 +1,39 @@
-# Modified from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/embeddings.py
+"""Sinusoidal timestep embeddings followed by a small MLP (adapted from HuggingFace ``diffusers``)."""
+from __future__ import annotations
 
 import math
+from typing import Callable, Dict, Optional
+
 import torch
 import torch.nn as nn
 
-from typing import Optional
+__all__ = ["get_activation", "get_timestep_embedding", "Timesteps", "TimestepEmbedding", "TimestepEmbeddings"]
 
-ACTIVATION_FUNCTIONS = {
-    "swish": nn.SiLU(),
-    "silu": nn.SiLU(),
-    "mish": nn.Mish(),
-    "gelu": nn.GELU(),
-    "relu": nn.ReLU(),
+_ACTIVATIONS: Dict[str, Callable[[], nn.Module]] = {
+    "swish": nn.SiLU,
+    "silu": nn.SiLU,
+    "mish": nn.Mish,
+    "gelu": nn.GELU,
+    "relu": nn.ReLU,
 }
 
 
 def get_activation(act_fn: str) -> nn.Module:
-    """Helper function to get activation function from string.
+    """Create an activation module from its name.
 
     Args:
-        act_fn (str): Name of activation function.
+        act_fn: One of ``"swish"``, ``"silu"``, ``"mish"``, ``"gelu"``, ``"relu"`` (case-insensitive).
 
     Returns:
-        nn.Module: Activation function.
-    """
+        A new activation module.
 
-    act_fn = act_fn.lower()
-    if act_fn in ACTIVATION_FUNCTIONS:
-        return ACTIVATION_FUNCTIONS[act_fn]
-    else:
-        raise ValueError(f"Unsupported activation function: {act_fn}")
+    Raises:
+        ValueError: If the name is not supported.
+    """
+    try:
+        return _ACTIVATIONS[act_fn.lower()]()
+    except KeyError:
+        raise ValueError(f"Unsupported activation function: {act_fn}") from None
 
 
 def get_timestep_embedding(
@@ -39,25 +43,19 @@ def get_timestep_embedding(
         downscale_freq_shift: float = 1,
         scale: float = 1,
         max_period: int = 10000,
-):
-    """
-    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
+) -> torch.Tensor:
+    """Create DDPM-style sinusoidal timestep embeddings.
 
-    Args
-        timesteps (torch.Tensor):
-            a 1-D Tensor of N indices, one per batch element. These may be fractional.
-        embedding_dim (int):
-            the dimension of the output.
-        flip_sin_to_cos (bool):
-            Whether the embedding order should be `cos, sin` (if True) or `sin, cos` (if False)
-        downscale_freq_shift (float):
-            Controls the delta between frequencies between dimensions
-        scale (float):
-            Scaling factor applied to the embeddings.
-        max_period (int):
-            Controls the maximum frequency of the embeddings
-    Returns
-        torch.Tensor: an [N x dim] Tensor of positional embeddings.
+    Args:
+        timesteps: 1-D tensor of ``N`` (possibly fractional) timesteps.
+        embedding_dim: Output channel size.
+        flip_sin_to_cos: Order the output as ``[cos, sin]`` instead of ``[sin, cos]``.
+        downscale_freq_shift: Offset subtracted from ``embedding_dim // 2`` in the frequency spacing.
+        scale: Factor applied to the angles.
+        max_period: Controls the lowest frequency.
+
+    Returns:
+        Float32 tensor of shape ``[N, embedding_dim]`` (zero-padded by one channel if ``embedding_dim`` is odd).
     """
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
@@ -69,53 +67,75 @@ def get_timestep_embedding(
 
     emb = torch.exp(exponent)
     emb = timesteps[:, None].float() * emb[None, :]
-
-    # scale embeddings
     emb = scale * emb
-
-    # concat sine and cosine embeddings
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
 
-    # flip sine and cosine embeddings
     if flip_sin_to_cos:
         emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
 
-    # zero pad
     if embedding_dim % 2 == 1:
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
     return emb
 
 
 class Timesteps(nn.Module):
-    def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
+    """Module wrapper around :func:`get_timestep_embedding`.
+
+    Args:
+        num_channels: Embedding size.
+        flip_sin_to_cos: Order the output as ``[cos, sin]``.
+        downscale_freq_shift: See :func:`get_timestep_embedding`.
+        scale: See :func:`get_timestep_embedding`.
+    """
+
+    def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1) -> None:
         super().__init__()
         self.num_channels = num_channels
         self.flip_sin_to_cos = flip_sin_to_cos
         self.downscale_freq_shift = downscale_freq_shift
         self.scale = scale
 
-    def forward(self, timesteps):
-        t_emb = get_timestep_embedding(
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Embed timesteps.
+
+        Args:
+            timesteps: Tensor of shape ``[N]``.
+
+        Returns:
+            Tensor of shape ``[N, num_channels]``.
+        """
+        return get_timestep_embedding(
             timesteps,
             self.num_channels,
             flip_sin_to_cos=self.flip_sin_to_cos,
             downscale_freq_shift=self.downscale_freq_shift,
             scale=self.scale,
         )
-        return t_emb
 
 
 class TimestepEmbedding(nn.Module):
+    """Two-layer MLP ``linear_1 -> act -> linear_2 [-> post_act]`` applied to a timestep projection.
+
+    Args:
+        in_channels: Input size.
+        time_embed_dim: Hidden size.
+        act_fn: Activation between the two linears.
+        out_dim: Output size; defaults to ``time_embed_dim``.
+        post_act_fn: Optional activation after the second linear.
+        cond_proj_dim: If set, an extra condition of this size is projected and added to the input.
+        sample_proj_bias: Whether the two linears have a bias.
+    """
+
     def __init__(
             self,
             in_channels: int,
             time_embed_dim: int,
             act_fn: str = "silu",
-            out_dim: int = None,
+            out_dim: Optional[int] = None,
             post_act_fn: Optional[str] = None,
-            cond_proj_dim=None,
-            sample_proj_bias=True,
-    ):
+            cond_proj_dim: Optional[int] = None,
+            sample_proj_bias: bool = True,
+    ) -> None:
         super().__init__()
 
         self.linear_1 = nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
@@ -127,40 +147,54 @@ class TimestepEmbedding(nn.Module):
 
         self.act = get_activation(act_fn)
 
-        if out_dim is not None:
-            time_embed_dim_out = out_dim
-        else:
-            time_embed_dim_out = time_embed_dim
+        time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
         self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out, sample_proj_bias)
 
-        if post_act_fn is None:
-            self.post_act = None
-        else:
-            self.post_act = get_activation(post_act_fn)
+        self.post_act = get_activation(post_act_fn) if post_act_fn is not None else None
 
-    def forward(self, sample, condition=None):
+    def forward(self, sample: torch.Tensor, condition: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Apply the MLP.
+
+        Args:
+            sample: Tensor of shape ``[N, in_channels]``.
+            condition: Optional tensor of shape ``[N, cond_proj_dim]``.
+
+        Returns:
+            Tensor of shape ``[N, out_dim]``.
+        """
         if condition is not None:
             sample = sample + self.cond_proj(condition)
         sample = self.linear_1(sample)
-
-        if self.act is not None:
-            sample = self.act(sample)
-
+        sample = self.act(sample)
         sample = self.linear_2(sample)
-
         if self.post_act is not None:
             sample = self.post_act(sample)
         return sample
 
 
 class TimestepEmbeddings(nn.Module):
-    def __init__(self, embedding_dim=256):
+    """256-channel sinusoidal projection (``[cos, sin]``) followed by a 256 -> ``embedding_dim`` MLP.
+
+    The output feeds :class:`~PhysDock.models.primitives.AdaLayerNormZero`, whose conditioning size is 256.
+
+    Args:
+        embedding_dim: Size of the output embedding.
+    """
+
+    def __init__(self, embedding_dim: int = 256) -> None:
         super().__init__()
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
-    def forward(self, timestep):
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Embed a batch of (noise-level) timesteps.
+
+        Args:
+            timestep: Tensor of shape ``[B]``.
+
+        Returns:
+            Tensor of shape ``[B, embedding_dim]`` in the dtype of ``timestep``.
+        """
         timesteps_proj = self.time_proj(timestep)
-        conditioning = self.timestep_embedder(timesteps_proj.to(dtype=timestep.dtype))  # (N, D)
-        return conditioning
+        return self.timestep_embedder(timesteps_proj.to(dtype=timestep.dtype))

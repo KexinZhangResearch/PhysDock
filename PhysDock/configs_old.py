@@ -44,50 +44,42 @@ def model_config(
     no_blocks_evo = 48
     no_blocks_atom = 3
     no_blocks_dit = 24
-    no_blocks_heads = 4
     if model_name == "small_toy":
         no_blocks_templ = 1
         no_blocks_evo = 1
         no_blocks_atom = 1
         no_blocks_dit = 1
-        no_blocks_heads = 1
     elif model_name == "toy":
         no_blocks_templ = 2
         no_blocks_evo = 2
         no_blocks_atom = 2
         no_blocks_dit = 2
-        no_blocks_heads = 2
 
     elif model_name == "small":
         no_blocks_templ = 2
         no_blocks_evo = 4
         no_blocks_atom = 2
         no_blocks_dit = 2
-        no_blocks_heads = 2
     elif model_name == "docking":
         no_blocks_templ = 2
         no_blocks_evo = 8
         no_blocks_atom = 2
         no_blocks_dit = 4
-        no_blocks_heads = 2
     elif model_name == "medium":
         no_blocks_templ = 2
         no_blocks_evo = 16
         no_blocks_atom = 3
         no_blocks_dit = 8
-        no_blocks_heads = 2
     elif model_name == "large":
         no_blocks_templ = 2
         no_blocks_evo = 24
         no_blocks_atom = 3
         no_blocks_dit = 12
-        no_blocks_heads = 4
     elif model_name == "full":
         no_blocks_templ = 2
         no_blocks_evo = 48
         no_blocks_atom = 3
         no_blocks_dit = 24
-        no_blocks_heads = 4
 
     return mlc.ConfigDict({
         "use_template": use_template,
@@ -176,28 +168,6 @@ def model_config(
                 "custom_rel_token": custom_rel_token,
                 "use_flash_attn": use_flash_attn,
                 "atom_attention_type": atom_attention_type
-            },
-            "confidence_module": {
-                "c_a": c_a,
-                "c_ap": c_ap,
-                "c_s": c_s,
-                "c_m": c_m,
-                "c_z": c_z,
-                "no_heads_a": 4,
-                "c_hidden_a": 16,
-                "c_hidden_m": 32,
-                "no_heads_m": 8,
-                "c_hidden_z": 32,
-                "no_heads_z": 4,
-                "c_hidden_opm": 32,
-                "inf": inf,
-                "eps": eps,
-                "no_blocks": no_blocks_heads,
-                "no_blocks_atom": no_blocks_atom,
-                "c_pae": 64,
-                "c_pde": 64,
-                "c_plddt": 50,
-                "c_distogram": 39,
             },
             "loss": {
                 "weighted_mse_loss": {

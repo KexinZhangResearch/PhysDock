@@ -20,7 +20,7 @@ sys.path.append(stfold_path)
 from PhysDock.configs_old import model_config
 from PhysDock.models.model import PhysDock as RFFold
 from PhysDock.data.feature_loader_plinder import FeatureLoader
-from PhysDock.models.loss_module3 import RFFoldLoss
+from PhysDock.models.loss import PhysDockLoss as RFFoldLoss
 from PhysDock.utils.import_weights import import_unicore_ckpt
 
 

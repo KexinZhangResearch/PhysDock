@@ -15,7 +15,7 @@
 
 from functools import partial
 import logging
-from typing import Tuple, List, Callable, Any, Dict, Sequence, Optional
+from typing import Tuple, List, Callable, Any, Dict, Sequence, Optional, Literal
 import numpy as np
 import torch
 import torch.nn as nn
@@ -50,6 +50,206 @@ def reshape_final_dim(t: torch.Tensor, shape: Tuple):
 def masked_mean(mask, value, dim, eps=1e-9):
     mask = mask.expand(*value.shape)
     return torch.sum(mask * value, dim=dim) / (eps + torch.sum(mask, dim=dim))
+
+
+def segment_mean_pool(
+        x: torch.Tensor,
+        segment_sizes: torch.Tensor,
+        eps: float = 1e-3,
+        method: Literal["segment_reduce", "cumsum"] = "segment_reduce",
+) -> torch.Tensor:
+    """Average-pool consecutive rows of ``x`` into segments (e.g. the atoms of every token).
+
+    Segment ``i`` covers ``segment_sizes[i]`` consecutive rows along dimension ``-2`` and the result is
+    ``sum(rows) / (segment_sizes[i] + eps)``. The small ``eps`` keeps empty segments at exactly zero instead of
+    ``0/0`` and slightly shrinks every mean by the factor ``n / (n + eps)``; it is part of the function the model
+    was trained with, so it must not be dropped. Rows behind the last segment (padding) are ignored.
+
+    Two implementations are available; they compute the same quantity but differ in accuracy:
+
+    * ``"segment_reduce"`` (default): :func:`torch.segment_reduce` with ``reduce="sum"``. Every segment is summed
+      on its own, so the rounding error depends only on the segment length. Half-precision inputs are
+      accumulated in float32 and cast back.
+    * ``"cumsum"``: the original implementation. It takes a running sum over *all* rows and differences it at the
+      segment boundaries, so the error grows with the total number of rows (catastrophic cancellation for long
+      inputs and for activations with a large mean) and rows after the first segment are affected by the sum of
+      everything before them. A leading empty segment is wrong (index ``-1`` wraps around to the grand total).
+      Kept for reproducing old results.
+
+    Args:
+        x: Values to pool, shape ``[..., N, C]``; any number of leading dimensions.
+        segment_sizes: Number of rows of every segment, integer tensor of shape ``[S]`` (zeros allowed) on any
+            device. ``segment_sizes.sum()`` must not exceed ``N``.
+        eps: Added to the segment size in the denominator.
+        method: ``"segment_reduce"`` or ``"cumsum"``.
+
+    Returns:
+        Tensor of shape ``[..., S, C]`` with the dtype of ``x``.
+
+    Raises:
+        ValueError: For an unknown ``method``, a non-1-D ``segment_sizes``, ``x`` with fewer than two dimensions,
+            or (``"segment_reduce"`` only) segment sizes adding up to more than ``N``.
+    """
+    if x.dim() < 2:
+        raise ValueError(f"x must have at least 2 dimensions [..., N, C], got shape {tuple(x.shape)}")
+    if segment_sizes.dim() != 1:
+        raise ValueError(f"segment_sizes must be 1-D, got shape {tuple(segment_sizes.shape)}")
+    if method not in ("segment_reduce", "cumsum"):
+        raise ValueError(f"unknown method {method!r}, expected 'segment_reduce' or 'cumsum'")
+
+    sizes = segment_sizes.to(device=x.device, dtype=torch.long)
+    n_rows, n_seg = x.shape[-2], sizes.shape[0]
+    denom = (sizes[:, None] + eps).to(x.dtype if x.dtype.is_floating_point else torch.float32)
+
+    if method == "cumsum":
+        cum = torch.cumsum(x, dim=-2)
+        value = cum[..., torch.cumsum(sizes, dim=-1) - 1, :]
+        pooled = torch.cat([value[..., 0:1, :], torch.diff(value, dim=-2)], dim=-2)
+        return pooled / denom
+
+    pooled = _segment_sum(x, sizes, dim=-2)
+    return pooled / denom
+
+
+def _segment_sum(x: torch.Tensor, sizes: torch.Tensor, dim: int = -2) -> torch.Tensor:
+    """Sum consecutive slices of ``x`` along ``dim`` with :func:`torch.segment_reduce` (deterministic).
+
+    Slices behind the last segment (``sizes.sum() < x.shape[dim]``) are ignored. Half-precision inputs are
+    accumulated in float32 and cast back.
+
+    Args:
+        x: Tensor of any shape with at least two dimensions.
+        sizes: Integer tensor ``[S]`` with the number of slices of every segment (zeros allowed).
+        dim: Dimension to reduce.
+
+    Returns:
+        Tensor like ``x`` with ``shape[dim] == S``.
+
+    Raises:
+        ValueError: If ``sizes`` add up to more than ``x.shape[dim]``.
+    """
+    dim = dim % x.dim()
+    xm = x.movedim(dim, -2)                                                    # [..., N, C]
+    n_rows, n_seg = xm.shape[-2], sizes.shape[0]
+    # torch.segment_reduce needs the lengths to add up to N exactly: describe the padding rows as a last segment
+    # (computed on the device, no host synchronisation of our own) and drop its result.
+    lengths = torch.cat([sizes, (n_rows - sizes.sum()).reshape(1)])
+    compute_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+    flat = xm.reshape(-1, n_rows, xm.shape[-1]).to(compute_dtype)               # [B, N, C]
+    lengths = lengths[None].expand(flat.shape[0], -1)                           # [B, S + 1]
+    try:
+        out = torch.segment_reduce(flat, "sum", lengths=lengths, axis=1)[:, :n_seg]   # [B, S, C]
+    except RuntimeError as e:
+        if "negative" in str(e):                    # the padding segment has negative length
+            raise ValueError(f"segment sizes add up to more than the number of rows ({n_rows})") from e
+        raise
+    out = out.reshape(*xm.shape[:-2], n_seg, xm.shape[-1]).to(x.dtype)
+    return out.movedim(-2, dim)
+
+
+def segment_unpool_1d(
+        x: torch.Tensor,
+        segment_sizes: Optional[torch.Tensor] = None,
+        num_rows: Optional[int] = None,
+        dim: int = -2,
+        index: Optional[torch.Tensor] = None,
+        method: Literal["index", "segment"] = "index",
+) -> torch.Tensor:
+    """Broadcast one row per segment back to all rows of the segment (e.g. token -> atom features).
+
+    Row ``i`` of ``x`` is handed to every row of segment ``i``. Two implementations give the same values for
+    all real rows:
+
+    * ``"index"`` (default): gather with a precomputed row -> segment map, ``x[..., index, :]`` (for tokens and
+      atoms this is ``atom_id_to_token_id``). Rows whose index points at segment 0 (padding atoms) receive a copy
+      of segment 0.
+    * ``"segment"``: derives the map on the device from ``segment_sizes`` (cumulative sum + ``searchsorted``),
+      so no index tensor is needed. Rows behind the last segment (padding atoms) are exactly zero instead.
+
+    Args:
+        x: Per-segment values, shape ``[..., S, C]`` (``S`` along ``dim``).
+        segment_sizes: Number of rows of every segment, integer tensor ``[S]`` (zeros allowed). Required for
+            ``method="segment"``.
+        num_rows: ``"segment"`` only: total number of output rows. Defaults to ``segment_sizes.sum()``, which costs
+            one host synchronisation. If given, ``segment_sizes.sum() <= num_rows`` is checked on the CPU only; on
+            CUDA the check would need a synchronisation, so sizes adding up to more than ``num_rows`` silently drop
+            the surplus (they can not crash the device).
+        dim: Dimension to expand.
+        index: Row -> segment map, integer tensor ``[N]`` with values in ``[0, S)``. Required for
+            ``method="index"``.
+        method: ``"index"`` or ``"segment"``.
+
+    Returns:
+        Tensor like ``x`` with ``N`` entries along ``dim``.
+
+    Raises:
+        ValueError: For an unknown ``method``, a missing ``index`` / ``segment_sizes``, ``segment_sizes`` of the
+            wrong shape, or (CPU only) sizes adding up to more than ``num_rows``.
+    """
+    if method not in ("index", "segment"):
+        raise ValueError(f"unknown method {method!r}, expected 'index' or 'segment'")
+    dim = dim % x.dim()
+
+    if method == "index":
+        if index is None:
+            raise ValueError("method='index' needs the row -> segment map `index` (e.g. atom_id_to_token_id)")
+        return x[(slice(None),) * dim + (index,)]
+
+    if segment_sizes is None:
+        raise ValueError("method='segment' needs `segment_sizes` (e.g. token_id_to_chunk_sizes)")
+    sizes = segment_sizes.to(device=x.device, dtype=torch.long)
+    if sizes.dim() != 1 or sizes.shape[0] != x.shape[dim]:
+        raise ValueError(f"segment_sizes must have shape [{x.shape[dim]}] to match dimension {dim} of x, "
+                         f"got {tuple(segment_sizes.shape)}")
+    if num_rows is None:
+        num_rows = int(sizes.sum())
+    elif x.device.type == "cpu" and int(sizes.sum()) > num_rows:
+        raise ValueError(f"segment_sizes add up to more than num_rows={num_rows}")
+    pad_shape = list(x.shape)
+    pad_shape[dim] = 1
+    x_pad = torch.cat([x, x.new_zeros(pad_shape)], dim=dim)                       # last entry: zeros for padding rows
+    rows = torch.arange(num_rows, device=x.device)
+    seg = torch.searchsorted(torch.cumsum(sizes, dim=0), rows, right=True)        # in [0, S]; S = padding row
+    return x_pad[(slice(None),) * dim + (seg,)]
+
+
+def segment_unpool_2d(
+        x: torch.Tensor,
+        row_sizes: Optional[torch.Tensor] = None,
+        col_sizes: Optional[torch.Tensor] = None,
+        num_rows: Optional[int] = None,
+        num_cols: Optional[int] = None,
+        row_index: Optional[torch.Tensor] = None,
+        col_index: Optional[torch.Tensor] = None,
+        method: Literal["index", "segment"] = "index",
+) -> torch.Tensor:
+    """Broadcast a per-segment-pair map ``[..., S_r, S_c, C]`` to all row/column pairs ``[..., N_r, N_c, C]``.
+
+    Entry ``(i, j)`` is copied into the whole block of rows of segment ``i`` times columns of segment ``j``, e.g.
+    the token-pair representation is handed to every atom pair. It applies :func:`segment_unpool_1d` to the row
+    dimension and then to the column dimension; with ``method="index"`` this is
+    ``x[..., row_index, :, :][..., :, col_index, :]``.
+
+    Args:
+        x: Values per segment pair, shape ``[..., S_r, S_c, C]``.
+        row_sizes: Rows of every row segment, shape ``[S_r]`` (``method="segment"``).
+        col_sizes: Columns of every column segment, shape ``[S_c]``; defaults to ``row_sizes`` (square case).
+        num_rows: ``"segment"`` only: number of output rows (padding rows are zero); defaults to the sum of sizes.
+        num_cols: ``"segment"`` only: number of output columns; defaults to ``num_rows`` in the square case.
+        row_index: Row -> segment map, shape ``[N_r]`` (``method="index"``).
+        col_index: Column -> segment map, shape ``[N_c]``; defaults to ``row_index`` (square case).
+        method: ``"index"`` or ``"segment"``, see :func:`segment_unpool_1d`.
+
+    Returns:
+        Tensor of shape ``[..., N_r, N_c, C]``.
+    """
+    if col_sizes is None:
+        col_sizes = row_sizes
+        num_cols = num_rows if num_cols is None else num_cols
+    if col_index is None:
+        col_index = row_index
+    out = segment_unpool_1d(x, row_sizes, num_rows=num_rows, dim=-3, index=row_index, method=method)
+    return segment_unpool_1d(out, col_sizes, num_rows=num_cols, dim=-2, index=col_index, method=method)
 
 
 def pts_to_distogram(pts, min_bin=2.3125, max_bin=21.6875, no_bins=64):

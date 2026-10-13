@@ -10,9 +10,8 @@ import ml_collections as mlc
 
 from PhysDock.data import TensorDict
 from PhysDock.models.primitives import Linear
-from PhysDock.models.layers.diffusion_conditioning import DiffusionConditioning
-from PhysDock.models.layers.transformers import AF3DiT
-# from PhysDock.models.layers.confidence_module import ConfidenceModule
+from PhysDock.models.encoders import DiffusionConditioning
+from PhysDock.models.decoders import AF3DiT
 from PhysDock.utils.tensor_utils import centre_random_augmentation
 from PhysDock.utils.tensor_utils import weighted_rigid_align
 
@@ -65,7 +64,6 @@ class PhysDock(nn.Module):
             **self.config.model.dit
         )
         self.linear_distogram = Linear(self.config.model.c_z, 39, init="final")
-        # self.confidence_module = ConfidenceModule(**self.config.model.confidence_module)
 
     def diffuse(
             self,

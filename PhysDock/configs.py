@@ -9,11 +9,8 @@ def PhysDockConfig(
         crop_size=256,
         atom_crop_size=256 * 8,
 
-        alpha_confifdence=1e-4,
         alpha_diffusion=4,
-        alpha_bond=0,
         alpha_distogram=3e-2,
-        alpha_pae=0,
         inf=1e9,
         eps=1e-8,
 
@@ -67,31 +64,26 @@ def PhysDockConfig(
         no_blocks_evoformer = 2
         no_blocks_pairformer = 2
         no_blocks_dit = 2
-        no_blocks_heads = 2
     elif model_name == "tiny":
         no_blocks_atom = 2
         no_blocks_evoformer = 2
         no_blocks_pairformer = 8
         no_blocks_dit = 4
-        no_blocks_heads = 2
     elif model_name == "small":
         no_blocks_atom = 2
         no_blocks_evoformer = 3
         no_blocks_pairformer = 16
         no_blocks_dit = 8
-        no_blocks_heads = 2
     elif model_name == "medium":
         no_blocks_atom = 3
         no_blocks_evoformer = 4
         no_blocks_pairformer = 24
         no_blocks_dit = 12
-        no_blocks_heads = 3
     elif model_name == "full":
         no_blocks_atom = 3
         no_blocks_evoformer = 4
         no_blocks_pairformer = 48
         no_blocks_dit = 24
-        no_blocks_heads = 4
     else:
         raise ValueError("Unknown model name")
 
@@ -138,16 +130,6 @@ def PhysDockConfig(
                 "no_blocks_dit": no_blocks_dit,
                 "sigma_data": sigma_data
             },
-            "confidence_module": {
-                "c_a": c_a,
-                "c_ap": c_ap,
-                "c_s": c_s,
-                "c_z": c_z,
-                "inf": inf,
-                "eps": eps,
-                "no_blocks_heads": no_blocks_heads,
-                "no_blocks_atom": no_blocks_atom,
-            }
         },
         "loss": {
             "weighted_mse_loss": {
@@ -161,34 +143,11 @@ def PhysDockConfig(
                 "weight": alpha_diffusion,
                 "max_clamp_distance": 15.,
             },
-
-            "bond_loss": {
-                "weight": alpha_diffusion * alpha_bond,
-                "sigma_data": sigma_data,
-            },
-            "key_res_loss": {
-                "weight": alpha_diffusion * alpha_bond,
-                "sigma_data": sigma_data,
-            },
             "distogram_loss": {
                 "weight": alpha_distogram,
                 "min_bin": 3.25,
                 "max_bin": 50.75,
                 "no_bins": 39,
-                "eps": 1e-9,
-            },
-            "plddt_loss": {
-                "weight": alpha_confifdence,
-                "no_bins": 50,
-            },
-            "pae_loss": {
-                "weight": alpha_confifdence * alpha_pae,
-            },
-            "pde_loss": {
-                "weight": alpha_confifdence,
-                "min_bin": 0,
-                "max_bin": 32,
-                "no_bins": 64,
             },
         }
     }

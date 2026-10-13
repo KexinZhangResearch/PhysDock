@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Literal, Tuple
 
-from .transformers import AtomTransformer, Evoformer, Pairformer, Triangleformer
-from PhysDock.models.primitives import Linear, FeedForward, RMSNorm
-from PhysDock.utils.tensor_utils import one_hot
+from PhysDock.models.primitives import (AtomTransformer, Evoformer, FeedForward, Linear, Pairformer, RMSNorm,
+                                        Triangleformer)
+from PhysDock.utils.tensor_utils import one_hot, segment_mean_pool, segment_unpool_1d, segment_unpool_2d
 from PhysDock.data import TensorDict
 
 
@@ -166,14 +166,16 @@ class TokenEmbedder(nn.Module):
         self.linear_s = Linear(c_s, c_s, bias=False)
 
     def downscale(self, batch: TensorDict, a: torch.Tensor) -> torch.Tensor:
-        token_id_to_chunk_sizes = batch["token_id_to_chunk_sizes"]
-        a_cumsum = torch.cumsum(F.silu(self.linear_a(a)), dim=-2)
-        inds = torch.cumsum(token_id_to_chunk_sizes, dim=-1) - 1
+        """Average-pool atom features into tokens (the atoms of a token are contiguous).
 
-        value = a_cumsum[inds, :]
-        s = torch.cat([value[0:1, :], torch.diff(value, dim=-2)], dim=-2)
-        s = s / (token_id_to_chunk_sizes[:, None] + 1e-3)
-        return s
+        Args:
+            batch: Feature dict; uses ``token_id_to_chunk_sizes``, the number of atoms of every token.
+            a: Atom representation, shape ``[N_atom, c_a]``.
+
+        Returns:
+            Token representation, shape ``[N_token, c_s]``.
+        """
+        return segment_mean_pool(F.silu(self.linear_a(a)), batch["token_id_to_chunk_sizes"])
 
     def forward(self, batch: TensorDict, a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         target_feat = batch["target_feat"]
@@ -218,8 +220,10 @@ class DiffusionConditioning(nn.Module):
             no_blocks_atom: int,
             no_blocks_evoformer: int,
             no_blocks_pairformer: int,
+            unpool_method: Literal["index", "segment"] = "index",
     ):
         super().__init__()
+        self.unpool_method = unpool_method   # how token features are broadcast to atoms, see segment_unpool_1d
 
         self.atom_embedder = AtomEmbedder(ref_dim, c_a, c_ap, inf, eps, no_blocks_atom)
         self.token_embedder = TokenEmbedder(target_dim, msa_dim, c_a, c_s, c_m, c_z, inf, eps, no_blocks_evoformer,
@@ -231,8 +235,12 @@ class DiffusionConditioning(nn.Module):
 
     def forward(self, batch:TensorDict)->Tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
         atom_id_to_token_id = batch["atom_id_to_token_id"]
+        sizes = batch["token_id_to_chunk_sizes"]
         a, ap = self.atom_embedder(batch)
         s, z = self.token_embedder(batch, a)
-        a = a + self.linear_s(self.norm_s(s))[atom_id_to_token_id]
-        ap = ap + self.linear_z(self.norm_z(z))[atom_id_to_token_id][:, atom_id_to_token_id]
+        n_atom = a.shape[0]
+        a = a + segment_unpool_1d(self.linear_s(self.norm_s(s)), sizes, num_rows=n_atom, dim=0,
+                                  index=atom_id_to_token_id, method=self.unpool_method)
+        ap = ap + segment_unpool_2d(self.linear_z(self.norm_z(z)), sizes, num_rows=n_atom,
+                                    row_index=atom_id_to_token_id, method=self.unpool_method)
         return a, ap, s, z
