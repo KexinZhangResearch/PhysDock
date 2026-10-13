@@ -11,6 +11,7 @@ def PhysDockConfig(
 
         alpha_diffusion=4,
         alpha_distogram=3e-2,
+        diffusion_type="edm_ve",  # "edm_ve" (released parameters) or "linear" (flow matching, PhysDock2)
         inf=1e9,
         eps=1e-8,
 
@@ -87,6 +88,36 @@ def PhysDockConfig(
     else:
         raise ValueError("Unknown model name")
 
+    sampler_af3 = {"gamma_0": 0.8, "gamma_min": 1.0, "noise_scale": 1.003, "step_scale": 1.5, "ode_step_scale": 1.0,
+                   "trans_scale": 1.0}
+    if diffusion_type == "edm_ve":
+        diffusion = {
+            "type": "edm_ve",
+            "sigma_data": sigma_data,
+            "trans_scale": 1.0,
+            # The released parameters were trained with t * ln(t / sigma_data) / 4 as noise input ("legacy");
+            # "af3" (ln(t / sigma_data) / 4) is only for models trained from scratch.
+            "noise_conditioning": "legacy",
+            "time_sampler": {"mean": -1.2, "std": 1.5},
+            # s_min is 4 * 10e-4 = 0.004 in the released code (AlphaFold 3 and PhysDock2 use 4e-4). It is kept
+            # because predictions of the released parameters depend on it.
+            "noise_schedule": {"s_min": 4e-3, "s_max": 160., "rho": 7.},
+            "sampler": sampler_af3,
+        }
+    elif diffusion_type == "linear":
+        diffusion = {
+            "type": "linear",
+            "sigma_data": sigma_data,
+            "trans_scale": 1.0,
+            "time_sampler": {"mean": -1.2, "std": 1.5},
+            # PhysDock2: Karras schedule with s_min = 4e-4 and rho = 1000.
+            "noise_schedule": {"s_min": 4e-4, "s_max": 160., "rho": 1000.},
+            # PhysDock2 samples with the plain probability-flow ODE: no churn, unit step, no random translation.
+            "sampler": {**sampler_af3, "gamma_0": 0.0, "step_scale": 1.0, "ode_step_scale": 1.0, "trans_scale": 0.0},
+        }
+    else:
+        raise ValueError(f"Unknown diffusion type {diffusion_type!r}, expected 'edm_ve' or 'linear'")
+
     config = {
         "inference_mode": inference_mode,
         "sigma_data": sigma_data,
@@ -104,7 +135,7 @@ def PhysDockConfig(
         "model": {
             "c_z": c_z,
             "num_augmentation_sample": num_augmentation_sample,
-            "diffusion_conditioning": {
+            "encoder": {
                 "ref_dim": ref_dim,
                 "target_dim": target_dim,
                 "msa_dim": msa_dim,
@@ -119,7 +150,7 @@ def PhysDockConfig(
                 "no_blocks_evoformer": no_blocks_evoformer,
                 "no_blocks_pairformer": no_blocks_pairformer
             },
-            "dit": {
+            "decoder": {
                 "c_a": c_a,
                 "c_ap": c_ap,
                 "c_s": c_s,
@@ -128,9 +159,9 @@ def PhysDockConfig(
                 "eps": eps,
                 "no_blocks_atom": no_blocks_atom,
                 "no_blocks_dit": no_blocks_dit,
-                "sigma_data": sigma_data
             },
         },
+        "diffusion": diffusion,
         "loss": {
             "weighted_mse_loss": {
                 "weight": alpha_diffusion,
