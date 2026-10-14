@@ -49,6 +49,7 @@ class FeatureConfig:
     """Featurisation settings (defaults = released pipeline). train_* are only used with training=True."""
     crop_size: Optional[int] = 256              # max tokens; None = no crop
     atom_crop_size: int = 2048                  # max atoms of a crop
+    msa_rows: int = 16384                       # rows of the merged MSA (padded by resampling) [legacy]
     max_msa_clusters: int = 128                 # MSA rows in msa_feat (query + random rows)
     num_msa_samples: int = 1                    # > 1: further samples in msa_feat_resampled (redocking rounds)
     key_res_random_mask_ratio: float = 0.5      # prob. that a key-residue flag is masked [legacy: also at inference]
@@ -247,7 +248,7 @@ class SystemFeaturizer:
         missing = [f for f in files if not os.path.isfile(f)]
         if missing:
             raise MissingMSAError(f"{path}: MSA features of chain {chain_id!r} not found: {missing}; "
-                                  f"generate them with run_homo_search.py for\n>{md5}\n{sequence}")
+                                  f"generate them with scripts/prepare/homo_search.py for\n>{md5}\n{sequence}")
         msa = {**load_pkl(files[0]), **load_pkl(files[1])}
         for key in ("msa", "deletion_matrix", "msa_all_seq", "deletion_matrix_all_seq", "msa_species_identifiers_all_seq"):
             if key not in msa:
@@ -446,7 +447,7 @@ class SystemFeaturizer:
             order = chain_ids
         else:
             _split_mixed_entities([chains[c] for c in chain_ids])
-            merged = pair_and_merge([chains[c] for c in chain_ids])
+            merged = pair_and_merge([chains[c] for c in chain_ids], self.config.msa_rows)
             order = [asym_to_chain[a] for a in OrderedDict.fromkeys(merged["asym_id"].tolist())]
             raw = {k: merged[k] for k in ("msa", "deletion_matrix", "asym_id", "sym_id", "entity_id")}
             for k in keys:

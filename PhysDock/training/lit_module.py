@@ -1,0 +1,135 @@
+"""LightningModule: training with PhysDockLoss, validation = diffusion loss + sampling metrics, Adam + AF3 LR schedule.
+
+Logged (Boltz style): train/<loss terms> and train/lr every step; every log_every_n_steps the gradient statistics
+(train/grad_norm, grad_abs_max, grad_abs_min, param_norm, per module train/grad_norm/<module>, and with
+grad_stats="parameter" grad/<parameter>/{norm,abs_max,abs_min}); per validation the means over all validation
+systems and DDP ranks of val/loss, val/loss_<term> and the sampling metrics val/<metric> (training/metrics.py).
+"""
+import lightning.pytorch as L
+import torch
+from torchmetrics import MeanMetric
+
+from PhysDock.data import Sample
+from PhysDock.models.loss import PhysDockLoss
+from PhysDock.models.model import PhysDock
+from PhysDock.training.metrics import sample_metrics
+from PhysDock.utils.import_weights import load_checkpoint_state_dict
+
+SAMPLE_METRICS = ("lrmsd", "success", "best_success", "ligand_mse", "slddt", "within_slddt", "ligand_bond_error",
+                  "inter_clash")
+
+
+def af3_lr_lambda(warmup_steps: int, start_decay_after: int, decay_every: int, decay_factor: float):
+    """LR factor: linear warmup, plateau, then decay_factor every decay_every steps (AF3 / PhysDock2 schedule)."""
+    def factor(step: int) -> float:
+        if step <= warmup_steps:
+            return step / max(1, warmup_steps)
+        if step > start_decay_after:
+            return decay_factor ** ((step - start_decay_after) // decay_every + 1)
+        return 1.0
+    return factor
+
+
+def _module_of(name: str) -> str:
+    """Module a parameter is reported under: e.g. dit.token_dit, diffusion_conditioning.token_embedder.pairformer."""
+    parts = name.split(".")
+    depth = 3 if parts[:2] == ["diffusion_conditioning", "token_embedder"] else 2
+    return ".".join(parts[:min(depth, len(parts) - 1)])
+
+
+class PhysDockLitModule(L.LightningModule):
+    """
+    Args:
+        model: model config (configs/model/<size>.yaml)
+        loss: loss config (configs/model/loss.yaml)
+        optim: {lr, betas, eps, scheduler: {warmup_steps, start_decay_after, decay_every, decay_factor}}
+        init_from: optional checkpoint to start from (params.pt, Lightning or Uni-Core checkpoint)
+        val: {num_samples, steps} of the validation sampling
+        grad_stats: "total", "module" or "parameter" (see module docstring)
+    """
+
+    def __init__(self, model: dict, loss: dict, optim: dict, init_from: str = None, val: dict = None,
+                 grad_stats: str = "parameter") -> None:
+        super().__init__()
+        if grad_stats not in ("total", "module", "parameter"):
+            raise ValueError(f"grad_stats must be total, module or parameter, got {grad_stats!r}")
+        self.save_hyperparameters(logger=False)         # the full run config is logged by scripts/train/train.py
+        self.model = PhysDock(**model)
+        if init_from:
+            self.model.load_state_dict(load_checkpoint_state_dict(init_from, mmap=False))
+        self.loss_fn = PhysDockLoss(**loss)
+        self.optim = optim
+        self.val = val or {"num_samples": 5, "steps": 20}
+        self.grad_stats = grad_stats
+        # MeanMetric is synced over the DDP ranks at epoch end, also for ranks with no (or skipped) systems
+        names = ["loss"] + [f"loss_{k}" for k in self.loss_fn.weights] + list(SAMPLE_METRICS)
+        self.val_metrics = torch.nn.ModuleDict({k: MeanMetric() for k in names})
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        if batch is None:
+            return None
+        if isinstance(batch, Sample):           # validation: features + metadata
+            return Sample({k: v.to(device) for k, v in batch.features.items()}, batch.meta)
+        return {k: v.to(device) for k, v in batch.items()}
+
+    # ------------------------------------------------------------------ training
+    def training_step(self, batch, batch_idx):
+        loss, logs = self.loss_fn(self.model(batch), batch)
+        self.log("train/loss", logs.pop("loss"), prog_bar=True, batch_size=1)
+        self.log_dict({f"train/{k}": v for k, v in logs.items()}, batch_size=1)
+        self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], batch_size=1)
+        return loss
+
+    @torch.no_grad()
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Gradient statistics (before clipping) every log_every_n_steps, logged by the global-zero rank."""
+        if self.logger is None or self.global_step % self.trainer.log_every_n_steps != 0:
+            return
+        named = [(n, p) for n, p in self.model.named_parameters() if p.grad is not None]
+        if not named:
+            return
+        grads = [p.grad.detach() for _, p in named]
+        stats = torch.stack([
+            torch.stack(torch._foreach_norm(grads)),
+            torch.stack([g.abs().max() for g in grads]),
+            torch.stack([g.abs().min() for g in grads]),
+            torch.stack(torch._foreach_norm([p.detach() for _, p in named])),
+        ]).float().cpu()
+        g_norm, g_max, g_min, p_norm = stats
+        metrics = {"train/grad_norm": g_norm.norm().item(), "train/grad_abs_max": g_max.max().item(),
+                   "train/grad_abs_min": g_min.min().item(), "train/param_norm": p_norm.norm().item()}
+        if self.grad_stats in ("module", "parameter"):
+            sq = {}
+            for (name, _), v in zip(named, g_norm.tolist()):
+                sq[_module_of(name)] = sq.get(_module_of(name), 0.) + v * v
+            metrics.update({f"train/grad_norm/{m}": s ** 0.5 for m, s in sq.items()})
+        if self.grad_stats == "parameter":
+            for (name, _), n, mx, mn in zip(named, g_norm.tolist(), g_max.tolist(), g_min.tolist()):
+                metrics[f"grad/{name}/norm"], metrics[f"grad/{name}/abs_max"], metrics[f"grad/{name}/abs_min"] = n, mx, mn
+        self.logger.log_metrics(metrics, step=self.global_step)
+
+    # ------------------------------------------------------------------ validation
+    def validation_step(self, batch, batch_idx):
+        if batch is None:                       # system that could not be featurised (on_error="skip")
+            return
+        f = batch.features
+        _, logs = self.loss_fn(self.model.forward(f), f)        # .forward: eager even if the model is compiled
+        for k, v in logs.items():
+            self.val_metrics["loss" if k == "loss" else f"loss_{k}"].update(v)
+        x = self.model.sample_diffusion(f, num_sample=self.val["num_samples"], steps=self.val["steps"],
+                                        align_ref_pos=False)
+        for k, v in sample_metrics(x, f).items():
+            self.val_metrics[k].update(v)
+
+    def on_validation_epoch_end(self) -> None:
+        for name, metric in self.val_metrics.items():
+            value = metric.compute()            # synced over the ranks
+            metric.reset()
+            if torch.isfinite(value):           # e.g. inter_clash stays empty if every system has one chain
+                self.log(f"val/{name}", value, prog_bar=name in ("loss", "lrmsd"))
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.optim["lr"], betas=tuple(self.optim["betas"]),
+                                     eps=self.optim["eps"])
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, af3_lr_lambda(**self.optim["scheduler"]))
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}

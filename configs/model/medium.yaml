@@ -1,0 +1,56 @@
+# Released PhysDock model (data/params/params.pt). Other sizes (toy / tiny / small / full) override the block counts.
+c_z: 128                        # pair channels
+num_augmentation_sample: 48     # noisy samples per structure in training
+distogram_bins: 39
+
+encoder:                        # MSATemplEncoder (DiffusionConditioning)
+  ref_dim: 167                  # per-atom reference features (see PhysDock.data.FEATURES)
+  target_dim: 65                # per-token target features
+  msa_dim: 34                   # per-MSA-row features
+  templ_dim: 40                 # template features [distogram 39, mask 1]
+  key_res_dim: 7                # key-residue (PLIP) flags
+  ligand_pair_dim: 42           # ligand pair features
+  c_a: 128                      # atom channels
+  c_ap: 16                      # atom-pair channels
+  c_s: 512                      # token channels
+  c_m: 256                      # MSA channels
+  c_z: ${..c_z}
+  inf: 1.0e9                    # masked attention logits get -inf
+  eps: 1.0e-8                   # norm epsilon
+  no_blocks_atom: 3
+  no_blocks_evoformer: 4
+  no_blocks_template: 2
+  no_blocks_pairformer: 24
+  r_max: 32                     # relative residue position clip
+  s_max: 2                      # relative chain index clip
+
+decoder:                        # AllAtomDecoder (DiffusionModule)
+  c_a: ${..encoder.c_a}
+  c_ap: ${..encoder.c_ap}
+  c_s: ${..encoder.c_s}
+  c_z: ${..c_z}
+  inf: ${..encoder.inf}
+  eps: ${..encoder.eps}
+  no_blocks_atom: 3             # atom DiT encoder and decoder
+  no_blocks_dit: 12             # token DiT
+
+diffusion:
+  # EDM variance exploding: z = x + t * e (released parameters); noise levels in units of sigma_data
+  type: edm_ve
+  sigma_data: 16.0                # data scale (Angstrom)
+  trans_scale: 1.0                # std of the random translation of the training samples (Angstrom)
+  noise_conditioning: legacy      # released parameters use t * ln(t / sigma) / 4; "af3" = ln(t / sigma) / 4 for new models
+  time_sampler:                   # training noise levels: ln(s) ~ N(mean, std^2)
+    mean: -1.2
+    std: 1.5
+  noise_schedule:                 # Karras schedule of the sampler; s_min 4e-3 as in the released code
+    s_min: 4.0e-3
+    s_max: 160.0
+    rho: 7.0
+  sampler:                        # AF3 Alg. 18
+    gamma_0: 0.8
+    gamma_min: 1.0
+    noise_scale: 1.003
+    step_scale: 1.5
+    ode_step_scale: 1.0
+    trans_scale: 1.0

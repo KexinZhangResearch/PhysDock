@@ -1,0 +1,15 @@
+# Training loss (PhysDock.models.loss.PhysDockLoss), PhysDock2 style.
+sigma_data: ${model.diffusion.sigma_data}
+weights:
+  x_mse: 4.0                    # aligned MSE of all atoms (EDM weighted)
+  ligand_mse: 0.5               # MSE of the ligand superposed on the ligand (EDM weighted)
+  smooth_lddt: 4.0              # smooth lDDT of all atom pairs closer than max_clamp_distance
+  within_smooth_lddt: 0.5       # smooth lDDT of the pairs inside each residue / ligand
+  distogram: 0.03
+alpha_ligand: 10.0              # ligand weight in the x_mse superposition (1 + alpha_ligand)
+ligand_align_weight: 1000.0     # ligand_mse superposition: ligand atoms x, other atoms 1 / x
+max_clamp_distance: 15.0
+distogram:
+  min_bin: 3.25
+  max_bin: 50.75
+  no_bins: ${model.distogram_bins}

@@ -37,8 +37,8 @@ apt install hhsuite hmmer
 
 # Download Databases (UniRef90, MGnify, UniProt, Uniclust30, BFD) -> data/homo_data
 # ~465 GB download, ~2.3 TB after extraction; parallel, resumable, checksum-verified
-python scripts/download_homo_data.py                       # all five
-python scripts/download_homo_data.py --only uniref90 bfd   # or a subset
+python scripts/download/download_homo_data.py                       # all five
+python scripts/download/download_homo_data.py --only uniref90 bfd   # or a subset
 ```
 
 * We provide a conda `.yaml` file to create environment to run PhysDock
@@ -56,15 +56,15 @@ conda activate PhysDock
 
 ```shell
 # Download latest EMA Params (params.pt) and the params used in the paper (params_2418.pt)
-python scripts/download_params.py --link
+python scripts/download/download_params.py --link
 ```
 
-All `scripts/download_*.py` share the same engine (`scripts/downloader.py`): every file is fetched with up to
+All `scripts/download/download_*.py` share the same engine (`scripts/download/downloader.py`): every file is fetched with up to
 `--workers` (default 96) parallel connections, each fetching small byte ranges, progress is checkpointed so an interrupted run resumes when
 the same command is re-executed, every file is verified against the checksum published by its host (md5, or
 crc32c / gzip-CRC where that is all the host provides), and archives are merged/extracted as soon as they are
 verified. Source archives are kept under `data/<section>/tmp` unless `--delete-archives` is given. Use
-`--dry-run` to see what would be downloaded and `python scripts/download_all.py` to fetch params, benchmarks and
+`--dry-run` to see what would be downloaded and `python scripts/download/download_all.py` to fetch params, benchmarks and
 the training dataset at once (`--all` adds the sequence databases). Everything lands in `<repo>/data`; only
 `data/demo` is tracked by git.
 `pip install google-crc32c` enables fast crc32c verification of the MGnify database.
@@ -77,82 +77,101 @@ PhysDock provides convenient inference scripts for two scenarios: **redocking** 
 
 In PhysDock, a system encompasses one or more receptor chains along with a ligand. The input is **a `.pdb` file** of receptor and a `.sdf` file of ligand, while the output consists of the raw features (`.pkl.gz` file) for model input, typically structural-related features. In addition to structural features, PhysDock generates MSA-related features, including `msa_feature` and `uniprot_msa_feature`, by searching all sequence databases. We utilize the **MD5 encoding** of the protein sequence as a query to reuse the MSA features. Moreover, the raw feature can also encompass key residues involved in interactions processed by **PLIP**, and specify high-importance key residues with a certain probability during inference.
 
-Below is an example of system preparation of demo input system.
+Every task has a Python entry point and a demo shell script in `scripts/`; the inference and training scripts read
+their settings from `configs/` ([Hydra](https://hydra.cc)): every yaml value can be overridden as `key=value`
+(nested keys with dots, also as extra arguments of the demo scripts) and `--cfg job` prints the resolved config.
+
+```
+scripts/
+  download/   download_{all,params,benchmarks,dataset,homo_data}.py, downloader.py (shared engine)
+  prepare/    prepare_system.py + .sh   system pickle from a receptor PDB and a ligand SDF
+              homo_search.py + .sh      MSA search (needs the sequence databases)
+  infer/      infer.py + .sh            redock one system            (configs/infer.yaml)
+              redocking.py + .sh        redock a folder of systems   (configs/redocking.yaml)
+              screening.py + .sh        virtual screening            (configs/screening.yaml)
+              docking.sh                full pipeline: prepare -> MSA search -> redocking
+  train/      train.py + .sh            training                     (configs/train.yaml)
+configs/
+  infer.yaml  redocking.yaml  screening.yaml  train.yaml
+  model/      model sizes toy / tiny / small / medium (released) / full / medium_linear (with diffusion),
+              features.yaml (featurisation), loss.yaml, data.yaml (training data)
+  trainer/    default.yaml (Trainer, optimiser, EMA, checkpoints, wandb, gradient statistics), ddp.yaml
+```
+
+`scripts/prepare/*.py` take ordinary command-line options (`-h`). The demo scripts work from any directory.
+
+System preparation of the demo input system (receptor PDB, ligand SDF and ligand CCD id in, system `.pkl.gz` and
+FASTA files out), then the MSA search:
 
 ```shell
-BASE=$(dirname $0)
-
-# Generate systems pkl.gz
-# The receptor pdb and ligand sdf and ligand CCD id are inputs.
-# The output is a system `pkl.gz`
-python $BASE/prepare_system.py \
-  --receptor_pdb_path $BASE/data/demo/system_preparation/receptor.pdb \
-  --ligand_sdf_path $BASE/data/demo/system_preparation/EJQ.sdf \
-  --ligand_ccd_id EJQ \
-  --systems_dir $BASE/data/demo/system_preparation/systems
-
-# Get MSA features
-python $BASE/run_homo_search.py \
-  --input_fasta_path $BASE/data/demo/system_preparation/systems/fastas \
-  --features_dir $BASE/data/demo/system_preparation/features \
-  --bfd_database_path $BASE/data/homo_data/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt \
-  --uniclust30_database_path $BASE/data/homo_data/uniclust30/uniclust30_2018_08/uniclust30_2018_08 \
-  --uniref90_database_path $BASE/data/homo_data/uniref90.fasta \
-  --mgnify_database_path $BASE/data/homo_data/mgy_clusters_2022_05.fa \
-  --uniprot_database_path $BASE/data/homo_data/uniprot.fasta \
-  --jackhmmer_binary_path /usr/bin/jackhmmer \
-  --hhblits_binary_path /usr/bin/hhblits
-
+sh scripts/prepare/prepare_system.sh
+sh scripts/prepare/homo_search.sh        # databases in data/homo_data (or HOMO_DATA=<dir>)
 ```
 
 ### Redocking
 
-The redocking procedure can refer to the following script `redocking_demo.sh`.
+```shell
+sh scripts/infer/infer.sh                # one system  -> out/5SAK_ZRY
+sh scripts/infer/redocking.sh            # all demo systems (ranking=true needs scikit-learn)
+```
 
 ```shell
-# Run Demo
-sh redocking_demo.sh
-```
+# One system with explicit inputs
+python scripts/infer/infer.py \
+  input_pkl=data/demo/redocking/Posebusters_subset/5SAK_ZRY_A_1.pkl.gz \
+  msa_features=data/demo/redocking/features/msa_features \
+  uniprot_msa_features=data/demo/redocking/features/uniprot_msa_features \
+  output_dir=out/5SAK_ZRY
 
-```python
-# redocking_demo.sh
-BASE=$(dirname $0)
-
-python $BASE/redocking.py \
-  -i $BASE/data/demo/redocking/Posebusters_subset \
-  -f $BASE/data/demo/redocking/features \
-  --crop_size 256 \
-  --atom_crop_size 2048 \
-  --enable_physics_correction \
-  --use_pocket \
-  --use_key_res \
-  --enable_ranking
-```
-
-```python
-# Get Help Info
-python redocking.py -h
+# All options and their defaults
+python scripts/infer/redocking.py --cfg job
 ```
 
 ### Virtual Screening
 
-The VS procedure can refer to the following script `screning.sh`.  Here, it should be noted that when conducting screening for a specified pocket, the position of the ligand in the system `.pkl.gz` file (from System Preparation procedure) will serve as the search area for the pocket.
+When screening against a pocket, the position of the ligand in the system `.pkl.gz` file (from System Preparation)
+defines the pocket.
 
 ```shell
-# Run Demo
-sh screening_demo.sh
+sh scripts/infer/screening.sh
 ```
 
 ### Full Docking Pipeline
 
 ```shell
-# Run full pipeline
-sh docking_demo.sh
+sh scripts/infer/docking.sh
 ```
 
 ### Other application scenarios
 
 Other application scenarios, such as blind docking, cross docking or standard precision (SP) flexiable docking can be implemented by specifying different parameters of python scripts. 
+
+## Training
+
+Training uses PyTorch Lightning (`scripts/train/train.py`, `configs/train.yaml`) with an exponential moving average of the
+weights (decay 0.999; validation and checkpoints for inference use the EMA weights) and logs to
+[wandb](https://wandb.ai) (`wandb login` once, or `logger.offline=true`; `logger=null` disables logging):
+
+* every step: `train/loss`, the loss terms and `train/lr`
+* every `trainer.log_every_n_steps`: `train/grad_norm`, `grad_abs_max`, `grad_abs_min`, `param_norm`, the gradient
+  norm of every module and, with `grad_stats=parameter` (default), `grad/<parameter>/{norm,abs_max,abs_min}`
+* every validation (`trainer.val_check_interval`): the diffusion loss and its terms (`val/loss*`) and, from structures
+  sampled by the model, ligand RMSD, success rate (< 2 A), ligand MSE, smooth lDDT, ligand bond / angle error and
+  inter-chain clashes, averaged over the validation systems (currently a fixed subset of the training set)
+
+The released training set is downloaded with `python scripts/download/download_dataset.py` (`data/v1`).
+
+```shell
+python scripts/train/train.py                                   # released model size, 1 GPU
+python scripts/train/train.py trainer=ddp                       # all GPUs of the node
+python scripts/train/train.py compile=true                      # torch.compile the training forward pass
+python scripts/train/train.py init_from=data/params/params.pt   # fine-tune the released weights
+python scripts/train/train.py ckpt_path=logs/train/<run>/checkpoints/last.ckpt    # resume
+sh scripts/train/train.sh                                                           # quick test (toy model)
+```
+
+Runs are written to `logs/train/<date>/` (checkpoints, wandb files, config). A training checkpoint can be used for
+inference directly (`params=logs/train/<run>/checkpoints/last.ckpt`, the EMA weights are used).
 
 ## Available Data
 
@@ -169,15 +188,15 @@ The training dataset, the preprocessed benchmark dataset, and the prediction res
 ```shell
 # Download all the preprocessed benchmark dataset including Posebusters, DeepDockingDare and PhiBench.
 # -> data/benchmarks/{PoseBusters,DeepDockingDare,PhiBench,features}
-python scripts/download_benchmarks.py
+python scripts/download/download_benchmarks.py
 ```
 
 * The training and validation dataset can be download by the following scripts
 
 ```shell
 # -> data/v1/{train_val, train_val_samples_weights.json, msa_features, uniprot_msa_features}  (~145 GB)
-python scripts/download_dataset.py
-python scripts/download_dataset.py --only train_val weights   # or a subset
+python scripts/download/download_dataset.py
+python scripts/download/download_dataset.py --only train_val weights   # or a subset
 ```
 
 

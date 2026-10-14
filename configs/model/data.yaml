@@ -1,0 +1,9 @@
+# Training data (PhysDock.training.PhysDockDataModule). Validation currently uses a fixed random subset of the same
+# training systems, featurised like inference (crop around the ligand, no augmentation).
+root: ${root_dir}/data/v1         # train_val/, msa_features/, uniprot_msa_features/, train_val_samples_weights.json
+samples_per_epoch: 10000          # weighted random systems per epoch
+num_workers: 8
+num_val_systems: 32               # validation systems (fixed subset, seed ${seed})
+val_num_workers: 4
+ccd: ${ccd}
+seed: ${seed}

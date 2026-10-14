@@ -1,0 +1,11 @@
+defaults:
+  - medium
+  - _self_
+
+encoder:
+  no_blocks_atom: 2
+  no_blocks_evoformer: 3
+  no_blocks_pairformer: 16
+decoder:
+  no_blocks_atom: 2
+  no_blocks_dit: 8

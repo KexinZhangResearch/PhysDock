@@ -1,0 +1,45 @@
+# @package _global_
+# Training: Lightning Trainer, optimiser, EMA, checkpoints, wandb logging, gradient statistics.
+trainer:                          # lightning.pytorch.Trainer arguments
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  num_nodes: 1
+  precision: 32                   # bf16-mixed crashed in the OuterProductMean backward on torch 2.4 + H20
+  max_steps: 1000000
+  gradient_clip_val: 10.0
+  accumulate_grad_batches: 1
+  log_every_n_steps: 10
+  val_check_interval: 2000        # training steps between validations
+  check_val_every_n_epoch: null
+  limit_val_batches: 1.0
+  num_sanity_val_steps: 0
+  use_distributed_sampler: false  # the data module shards training (weighted) and validation over the ranks itself
+
+optim:                            # Adam, linear warmup then stepwise exponential decay (released PhysDock schedule)
+  lr: 1.8e-3
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  scheduler:
+    warmup_steps: 1000
+    start_decay_after: 1000
+    decay_every: 1000
+    decay_factor: 0.998
+
+ema:                              # moving average of the weights; validation and checkpoints use it for inference
+  decay: 0.999
+  warm_start: true
+
+checkpoint:                       # lightning.pytorch.callbacks.ModelCheckpoint
+  every_n_train_steps: 2000
+  save_top_k: -1
+  save_last: true
+
+logger:                           # lightning.pytorch.loggers.WandbLogger; logger=null disables logging
+  project: PhysDock
+  name: ${task_name}
+  offline: false                  # true: log locally (wandb sync later)
+  log_model: false
+
+grad_stats: parameter             # gradient statistics every log_every_n_steps: total | module | parameter
+                                  # (parameter: norm / abs_min / abs_max of every parameter, plus module and total)

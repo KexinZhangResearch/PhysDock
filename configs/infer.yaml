@@ -1,0 +1,45 @@
+# Redock ONE system:
+#   python scripts/infer/infer.py input_pkl=data/demo/redocking/Posebusters_subset/5SAK_ZRY_A_1.pkl.gz \
+#       msa_features=data/demo/redocking/features/msa_features \
+#       uniprot_msa_features=data/demo/redocking/features/uniprot_msa_features output_dir=out/5SAK_ZRY \
+#       sampling.physics_correction=true features.use_pocket=true features.use_key_res=true features.crop_size=256
+# Output: ligand/receptor/system _gt and _pred_<k> files and summary.json in output_dir (plus .hydra/ with the config).
+defaults:
+  - model: medium                 # model/*.yaml (released: medium)
+  - model@features: features      # featurisation, see model/features.yaml
+  - _self_
+
+task_name: infer
+root_dir: ${oc.env:PHYSDOCK_ROOT}
+input_pkl: ???                  # system .pkl.gz (receptor + one single-component ligand chain)
+msa_features: ???               # folder with <md5>.pkl.gz MSA features
+uniprot_msa_features: ???       # folder with <md5>.pkl.gz UniProt MSA features
+output_dir: ???
+params: ${root_dir}/data/params/params.pt         # model weights (params.pt or a training checkpoint)
+ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
+device: null                    # default cuda:0 if available
+seed: null                      # null = nondeterministic
+matmul_precision: high          # TF32 matmuls, as the released pipeline
+
+sampling:
+  max_samples: 5                # samples to keep
+  physics_correction: false     # rounds with chirality check and physics guidance
+  max_rounds: 10                # max rounds (physics correction only)
+  num_samples_per_round: 5
+  steps: 40                     # denoising steps
+  mmff_iters: 5                 # MMFF steps per denoising step
+  eta: 6.0                      # adaptive factor of the physics projection
+  num_confs: 128                # RDKit reference conformers
+  rho: 1000                     # Karras noise schedule power
+
+features:                       # overrides of model/features.yaml (released single-system defaults)
+  crop_size: null
+  pocket_cutoff: 10.0
+  use_pocket: false
+  use_key_res: false
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

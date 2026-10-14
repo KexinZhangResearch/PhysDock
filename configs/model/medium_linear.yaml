@@ -1,0 +1,23 @@
+# Released model size with PhysDock2's flow-matching diffusion (train from scratch; no released weights).
+defaults:
+  - medium
+  - _self_
+
+diffusion:
+  type: linear
+  sigma_data: 16.0
+  trans_scale: 1.0
+  time_sampler:
+    mean: -1.2
+    std: 1.5
+  noise_schedule:
+    s_min: 4.0e-4
+    s_max: 160.0
+    rho: 1000.0
+  sampler:                        # plain probability-flow ODE (no churn, unit steps, no random translation)
+    gamma_0: 0.0
+    gamma_min: 1.0
+    noise_scale: 1.003
+    step_scale: 1.0
+    ode_step_scale: 1.0
+    trans_scale: 0.0

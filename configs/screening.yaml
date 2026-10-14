@@ -1,0 +1,46 @@
+# Dock every SMILES of a text file into one system (pocket from its reference ligand):
+#   python scripts/infer/screening.py input_pkl=data/demo/screening/6kzd.pkl.gz smiles=data/demo/screening/demo_db.txt \
+#       features_dir=data/demo/screening/features
+# Output: <output_dir>/<md5(smiles)>/tmp/... and <name>_smi_md5_meta_data.json (SMILES -> folder).
+defaults:
+  - model: medium                 # model/*.yaml (released: medium)
+  - model@features: features      # featurisation, see model/features.yaml
+  - _self_
+
+task_name: screening
+root_dir: ${oc.env:PHYSDOCK_ROOT}
+input_pkl: ???                  # system .pkl.gz
+smiles: ???                     # text file with one SMILES per line
+features_dir: ???               # folder with msa_features/ and uniprot_msa_features/
+output_dir: null                # default <input_pkl without extension>_screening
+params: ${root_dir}/data/params/params.pt
+ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
+device_id: 0
+num_workers: 4
+matmul_precision: high
+ranking: false
+sidechain_relaxation: false
+align_mode: pocket_ca
+
+sampling:
+  max_samples: 5
+  physics_correction: false
+  max_rounds: 10
+  num_samples_per_round: 5
+  steps: 40
+  mmff_iters: 5
+  eta: 6.0
+  num_confs: 128
+  rho: 1000
+
+features:                       # overrides of model/features.yaml
+  crop_size: null
+  pocket_cutoff: 10.0
+  use_pocket: false
+  use_key_res: false
+
+hydra:
+  run:
+    dir: ${root_dir}/logs/${task_name}/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

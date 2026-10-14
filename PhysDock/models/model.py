@@ -11,16 +11,31 @@ from PhysDock.models.primitives import Linear
 
 
 class PhysDock(nn.Module):
-    """Encoder and decoder keep the checkpoint names ``diffusion_conditioning`` and ``dit``."""
+    """Built from the model config (configs/model/*.yaml). Encoder and decoder keep the checkpoint names
+    ``diffusion_conditioning`` and ``dit``.
 
-    def __init__(self, config) -> None:
+    Args:
+        c_z: pair channels (input of the distogram head)
+        num_augmentation_sample: noisy samples per structure in training
+        encoder, decoder: MSATemplEncoder / AllAtomDecoder arguments
+        diffusion: diffusion settings (see models/diffusion.py)
+        distogram_bins: distogram head bins
+    """
+
+    def __init__(self, c_z: int, num_augmentation_sample: int, encoder, decoder, diffusion,
+                 distogram_bins: int = 39) -> None:
         super().__init__()
-        self.config = config
-        self.num_augmentation_sample = config.model.num_augmentation_sample
-        self.diffuser = build_diffuser(config.diffusion)
-        self.diffusion_conditioning = MSATemplEncoder(**config.model.encoder)
-        self.dit = AllAtomDecoder(**config.model.decoder)
-        self.linear_distogram = Linear(config.model.c_z, 39, init="final")
+        self.num_augmentation_sample = num_augmentation_sample
+        self.diffuser = build_diffuser(diffusion)
+        self.diffusion_conditioning = MSATemplEncoder(**encoder)
+        self.dit = AllAtomDecoder(**decoder)
+        self.linear_distogram = Linear(c_z, distogram_bins, init="final")
+
+    @classmethod
+    def from_config(cls, cfg) -> "PhysDock":
+        """Model from a model config (DictConfig of configs/model/*.yaml or a plain dict)."""
+        from PhysDock.configs import to_dict
+        return cls(**to_dict(cfg))
 
     def forward(self, batch):
         """Training step on one (padded) structure.

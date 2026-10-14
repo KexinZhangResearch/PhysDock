@@ -40,9 +40,12 @@ class TemplatePairEmbedder(nn.Module):
             [N_token, N_token, c_z] update
         """
         templ_feat = batch["templ_feat"]
-        same_chain = (batch["asym_id"][None] == batch["asym_id"][:, None]).type_as(templ_feat)
-        z_mask = pair_mask(batch["token_mask"]) * templ_feat[..., 39] * same_chain
-        z = self.linear_in(self.norm_in(z)) + self.linear_templ_feat(templ_feat)
+        same_chain = (batch["asym_id"][None] ==
+                      batch["asym_id"][:, None]).type_as(templ_feat)
+        z_mask = pair_mask(batch["token_mask"]) * \
+            templ_feat[..., 39] * same_chain
+        z = self.linear_in(self.norm_in(z)) + \
+            self.linear_templ_feat(templ_feat)
         z = self.triangleformer(z, z_mask)
         return (self.linear_out(F.relu(self.norm_out(z))).float() * batch["templ_mask"]).float()
 
@@ -50,11 +53,12 @@ class TemplatePairEmbedder(nn.Module):
 class RelPosEmbedder(nn.Module):
     """Relative residue / chain position features (AF3 Alg. 3) plus the ligand pair features."""
 
-    def __init__(self, c_z: int) -> None:
+    def __init__(self, c_z: int, r_max: int = 32, s_max: int = 2, ligand_pair_dim: int = 42) -> None:
         super().__init__()
-        self.r_max, self.s_max = 32, 2
-        # 66 residue bins + 42 ligand pair features + same entity + 6 chain bins = 115
-        self.linear = Linear(2 * self.r_max + 2 + 42 + 1 + 2 * self.s_max + 2, c_z, bias=False)
+        self.r_max, self.s_max = r_max, s_max
+        # residue bins (2 r_max + 2) + ligand pair features + same entity + chain bins (2 s_max + 2)
+        self.linear = Linear(2 * r_max + 2 + ligand_pair_dim + 1 +
+                             2 * s_max + 2, c_z, bias=False)
 
     def forward(self, batch) -> torch.Tensor:
         """
@@ -68,10 +72,13 @@ class RelPosEmbedder(nn.Module):
             asym, sym, entity, res = batch["asym_id"], batch["sym_id"], batch["entity_id"], batch["residue_index"]
             same_chain = asym[:, None] == asym[None, :]
             same_entity = entity[:, None] == entity[None, :]
-            d_res = torch.clamp(res[:, None] - res[None, :] + self.r_max, 0, 2 * self.r_max)
+            d_res = torch.clamp(
+                res[:, None] - res[None, :] + self.r_max, 0, 2 * self.r_max)
             d_res = torch.where(same_chain, d_res, 2 * self.r_max + 1)
-            d_chain = torch.clamp(sym[:, None] - sym[None, :] + self.s_max, 0, 2 * self.s_max)
-            d_chain = torch.where(same_chain | ~same_entity, 2 * self.s_max + 1, d_chain)
+            d_chain = torch.clamp(
+                sym[:, None] - sym[None, :] + self.s_max, 0, 2 * self.s_max)
+            d_chain = torch.where(same_chain | ~same_entity,
+                                  2 * self.s_max + 1, d_chain)
             rel_feat = torch.cat([
                 F.one_hot(d_res.long(), 2 * self.r_max + 2).float(),
                 batch["ligand_pair_feat"],
@@ -93,7 +100,8 @@ class AtomEmbedder(nn.Module):
         self.linear_c_l = Linear(c_a, c_ap, bias=False)
         self.linear_c_m = Linear(c_a, c_ap, bias=False)
         self.ffn = FeedForward(c_ap)
-        self.atom_transformer = AtomTransformer(c_a, c_ap, inf, eps, no_blocks_atom)
+        self.atom_transformer = AtomTransformer(
+            c_a, c_ap, inf, eps, no_blocks_atom)
 
     def forward(self, batch):
         """
@@ -107,9 +115,11 @@ class AtomEmbedder(nn.Module):
         with torch.no_grad():
             d = (ref_pos[:, None, :] - ref_pos[None, :, :]).float()
             conf = batch["atom_to_conformer"]
-            v = (conf[:, None] == conf[None, :]).float()[..., None]      # 1 for atom pairs of the same conformer
+            # 1 for atom pairs of the same conformer
+            v = (conf[:, None] == conf[None, :]).float()[..., None]
         a = self.linear_c(batch["ref_feat"])
-        ap = self.linear_c_l(F.relu(a))[:, None] + self.linear_c_m(F.relu(a))[None, :]
+        ap = self.linear_c_l(F.relu(a))[:, None] + \
+            self.linear_c_m(F.relu(a))[None, :]
         ap = ap + (self.linear_p(d) * v + self.linear_d(1 / (1 + torch.norm(d, dim=-1)[..., None])) * v
                    + self.linear_v(v) * v)
         ap = ap + self.ffn(ap)
@@ -121,19 +131,22 @@ class TokenEmbedder(nn.Module):
     """Pool atoms to tokens, add token / pair / MSA features, run Evoformer, template embedder and Pairformer."""
 
     def __init__(self, target_dim: int, msa_dim: int, c_a: int, c_s: int, c_m: int, c_z: int, inf: float, eps: float,
-                 no_blocks_evoformer: int, no_blocks_pairformer: int) -> None:
+                 no_blocks_evoformer: int, no_blocks_pairformer: int, no_blocks_template: int = 2,
+                 templ_dim: int = 40, key_res_dim: int = 7, r_max: int = 32, s_max: int = 2,
+                 ligand_pair_dim: int = 42) -> None:
         super().__init__()
         self.linear_a = Linear(c_a, c_s)
         self.linear_target_feat = Linear(target_dim, c_s, bias=False)
-        self.linear_key_res_feat = Linear(7, c_s, bias=False)
+        self.linear_key_res_feat = Linear(key_res_dim, c_s, bias=False)
         self.linear_pocket_res_feat = Linear(1, c_s, bias=False)
         self.linear_s_i = Linear(c_s, c_z)
         self.linear_s_j = Linear(c_s, c_z)
-        self.rel_pos_embedder = RelPosEmbedder(c_z)
+        self.rel_pos_embedder = RelPosEmbedder(c_z, r_max, s_max, ligand_pair_dim)
         self.linear_bonds = Linear(1, c_z, bias=False)
         self.linear_msa_feat = Linear(msa_dim, c_m, bias=False)
         self.linear_s_input = Linear(c_s, c_m)
-        self.template_pair_embedder = TemplatePairEmbedder(40, c_z, inf, eps, no_blocks=2)
+        self.template_pair_embedder = TemplatePairEmbedder(
+            templ_dim, c_z, inf, eps, no_blocks_template)
         self.evoformer = Evoformer(c_m, c_z, inf, eps, no_blocks_evoformer)
         self.pairformer = Pairformer(c_s, c_z, inf, eps, no_blocks_pairformer)
         self.linear_m = Linear(c_m, c_s, bias=False)
@@ -163,14 +176,18 @@ class TokenEmbedder(nn.Module):
 
 
 class MSATemplEncoder(nn.Module):
-    """Encoder of one structure; its output conditions every sample and denoising step of the decoder."""
+    """Encoder of one structure; its output conditions every sample and denoising step of the decoder. (Nature Communications DiffusionConditioning)"""
 
     def __init__(self, ref_dim: int, target_dim: int, msa_dim: int, c_a: int, c_ap: int, c_s: int, c_m: int, c_z: int,
-                 inf: float, eps: float, no_blocks_atom: int, no_blocks_evoformer: int, no_blocks_pairformer: int) -> None:
+                 inf: float, eps: float, no_blocks_atom: int, no_blocks_evoformer: int, no_blocks_pairformer: int,
+                 no_blocks_template: int = 2, templ_dim: int = 40, key_res_dim: int = 7, r_max: int = 32,
+                 s_max: int = 2, ligand_pair_dim: int = 42) -> None:
         super().__init__()
-        self.atom_embedder = AtomEmbedder(ref_dim, c_a, c_ap, inf, eps, no_blocks_atom)
+        self.atom_embedder = AtomEmbedder(
+            ref_dim, c_a, c_ap, inf, eps, no_blocks_atom)
         self.token_embedder = TokenEmbedder(target_dim, msa_dim, c_a, c_s, c_m, c_z, inf, eps, no_blocks_evoformer,
-                                            no_blocks_pairformer)
+                                            no_blocks_pairformer, no_blocks_template, templ_dim, key_res_dim,
+                                            r_max, s_max, ligand_pair_dim)
         self.norm_s = RMSNorm(c_s, eps=eps)
         self.linear_s = Linear(c_s, c_a, bias=False)
         self.norm_z = RMSNorm(c_z, eps=eps)
@@ -181,6 +198,8 @@ class MSATemplEncoder(nn.Module):
         idx = batch["atom_to_token"]
         a, ap = self.atom_embedder(batch)
         s, z = self.token_embedder(batch, a)
-        a = a + self.linear_s(self.norm_s(s))[idx]                    # token -> atom
-        ap = ap + self.linear_z(self.norm_z(z))[idx][:, idx]          # token pair -> atom pair
+        # token -> atom
+        a = a + self.linear_s(self.norm_s(s))[idx]
+        # token pair -> atom pair
+        ap = ap + self.linear_z(self.norm_z(z))[idx][:, idx]
         return Conditions(a, ap, s, z)

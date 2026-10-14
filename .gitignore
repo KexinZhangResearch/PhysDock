@@ -204,7 +204,7 @@ __marimo__/
 params/params.pt
 out/
 
-# Downloaded data (scripts/download_*.py): everything under data/ is ignored except the bundled demo and the CCD metadata
+# Downloaded data (scripts/download/download_*.py): everything under data/ is ignored except the bundled demo and the CCD metadata
 
 data/*
 !data/demo/
@@ -213,3 +213,8 @@ data/*
 
 third_party/
 .claude/
+# Hydra / training logs
+logs/
+
+
+todo.txt

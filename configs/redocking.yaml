@@ -1,0 +1,44 @@
+# Redock every system of a folder:
+#   python scripts/infer/redocking.py input_dir=data/demo/redocking/Posebusters_subset features_dir=data/demo/redocking/features
+# Output: <output_dir>/<system>/tmp/{ligand,receptor,system}_{gt,pred_<k>}.* (ranked files with ranking=true).
+defaults:
+  - model: medium                 # model/*.yaml (released: medium)
+  - model@features: features      # featurisation, see model/features.yaml
+  - _self_
+
+task_name: redocking
+root_dir: ${oc.env:PHYSDOCK_ROOT}
+input_dir: ???                  # folder of system .pkl.gz
+features_dir: ???               # folder with msa_features/ and uniprot_msa_features/
+output_dir: null                # default <input_dir>_predictions
+params: ${root_dir}/data/params/params.pt
+ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
+device_id: 0
+num_workers: 4                  # featurisation workers
+matmul_precision: high
+ranking: false                  # K-means clustering and ranking of the samples (needs scikit-learn)
+sidechain_relaxation: false     # OpenMM side-chain relaxation of the ranked samples (needs openmm, pdbfixer)
+align_mode: pocket_ca
+
+sampling:
+  max_samples: 5
+  physics_correction: false
+  max_rounds: 10
+  num_samples_per_round: 5
+  steps: 40
+  mmff_iters: 5
+  eta: 6.0
+  num_confs: 128
+  rho: 1000
+
+features:                       # overrides of model/features.yaml
+  crop_size: null
+  pocket_cutoff: 10.0
+  use_pocket: false
+  use_key_res: false
+
+hydra:
+  run:
+    dir: ${root_dir}/logs/${task_name}/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

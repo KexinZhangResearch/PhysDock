@@ -17,7 +17,7 @@ def _pad_rows(msa: np.ndarray, deletion: np.ndarray, rows: int):
     return msa[:rows], deletion[:rows]
 
 
-def pair_and_merge(chains):
+def pair_and_merge(chains, msa_rows: int = MSA_ROWS):
     """Merged MSA of all chains.
 
     Every protein chain gets [paired UniProt rows (<= 8192); its own MSA padded to the remaining rows], every ligand
@@ -42,12 +42,12 @@ def pair_and_merge(chains):
             n_res = msa_all.shape[1]
             msa_all = np.concatenate([msa_all, np.full([1, n_res], MSA_GAP, msa_all.dtype)], axis=0)[paired[:, i]]
             del_all = np.concatenate([del_all, np.zeros([1, n_res], del_all.dtype)], axis=0)[paired[:, i]]
-        n_all = min(len(msa_all), MSA_ROWS // 2)
-        msa, deletion = _pad_rows(c.msa, c.deletion_matrix, MSA_ROWS - n_all)
+        n_all = min(len(msa_all), msa_rows // 2)
+        msa, deletion = _pad_rows(c.msa, c.deletion_matrix, msa_rows - n_all)
         merged.append((c, np.concatenate([msa_all[:n_all], msa], axis=0),
                        np.concatenate([del_all[:n_all], deletion], axis=0)))
     for c in ligands:
-        merged.append((c, *_pad_rows(c.msa, c.deletion_matrix, MSA_ROWS)))
+        merged.append((c, *_pad_rows(c.msa, c.deletion_matrix, msa_rows)))
 
     merged.sort(key=lambda m: int(m[0].entity_id[0]))      # stable: list order within an entity
     out = {"msa": np.concatenate([m[1] for m in merged], axis=1),

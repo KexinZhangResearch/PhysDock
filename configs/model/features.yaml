@@ -1,0 +1,29 @@
+# Featurisation (PhysDock.data.FeatureConfig). Defaults = released inference pipeline.
+crop_size: 256                  # max tokens of the spatial crop; null = no crop
+atom_crop_size: 2048            # max atoms of the crop
+msa_rows: 16384                 # rows of the merged MSA (padded by resampling rows)
+max_msa_clusters: 128           # MSA rows given to the model (query + random rows)
+num_msa_samples: 1              # > 1: extra MSA samples for the redocking rounds
+key_res_random_mask_ratio: 0.5  # prob. that a key-residue flag is masked (also at inference, as released)
+pocket_type: atom               # atom: any atom within the cutoff / ca: CA within the cutoff
+pocket_cutoff: 6.0              # Angstrom
+pocket_dist_type: ligand        # ligand: distance to any ligand atom / ligand_centre: to the ligand centre
+use_pocket: true
+use_key_res: true
+use_x_gt_ligand_as_ref_pos: false   # ablation only
+# training only (random pocket / key-residue settings, crop and template augmentation)
+train_pocket_type_atom_ratio: 0.5
+train_pocket_cutoff_ligand_min: 6.0
+train_pocket_cutoff_ligand_max: 12.0
+train_pocket_cutoff_ligand_centre_min: 10.0
+train_pocket_cutoff_ligand_centre_max: 16.0
+train_pocket_dist_type_ligand_ratio: 0.5
+train_use_pocket_ratio: 0.5
+train_use_key_res_ratio: 0.5
+train_shuffle_sym_id: true
+train_spatial_crop_ligand_ratio: 0.2
+train_spatial_crop_interface_ratio: 0.4
+train_spatial_crop_interface_threshold: 15.0
+train_charility_augmentation_ratio: 0.1
+train_use_template_ratio: 0.25  # prob. that the template is used
+train_template_mask_max_ratio: 0.4

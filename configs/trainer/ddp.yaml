@@ -1,0 +1,9 @@
+# @package _global_
+# All GPUs of the node (multi-node: trainer.num_nodes=N, launched by the cluster).
+defaults:
+  - default
+  - _self_
+
+trainer:
+  devices: -1
+  strategy: ddp

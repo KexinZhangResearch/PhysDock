@@ -140,29 +140,70 @@ class PhysDockCollator:
 
 
 def seed_worker(worker_id: int) -> None:
-    """worker_init_fn: seed NumPy per worker (torch only seeds random / torch) and use one torch thread."""
-    np.random.seed(torch.initial_seed() % 2 ** 32)
+    """worker_init_fn: seed NumPy per worker (torch only seeds random / torch) and use one torch thread.
+
+    Under DDP every rank starts from the same seed; ranks > 0 get an offset so their workers draw different numbers.
+    """
+    seed = torch.initial_seed() % 2 ** 32
+    rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+    if rank > 0:
+        seed = (seed + 1000003 * rank) % 2 ** 32
+        random.seed(seed)
+        torch.manual_seed(seed)
+    np.random.seed(seed)
     torch.set_num_threads(1)
 
 
-class PhysDockDataloader(DataLoader):
-    """DataLoader with PhysDockCollator, per-worker seeding and optional weighted sampling (dataset.sample_weights)."""
+class WeightedDistributedSampler(torch.utils.data.Sampler):
+    """Weighted sampling with replacement, split over DDP ranks: every rank draws num_samples / world_size indices
+    from its own random stream (seed + epoch + rank). Call set_epoch(epoch) for new draws (Lightning does)."""
 
-    def __init__(self, dataset: PhysDockDataset, batch_size: int = 1, shuffle: bool = False, num_workers: int = 0,
-                 weighted_sampling: bool = False, num_samples: int = None, seed: int = None, **kwargs) -> None:
-        generator = None
-        if seed is not None:
-            generator = torch.Generator()
-            generator.manual_seed(seed)
-        sampler = None
-        if weighted_sampling:
-            if dataset.sample_weights is None:
-                raise ValueError("weighted_sampling needs a dataset with sample_weights")
+    def __init__(self, weights, num_samples: int, seed: int = 0) -> None:
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+        self.rank = torch.distributed.get_rank() if dist else 0
+        self.world_size = torch.distributed.get_world_size() if dist else 1
+        self.num_samples = -(-num_samples // self.world_size)          # per rank
+        self.seed, self.epoch = seed, 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + 1000003 * self.epoch + self.rank)
+        return iter(torch.multinomial(self.weights, self.num_samples, replacement=True, generator=g).tolist())
+
+
+def PhysDockDataloader(dataset: PhysDockDataset, batch_size: int = 1, shuffle: bool = False, num_workers: int = 0,
+                       weighted_sampling: bool = False, num_samples: int = None, seed: int = None,
+                       distributed: bool = False, **kwargs) -> DataLoader:
+    """DataLoader with PhysDockCollator, per-worker seeding and optional weighted sampling (dataset.sample_weights).
+
+    Args:
+        weighted_sampling: draw num_samples (default len(dataset)) entries with replacement by sample_weights
+        seed: seed of the sampler, for reproducible epochs
+        distributed: weighted sampling split over DDP ranks (WeightedDistributedSampler)
+    """
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+    sampler = kwargs.pop("sampler", None)
+    if weighted_sampling:
+        if dataset.sample_weights is None:
+            raise ValueError("weighted_sampling needs a dataset with sample_weights")
+        if distributed:
+            sampler = WeightedDistributedSampler(dataset.sample_weights, num_samples or len(dataset), seed or 0)
+        else:
             sampler = WeightedRandomSampler(dataset.sample_weights, num_samples or len(dataset), replacement=True,
                                             generator=generator)
-            shuffle = False
-        kwargs.setdefault("collate_fn", PhysDockCollator())
-        kwargs.setdefault("worker_init_fn", seed_worker)
-        kwargs.setdefault("persistent_workers", num_workers > 0)
-        super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers,
-                         generator=generator, **kwargs)
+        shuffle = False
+    kwargs.setdefault("collate_fn", PhysDockCollator())
+    kwargs.setdefault("worker_init_fn", seed_worker)
+    kwargs.setdefault("persistent_workers", num_workers > 0)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers,
+                      generator=generator, **kwargs)

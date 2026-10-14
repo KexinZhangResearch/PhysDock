@@ -1,0 +1,37 @@
+# python scripts/train/train.py [overrides], e.g.
+#   python scripts/train/train.py trainer=ddp                          # all GPUs of the node
+#   python scripts/train/train.py model=toy trainer.max_steps=200 data.samples_per_epoch=100     (quick test)
+#   python scripts/train/train.py init_from=data/params/params.pt      # fine-tune the released weights
+#   python scripts/train/train.py ckpt_path=logs/train/<run>/checkpoints/last.ckpt               (resume)
+#   python scripts/train/train.py compile=true logger.offline=true
+defaults:
+  - model: medium                 # model/{toy,tiny,small,medium,full,medium_linear}.yaml
+  - model@features: features      # training featurisation
+  - model@val_features: features  # validation featurisation (inference settings)
+  - model@loss: loss
+  - model@data: data
+  - trainer: default              # trainer/{default,ddp}.yaml: trainer, optim, ema, checkpoint, logger
+  - _self_
+
+task_name: train
+root_dir: ${oc.env:PHYSDOCK_ROOT}
+output_dir: ${hydra:runtime.output_dir}   # logs/train/<time>: checkpoints, wandb, .hydra
+ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
+seed: 42
+init_from: null                   # start from these weights (params.pt, Lightning or Uni-Core checkpoint)
+ckpt_path: null                   # resume this Lightning checkpoint (weights, optimiser, EMA, step)
+compile: false                    # torch.compile the training forward pass
+matmul_precision: high            # TF32 matmuls
+
+val:                              # validation: diffusion loss, then sampling + structure metrics
+  num_samples: 5
+  steps: 20
+
+hydra:
+  run:
+    dir: ${root_dir}/logs/${task_name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${root_dir}/logs/${task_name}/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false
