@@ -1,5 +1,5 @@
 # Training loss (PhysDock.models.loss.PhysDockLoss), PhysDock2 style.
-sigma_data: ${model.diffusion.sigma_data}
+sigma_data: ${global.sigma_data}         # model outputs are normalised; lDDT / distogram use Angstrom
 weights:
   x_mse: 4.0                    # aligned MSE of all atoms (EDM weighted)
   ligand_mse: 0.5               # MSE of the ligand superposed on the ligand (EDM weighted)
@@ -12,4 +12,4 @@ max_clamp_distance: 15.0
 distogram:
   min_bin: 3.25
   max_bin: 50.75
-  no_bins: ${model.distogram_bins}
+  no_bins: ${global.distogram_bins}

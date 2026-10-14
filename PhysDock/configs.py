@@ -6,7 +6,9 @@ from omegaconf import DictConfig, OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_ROOT / "configs"
-os.environ.setdefault("PHYSDOCK_ROOT", str(REPO_ROOT))          # used by configs/paths/default.yaml
+os.environ.setdefault("PHYSDOCK_ROOT", str(REPO_ROOT))          # root_dir of the configs
+if not OmegaConf.has_resolver("div"):                          # ${div:a,b} = a / b, e.g. 1 Angstrom / sigma_data
+    OmegaConf.register_new_resolver("div", lambda a, b: float(a) / float(b))
 
 
 def compose(config_name: str, overrides=()) -> DictConfig:

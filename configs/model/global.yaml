@@ -1,0 +1,11 @@
+# Global model parameters, composed at the config root as `global` (by model/medium.yaml) and referenced as
+# ${global.<key>} by the model, diffusion and loss configs. Override e.g. `global.sigma_data=8`.
+sigma_data: 16.0                # data scale (Angstrom): the model diffuses x_gt / sigma_data and returns x * sigma_data
+c_a: 128                        # atom channels
+c_ap: 16                        # atom-pair channels
+c_s: 512                        # token channels
+c_z: 128                        # pair channels
+c_m: 256                        # MSA channels
+inf: 1.0e9                      # masked attention logits get -inf
+eps: 1.0e-8                     # norm epsilon
+distogram_bins: 39              # distogram head (model) and distogram loss

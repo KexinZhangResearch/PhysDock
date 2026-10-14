@@ -1,7 +1,13 @@
 # Released PhysDock model (data/params/params.pt). Other sizes (toy / tiny / small / full) override the block counts.
-c_z: 128                        # pair channels
+# Channels, inf / eps and sigma_data come from model/global.yaml (config root `global`).
+defaults:
+  - global@_global_.global
+  - _self_
+
+c_z: ${global.c_z}              # input of the distogram head
+sigma_data: ${global.sigma_data}
 num_augmentation_sample: 48     # noisy samples per structure in training
-distogram_bins: 39
+distogram_bins: ${global.distogram_bins}
 
 encoder:                        # MSATemplEncoder (DiffusionConditioning)
   ref_dim: 167                  # per-atom reference features (see PhysDock.data.FEATURES)
@@ -10,13 +16,13 @@ encoder:                        # MSATemplEncoder (DiffusionConditioning)
   templ_dim: 40                 # template features [distogram 39, mask 1]
   key_res_dim: 7                # key-residue (PLIP) flags
   ligand_pair_dim: 42           # ligand pair features
-  c_a: 128                      # atom channels
-  c_ap: 16                      # atom-pair channels
-  c_s: 512                      # token channels
-  c_m: 256                      # MSA channels
-  c_z: ${..c_z}
-  inf: 1.0e9                    # masked attention logits get -inf
-  eps: 1.0e-8                   # norm epsilon
+  c_a: ${global.c_a}
+  c_ap: ${global.c_ap}
+  c_s: ${global.c_s}
+  c_m: ${global.c_m}
+  c_z: ${global.c_z}
+  inf: ${global.inf}
+  eps: ${global.eps}
   no_blocks_atom: 3
   no_blocks_evoformer: 4
   no_blocks_template: 2
@@ -25,21 +31,21 @@ encoder:                        # MSATemplEncoder (DiffusionConditioning)
   s_max: 2                      # relative chain index clip
 
 decoder:                        # AllAtomDecoder (DiffusionModule)
-  c_a: ${..encoder.c_a}
-  c_ap: ${..encoder.c_ap}
-  c_s: ${..encoder.c_s}
-  c_z: ${..c_z}
-  inf: ${..encoder.inf}
-  eps: ${..encoder.eps}
+  c_a: ${global.c_a}
+  c_ap: ${global.c_ap}
+  c_s: ${global.c_s}
+  c_z: ${global.c_z}
+  inf: ${global.inf}
+  eps: ${global.eps}
   no_blocks_atom: 3             # atom DiT encoder and decoder
   no_blocks_dit: 12             # token DiT
 
 diffusion:
-  # EDM variance exploding: z = x + t * e (released parameters); noise levels in units of sigma_data
+  # EDM variance exploding: z = x + t * e on normalised coordinates; lengths and noise levels in units of sigma_data
   type: edm_ve
-  sigma_data: 16.0                # data scale (Angstrom)
-  trans_scale: 1.0                # std of the random translation of the training samples (Angstrom)
-  noise_conditioning: legacy      # released parameters use t * ln(t / sigma) / 4; "af3" = ln(t / sigma) / 4 for new models
+  trans_scale: ${div:1.0,${global.sigma_data}}  # random translation std of the training samples: 1 Angstrom
+  noise_conditioning: legacy      # released parameters: t_A * ln(t) / 4 (t_A = noise level in Angstrom); af3: ln(t) / 4
+  legacy_noise_scale: ${global.sigma_data}      # t_A = legacy_noise_scale * t (noise level in Angstrom)
   time_sampler:                   # training noise levels: ln(s) ~ N(mean, std^2)
     mean: -1.2
     std: 1.5
@@ -49,8 +55,8 @@ diffusion:
     rho: 7.0
   sampler:                        # AF3 Alg. 18
     gamma_0: 0.8
-    gamma_min: 1.0
+    gamma_min: ${div:1.0,${global.sigma_data}}    # no churn at noise levels <= 1 Angstrom
     noise_scale: 1.003
     step_scale: 1.5
     ode_step_scale: 1.0
-    trans_scale: 1.0
+    trans_scale: ${div:1.0,${global.sigma_data}}  # random translation before every step: 1 Angstrom

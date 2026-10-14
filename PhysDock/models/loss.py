@@ -1,5 +1,10 @@
 """Training loss (PhysDock2 style): aligned MSE, ligand-frame MSE, smooth lDDT (all pairs and within each conformer)
-and distogram. S = number of noisy samples; weights and settings come from configs/loss/*.yaml.
+and distogram. S = number of noisy samples; weights and settings come from configs/model/loss.yaml.
+
+The model returns normalised coordinates (Angstrom / sigma_data) and noise levels. The MSE terms are computed on them
+with the EDM weight in normalised form, (1 + t^2) / t^2 / 3 (= (t_A^2 + sigma^2) / (t_A sigma)^2 / 3 times the
+squared error in Angstrom^2, the same value). Smooth lDDT and the distogram are defined on Angstrom distances and
+get Angstrom coordinates.
 
 Fixes w.r.t. the released PhysDock loss:
 * distogram: padding tokens were counted (their pseudo-beta index 0 points at a real atom); now masked by token_mask
@@ -15,9 +20,9 @@ import torch.nn.functional as F
 from PhysDock.utils.tensor_utils import masked_mean, weighted_rigid_align
 
 
-def edm_weight(t_hat: torch.Tensor, sigma_data: float) -> torch.Tensor:
-    """EDM / AF3 loss weight (t^2 + sigma^2) / (t sigma)^2 / 3; t_hat: [S] noise level (Angstrom) -> [S]"""
-    return (t_hat ** 2 + sigma_data ** 2) / (t_hat * sigma_data) ** 2 / 3
+def edm_weight(t_hat: torch.Tensor) -> torch.Tensor:
+    """EDM / AF3 loss weight of normalised coordinates (1 + t^2) / t^2 / 3; t_hat: [S] noise level -> [S]"""
+    return (t_hat ** 2 + 1) / t_hat ** 2 / 3
 
 
 def aligned_mse(x_denoised, x_gt, align_weights, mse_mask) -> torch.Tensor:
@@ -63,8 +68,8 @@ def smooth_lddt(x_denoised, x_gt, atom_mask, atom_to_conformer, max_clamp_distan
     return masked_mean(near, eps, dim=(-1, -2)).mean(), masked_mean(same_conf, eps, dim=(-1, -2)).mean()
 
 
-def distogram_loss(p_distogram, x_gt, token_mask, token_to_pseudo_beta_atom, min_bin: float = 3.25,
-                   max_bin: float = 50.75, no_bins: int = 39) -> torch.Tensor:
+def distogram_loss(p_distogram, x_gt, token_mask, token_to_pseudo_beta_atom, min_bin: float, max_bin: float,
+                   no_bins: int) -> torch.Tensor:
     """Cross-entropy of the binned pseudo-beta distances over real token pairs.
 
     Args:
@@ -86,10 +91,10 @@ def distogram_loss(p_distogram, x_gt, token_mask, token_to_pseudo_beta_atom, min
 
 
 class PhysDockLoss(nn.Module):
-    """Weighted sum of the loss terms; a non-finite term is logged and replaced by 0.
+    """Weighted sum of the loss terms; a non-finite term is logged and replaced by 0. Settings: configs/model/loss.yaml.
 
     Args:
-        sigma_data: data scale of the EDM weight (Angstrom)
+        sigma_data: data scale (Angstrom) of the normalised model outputs (for the Angstrom-based terms)
         weights: {x_mse, ligand_mse, smooth_lddt, within_smooth_lddt, distogram} loss weights
         alpha_ligand: x_mse superposition weight of ligand atoms is 1 + alpha_ligand
         ligand_align_weight: ligand_mse superposes on the ligand (ligand atoms this weight, other atoms 1 / it)
@@ -97,29 +102,29 @@ class PhysDockLoss(nn.Module):
         distogram: {min_bin, max_bin, no_bins}
     """
 
-    def __init__(self, sigma_data: float = 16., weights=None, alpha_ligand: float = 10.,
-                 ligand_align_weight: float = 1000., max_clamp_distance: float = 15., distogram=None) -> None:
+    def __init__(self, sigma_data: float, weights, alpha_ligand: float, ligand_align_weight: float,
+                 max_clamp_distance: float, distogram) -> None:
         super().__init__()
         self.sigma_data = sigma_data
-        self.weights = dict(weights or {"x_mse": 4., "ligand_mse": 0.5, "smooth_lddt": 4., "within_smooth_lddt": 0.5,
-                                        "distogram": 0.03})
+        self.weights = dict(weights)
         self.alpha_ligand = alpha_ligand
         self.ligand_align_weight = ligand_align_weight
         self.max_clamp_distance = max_clamp_distance
-        self.distogram = dict(distogram or {"min_bin": 3.25, "max_bin": 50.75, "no_bins": 39})
+        self.distogram = dict(distogram)
 
     def forward(self, outputs, batch):
         """
         Args:
-            outputs: x_denoised [S, N_atom, 3], t_hat [S], p_distogram [N_token, N_token, no_bins]
-            batch: x_gt, atom_mask, atom_to_token, atom_to_conformer, is_ligand, token_mask, token_to_pseudo_beta_atom
+            outputs: normalised x_gt [N_atom, 3], x_denoised [S, N_atom, 3], t_hat [S]; p_distogram [N_token, N_token, bins]
+            batch: x_gt (Angstrom), atom_mask, atom_to_token, atom_to_conformer, is_ligand, token_mask,
+                token_to_pseudo_beta_atom
 
         Returns:
             (loss, {name: detached value})
         """
-        x, x_gt, atom_mask = outputs["x_denoised"], batch["x_gt"], batch["atom_mask"]
+        x, x_gt, atom_mask = outputs["x_denoised"], outputs["x_gt"], batch["atom_mask"]       # normalised
         is_lig = batch["is_ligand"][batch["atom_to_token"]] * atom_mask          # real ligand atoms
-        w_t = edm_weight(outputs["t_hat"], self.sigma_data)
+        w_t = edm_weight(outputs["t_hat"])
         terms = {}
         if self.weights.get("x_mse"):
             terms["x_mse"] = (aligned_mse(x, x_gt, atom_mask * (1 + self.alpha_ligand * is_lig), atom_mask) * w_t).mean()
@@ -128,9 +133,9 @@ class PhysDockLoss(nn.Module):
             terms["ligand_mse"] = (aligned_mse(x, x_gt, align, is_lig) * w_t).mean()
         if self.weights.get("smooth_lddt") or self.weights.get("within_smooth_lddt"):
             terms["smooth_lddt"], terms["within_smooth_lddt"] = smooth_lddt(
-                x, x_gt, atom_mask, batch["atom_to_conformer"], self.max_clamp_distance)
+                x * self.sigma_data, batch["x_gt"], atom_mask, batch["atom_to_conformer"], self.max_clamp_distance)
         if self.weights.get("distogram"):
-            terms["distogram"] = distogram_loss(outputs["p_distogram"], x_gt, batch["token_mask"],
+            terms["distogram"] = distogram_loss(outputs["p_distogram"], batch["x_gt"], batch["token_mask"],
                                                 batch["token_to_pseudo_beta_atom"], **self.distogram)
         total = 0.
         logs = {}

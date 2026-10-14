@@ -5,8 +5,7 @@ defaults:
 
 diffusion:
   type: linear
-  sigma_data: 16.0
-  trans_scale: 1.0
+  trans_scale: ${div:1.0,${global.sigma_data}}   # 1 Angstrom
   time_sampler:
     mean: -1.2
     std: 1.5
@@ -16,7 +15,7 @@ diffusion:
     rho: 1000.0
   sampler:                        # plain probability-flow ODE (no churn, unit steps, no random translation)
     gamma_0: 0.0
-    gamma_min: 1.0
+    gamma_min: ${div:1.0,${global.sigma_data}}  # 1 Angstrom
     noise_scale: 1.003
     step_scale: 1.0
     ode_step_scale: 1.0

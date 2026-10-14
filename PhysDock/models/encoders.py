@@ -53,7 +53,7 @@ class TemplatePairEmbedder(nn.Module):
 class RelPosEmbedder(nn.Module):
     """Relative residue / chain position features (AF3 Alg. 3) plus the ligand pair features."""
 
-    def __init__(self, c_z: int, r_max: int = 32, s_max: int = 2, ligand_pair_dim: int = 42) -> None:
+    def __init__(self, c_z: int, r_max: int, s_max: int, ligand_pair_dim: int) -> None:
         super().__init__()
         self.r_max, self.s_max = r_max, s_max
         # residue bins (2 r_max + 2) + ligand pair features + same entity + chain bins (2 s_max + 2)
@@ -131,9 +131,8 @@ class TokenEmbedder(nn.Module):
     """Pool atoms to tokens, add token / pair / MSA features, run Evoformer, template embedder and Pairformer."""
 
     def __init__(self, target_dim: int, msa_dim: int, c_a: int, c_s: int, c_m: int, c_z: int, inf: float, eps: float,
-                 no_blocks_evoformer: int, no_blocks_pairformer: int, no_blocks_template: int = 2,
-                 templ_dim: int = 40, key_res_dim: int = 7, r_max: int = 32, s_max: int = 2,
-                 ligand_pair_dim: int = 42) -> None:
+                 no_blocks_evoformer: int, no_blocks_pairformer: int, no_blocks_template: int, templ_dim: int,
+                 key_res_dim: int, r_max: int, s_max: int, ligand_pair_dim: int) -> None:
         super().__init__()
         self.linear_a = Linear(c_a, c_s)
         self.linear_target_feat = Linear(target_dim, c_s, bias=False)
@@ -180,8 +179,8 @@ class MSATemplEncoder(nn.Module):
 
     def __init__(self, ref_dim: int, target_dim: int, msa_dim: int, c_a: int, c_ap: int, c_s: int, c_m: int, c_z: int,
                  inf: float, eps: float, no_blocks_atom: int, no_blocks_evoformer: int, no_blocks_pairformer: int,
-                 no_blocks_template: int = 2, templ_dim: int = 40, key_res_dim: int = 7, r_max: int = 32,
-                 s_max: int = 2, ligand_pair_dim: int = 42) -> None:
+                 no_blocks_template: int, templ_dim: int, key_res_dim: int, r_max: int, s_max: int,
+                 ligand_pair_dim: int) -> None:
         super().__init__()
         self.atom_embedder = AtomEmbedder(
             ref_dim, c_a, c_ap, inf, eps, no_blocks_atom)
