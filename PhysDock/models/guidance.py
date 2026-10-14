@@ -112,9 +112,9 @@ class LigandGuidance:
             mmff_gamma_0_factor: float = 1.0,
             mmff_iters: int = 5,
     ) -> None:
-        self.x_exists = batch["a_mask"]
-        self.is_ligand_atom = batch["is_ligand"][batch["atom_id_to_token_id"]].bool()
-        self.weights = self.x_exists * batch["is_ligand"][batch["atom_id_to_token_id"]]
+        self.x_exists = batch["atom_mask"]
+        self.is_ligand_atom = batch["is_ligand"][batch["atom_to_token"]].bool()
+        self.weights = self.x_exists * batch["is_ligand"][batch["atom_to_token"]]
         self.ref_pos = batch["ref_pos"][None].repeat([num_samples, 1, 1])
         self.ref_mol = copy.deepcopy(ref_mol) if ref_mol is not None else None
         self.align_ref_pos = align_ref_pos

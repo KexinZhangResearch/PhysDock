@@ -1,5 +1,5 @@
 import argparse
-from PhysDock.data.generate_system import generate_system
+from PhysDock.data.tools.generate_system import generate_system
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PhysDock Redocking Data Preparation')

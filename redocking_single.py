@@ -45,10 +45,10 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Geometry import Point3D
 
-from PhysDock import PhysDock, PhysDockConfig
+from PhysDock import PhysDock
 from PhysDock.data.constants.PDBData import protein_letters_3to1_extended
-from PhysDock.data.feature_loader import FeatureLoader
-from PhysDock.models.primitives import skip_weight_init
+from PhysDock.data import CCDLibrary, FeatureConfig, PhysDockDataset, SystemEntry, msa_feat_for_round
+from PhysDock.utils.import_weights import load_pretrained
 from PhysDock.utils.io_utils import convert_md5_string, dump_json, dump_txt, load_pkl
 from PhysDock.utils.tensor_utils import weighted_rigid_align
 
@@ -122,12 +122,8 @@ def inspect_system(input_pkl: Path, msa_dir: Path, uniprot_dir: Path):
 # Helpers
 # --------------------------------------------------------------------------------------
 def load_model(params_path: Path, device: torch.device) -> PhysDock:
-    with skip_weight_init():   # random init (~40 s) is pointless: the strict load below overwrites everything
-        model = PhysDock(PhysDockConfig(model_name="medium"))
-    state = torch.load(str(params_path), map_location="cpu", weights_only=False)
-    state = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in state.items()}
-    model.load_state_dict(state)          # strict: a wrong checkpoint fails here with the offending keys
-    return model.to(device).eval()
+    # built on the meta device without initialisation; every parameter is assigned from the checkpoint (strict)
+    return load_pretrained(params_path, device=device)
 
 
 def write_ligand_sdf(ref_mol, coords, path: Path) -> None:
@@ -213,28 +209,26 @@ def redock_single(
     log(f"device {device}, params {params_path}")
 
     # ---- features -----------------------------------------------------------------------
-    feature_loader = FeatureLoader(
-        ccd_id_meta_data=str(ccd_meta_path), crop_size=crop_size, atom_crop_size=atom_crop_size,
-        inference_mode=True, infer_pocket_type=pocket_type, infer_pocket_cutoff=pocket_cutoff,
-        infer_pocket_dist_type=pocket_dist_type, infer_use_pocket=use_pocket, infer_use_key_res=use_key_res,
+    config = FeatureConfig(
+        crop_size=crop_size, atom_crop_size=atom_crop_size or 2048, pocket_type=pocket_type,
+        pocket_cutoff=pocket_cutoff, pocket_dist_type=pocket_dist_type, use_pocket=use_pocket, use_key_res=use_key_res,
         key_res_random_mask_ratio=key_res_random_mask_ratio, use_x_gt_ligand_as_ref_pos=use_x_gt_ligand_as_ref_pos,
-        num_recycles=max_rounds if physics_correction else 1,
+        num_msa_samples=max_rounds if physics_correction else 1,
     )
-    # FeatureLoader derives these two folders from one parent directory; here they are given independently.
-    feature_loader.msa_features_path = str(msa_dir)
-    feature_loader.uniprot_msa_features_path = str(uni_dir)
-    unknown = sorted(c for c in info["ccds"] if c not in feature_loader.ccd_id_meta_data)
+    ccd = CCDLibrary(ccd_meta_path)
+    unknown = sorted(c for c in info["ccds"] if c not in ccd)
     if unknown:
         raise InputError(f"components not in the CCD metadata {ccd_meta_path.name}: {unknown}")
+    dataset = PhysDockDataset([SystemEntry(str(input_pkl))], msa_dir, uni_dir, ccd=ccd, config=config)
     t0 = time.time()
-    tensors, meta = feature_loader.load(system_pkl_path=str(input_pkl))
-    tensors = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in tensors.items()}
+    tensors, meta = dataset[0]
+    tensors = {k: v.to(device) for k, v in tensors.items()}
     log(f"features ready ({time.time() - t0:.1f}s): {len(tensors['restype'])} tokens, {len(tensors['x_gt'])} atoms")
 
-    ref_mol = meta["ref_mol"]
+    ref_mol = meta.ref_mol
     if ref_mol is None:
         raise InputError("no reference molecule for the ligand (needs exactly one ligand chain with one CCD component)")
-    atom_token = tensors["atom_id_to_token_id"].long()
+    atom_token = tensors["atom_to_token"]
     is_ligand_atom = tensors["is_ligand"][atom_token].bool()
     n_lig = int(is_ligand_atom.sum())
     if n_lig != ref_mol.GetNumAtoms():
@@ -243,21 +237,21 @@ def redock_single(
     is_lig_cpu = is_ligand_atom.cpu()
 
     # alignment weights: receptor atoms (pocket residues only when the pocket feature is used)
-    weights = (tensors["s_mask"] * tensors["is_protein"])[atom_token]
+    weights = (tensors["token_mask"] * tensors["is_protein"])[atom_token]
     if use_pocket:
-        weights = tensors["pocket_res_feat"][atom_token] * weights
+        weights = tensors["is_pocket"][atom_token] * weights
     if float(weights.sum()) == 0.0:
         raise InputError("no receptor atoms to align on (is the pocket empty? try a larger --pocket_cutoff)")
     x_gt = tensors["x_gt"][None]
     x_gt_cpu = tensors["x_gt"].cpu()
 
     # ---- ground truth outputs + chirality reference -----------------------------------------------
-    feature_loader.write_pdb(x_gt_cpu, str(out / "system_gt.pdb"), meta)
-    feature_loader.write_pdb(x_gt_cpu, str(out / "receptor_gt.pdb"), meta, receptor_only=True)
+    meta.write_pdb(out / "system_gt.pdb", x_gt_cpu)
+    meta.write_pdb(out / "receptor_gt.pdb", x_gt_cpu, receptor_only=True)
     write_ligand_sdf(ref_mol, x_gt_cpu[is_lig_cpu], out / "ligand_gt.sdf")
     chiral_init = {i[0]: i[1] for i in Chem.FindMolChiralCenters(ref_mol)}
     chiral_gt = {i[0]: i[1] for i in Chem.FindMolChiralCenters(Chem.MolFromPDBBlock(
-        feature_loader.write_pdb_block(tensors["ref_pos"].cpu(), infer_meta_data=meta, ligand_only=True),
+        meta.to_pdb(tensors["ref_pos"].cpu(), ligand_only=True),
         sanitize=False))}
     chiral_centres = {k: v for k, v in chiral_gt.items() if k in chiral_init}
 
@@ -281,7 +275,7 @@ def redock_single(
         if recycle_id > 0 and not physics_correction:
             break
         if recycle_id >= 1:
-            tensors["msa_feat"] = tensors["batch_msa_feat"][recycle_id]
+            tensors["msa_feat"] = msa_feat_for_round(tensors, recycle_id)
         t0 = time.time()
         with torch.no_grad():
             x_pred = model.sample_diffusion(
@@ -298,7 +292,7 @@ def redock_single(
         pass_flags = []
         for x, x_cpu in zip(x_pred, x_pred_cpu):
             ok = True if not physics_correction else chirality_ok(
-                chiral_centres, feature_loader.write_pdb_block(x_cpu, infer_meta_data=meta, ligand_only=True))
+                chiral_centres, meta.to_pdb(x_cpu, ligand_only=True))
             pass_flags.append(ok)
             if ok:
                 ligand_templates.append(x[is_ligand_atom])
@@ -334,9 +328,8 @@ def redock_single(
         xa = weighted_rigid_align(x_gt, x, weights=weights)[0].cpu()      # sample superposed on the GT (pocket CA)
         aligned.append(xa)
         write_ligand_sdf(ref_mol, xa[is_lig_cpu], out / f"ligand_pred_{k}.sdf")
-        dump_txt(feature_loader.write_pdb_block(xa, infer_meta_data=meta), str(out / f"system_pred_{k}.pdb"))
-        dump_txt(feature_loader.write_pdb_block(xa, infer_meta_data=meta, receptor_only=True),
-                 str(out / f"receptor_pred_{k}.pdb"))
+        meta.write_pdb(out / f"system_pred_{k}.pdb", xa)
+        meta.write_pdb(out / f"receptor_pred_{k}.pdb", xa, receptor_only=True)
 
     lig_gt = x_gt_cpu[is_lig_cpu].numpy()
     lig_pred = np.stack([xa[is_lig_cpu].numpy() for xa in aligned])

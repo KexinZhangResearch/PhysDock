@@ -46,9 +46,12 @@ def generate_system(
         ligand_id (str): CCD ID of the ligand.
     """
     # Create output directories
-    if ccd_id_meta_data is None:
+    if ccd_id_meta_data is None or isinstance(ccd_id_meta_data, (str, os.PathLike)):
         print("Loading CCD meta data ...")
-        ccd_id_meta_data = load_pkl(os.path.join(os.path.split(__file__)[0], "../../params/ccd_id_meta_data.pkl.gz"))
+        if ccd_id_meta_data is None:
+            from PhysDock.data.dataloader import default_ccd_path
+            ccd_id_meta_data = default_ccd_path()
+        ccd_id_meta_data = load_pkl(str(ccd_id_meta_data))
     os.makedirs(systems_dir, exist_ok=True)
 
 

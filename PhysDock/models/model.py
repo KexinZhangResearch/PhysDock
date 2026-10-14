@@ -73,7 +73,7 @@ class PhysDock(nn.Module):
             ``S = num_augmentation_sample``.
         """
         conds = self.diffusion_conditioning(batch)
-        z_t, t = self.diffuser.noising(batch["x_gt"], batch["x_exists"], self.num_augmentation_sample)
+        z_t, t = self.diffuser.noising(batch["x_gt"], batch["atom_mask"], self.num_augmentation_sample)
         x_denoised = self.diffuser.denoise(self.dit, batch, z_t, t, conds)
 
         p_distogram = self.linear_distogram(conds.z)
@@ -145,5 +145,5 @@ class PhysDock(nn.Module):
                 use_ref_mol_poses=use_ref_mol_poses, align_ref_pos=align_ref_pos,
                 mmff_gamma_0_factor=mmff_gamma_0_factor, mmff_iters=mmff_iters)
         return self.diffuser.sample(
-            self.dit, batch, conds, batch["a_mask"], num_sample, steps, sampler=sampler,
+            self.dit, batch, conds, batch["atom_mask"], num_sample, steps, sampler=sampler,
             noise_schedule=schedule, guidance=guidance)

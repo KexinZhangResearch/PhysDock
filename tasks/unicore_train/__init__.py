@@ -19,7 +19,7 @@ sys.path.append(stfold_path)
 
 from PhysDock.configs_old import model_config
 from PhysDock.models.model import PhysDock as RFFold
-from PhysDock.data.feature_loader_plinder import FeatureLoader
+from PhysDock.data import FeatureConfig, PhysDockDataset
 from PhysDock.models.loss import PhysDockLoss as RFFoldLoss
 from PhysDock.utils.import_weights import import_unicore_ckpt
 
@@ -36,24 +36,24 @@ class STFoldUnicoreDataset(UnicoreDataset):
         self.mode = mode
         self.num_processors = num_processors
 
-        self.feature_loader = FeatureLoader(
-            atom_crop_size=256 * 8,
-            token_crop_size=256,
-            inference_mode=False
+        # Released training set (data/v1, see scripts/download_dataset.py) in training mode; systems that cannot be
+        # featurised are replaced by other random systems (on_error="resample").
+        self.dataset = PhysDockDataset.from_train_val(
+            config=FeatureConfig(crop_size=256, atom_crop_size=256 * 8,
+                                 max_msa_clusters=getattr(config.data, "max_msa_clusters", 128)
+                                 if hasattr(config, "data") else 128),
+            training=True,
+            on_error="resample",
         )
+        weights = self.dataset.sample_weights
+        self.probabilities = (weights / weights.sum()) if weights is not None else torch.ones(len(self.dataset), dtype=torch.double)
 
         self.final_len = int(256 * 120000)
 
     def __getitem__(self, item):
-        while True:
-            try:
-                tensors, infer_meta_data = self.feature_loader.weighted_random_load()
-                break
-            except Exception as e:
-                # print(sample_id)
-                logging.warning(e)
-                continue
-        return tensors
+        # every item is a weighted random draw from the training set (the index is ignored)
+        index = torch.multinomial(self.probabilities, 1).item()
+        return self.dataset[index].features
 
     def __len__(self):
         return self.final_len

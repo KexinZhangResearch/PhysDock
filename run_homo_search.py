@@ -1,5 +1,5 @@
 import argparse
-from PhysDock.data.alignment_runner_v2 import run_homo_search
+from PhysDock.data.homo_search import run_homo_search
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

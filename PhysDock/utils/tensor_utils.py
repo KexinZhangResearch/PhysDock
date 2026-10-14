@@ -52,6 +52,18 @@ def masked_mean(mask, value, dim, eps=1e-9):
     return torch.sum(mask * value, dim=dim) / (eps + torch.sum(mask, dim=dim))
 
 
+def pair_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Pair mask ``mask[..., None, :] * mask[..., :, None]`` of a per-token or per-atom mask.
+
+    Args:
+        mask: Mask, shape ``[..., N]``.
+
+    Returns:
+        Pair mask, shape ``[..., N, N]``.
+    """
+    return mask[..., None, :] * mask[..., :, None]
+
+
 def segment_mean_pool(
         x: torch.Tensor,
         segment_sizes: torch.Tensor,
@@ -850,8 +862,8 @@ def GreedyMatching(feats, x_pred):
     with torch.no_grad():
         x_gt_decoy = feats["x_gt_decoy"]
         x_gt_decoy_exists = feats["x_gt_decoy_exists"]
-        token_id_to_centre_atom_id = feats["token_id_to_centre_atom_id"]
-        z_mask = feats["z_mask"]
+        token_id_to_centre_atom_id = feats["token_to_centre_atom"]
+        z_mask = pair_mask(feats["token_mask"])
         # x_pred: [?, num_atom,3]
         # x_gt_decoy: [128, num_atom, 3]
         # x_gt_decoy_exists: [128]

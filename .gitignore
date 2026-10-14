@@ -212,3 +212,4 @@ data/*
 
 
 third_party/
+.claude/

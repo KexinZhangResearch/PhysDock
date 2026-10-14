@@ -8,7 +8,7 @@ from PhysDock.utils.io_utils import run_pool_tasks, load_json, load_txt, dump_pk
 from PhysDock.data.tools.parsers import parse_fasta
 from PhysDock.data.tools.parse_msas import parse_protein_alignment_dir, parse_uniprot_alignment_dir, \
     parse_rna_alignment_dir
-from PhysDock.data.alignment_runner import DataProcessor
+from PhysDock.data.tools.alignment_runner import DataProcessor
 from PhysDock.data.tools.residue_constants import standard_ccds, amino_acid_3to1
 from PhysDock.data.tools.PDBData import protein_letters_3to1_extended, nucleic_letters_3to1_extended
 

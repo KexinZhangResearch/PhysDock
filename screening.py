@@ -6,8 +6,8 @@ import tqdm
 import pandas as pd
 import argparse
 
-from PhysDock.utils.import_weights import import_state_dict
-from PhysDock.data.feature_loader import FeatureLoader
+from PhysDock.utils.import_weights import load_pretrained
+from PhysDock.data import FeatureConfig, PhysDockDataloader, PhysDockDataset, msa_feat_for_round
 from PhysDock import PhysDock, PhysDockConfig
 from PhysDock.utils.tensor_utils import weighted_rigid_align
 from PhysDock.utils.io_utils import load_txt, dump_txt, chunk_lists, load_json, convert_md5_string, dump_json, \
@@ -15,9 +15,8 @@ from PhysDock.utils.io_utils import load_txt, dump_txt, chunk_lists, load_json, 
 from collections import deque
 import numpy as np
 import shutil
-from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
-from PhysDock.data.relaxation import relax
+from PhysDock.utils.relaxation import relax
 from rdkit import RDLogger
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -68,8 +67,9 @@ def screening(
 ****************************************************************************''')
     print("Starting Initialization ...")
     # Initialization
-    ccd_id_meta_data_path = os.path.join(os.path.split(__file__)[0], "params", "ccd_id_meta_data.pkl.gz")
-    params_path = os.path.join(os.path.split(__file__)[0], "params", "params.pt")
+    repo = os.path.split(os.path.abspath(__file__))[0]
+    params_path = next((p for p in (os.path.join(repo, "data", "params", "params.pt"), os.path.join(repo, "params", "params.pt"))
+                        if os.path.isfile(p)), os.path.join(repo, "data", "params", "params.pt"))
 
     device = f"cuda:{device_id}"
     assert os.path.isfile(input_pkl_path)
@@ -81,20 +81,17 @@ def screening(
         print(
             "You are using GT ligand conformer as reference conformer, which is dangerous and is only for ablation study.")
 
-    feature_loader = FeatureLoader(
-        msa_features_dir=msa_features_dir,
-        ccd_id_meta_data=ccd_id_meta_data_path,
+    feature_config = FeatureConfig(
         crop_size=crop_size,
-        atom_crop_size=atom_crop_size,
-        inference_mode=True,
-        infer_pocket_type=pocket_type,
-        infer_pocket_cutoff=pocket_cutoff,
-        infer_pocket_dist_type=pocket_dist_type,
-        infer_use_pocket=use_pocket,
-        infer_use_key_res=use_key_res,
+        atom_crop_size=atom_crop_size if atom_crop_size is not None else 2048,
+        pocket_type=pocket_type,
+        pocket_cutoff=pocket_cutoff,
+        pocket_dist_type=pocket_dist_type,
+        use_pocket=use_pocket,
+        use_key_res=use_key_res,
         key_res_random_mask_ratio=key_res_random_mask_ratio,
         use_x_gt_ligand_as_ref_pos=use_x_gt_ligand_as_ref_pos,
-        num_recycles=max_rounds,
+        num_msa_samples=max_rounds,
     )
 
     smis = load_txt(smi_file_path).split()
@@ -103,29 +100,11 @@ def screening(
         output_dir, os.path.split(smi_file_path)[1].split(".")[0] + f"_smi_md5_meta_data.json"))
     print(f"Finish dumping SMILES to MD5 meta data!")
 
-    def _collator_fn(smi):
-        smi = smi[0]
-        try:
-            tensors, infer_meta_data = feature_loader.load(
-                system_pkl_path=input_pkl_path,
-                remove_ligand=True,
-                smi=smi
-            )
-            return smi, tensors, infer_meta_data
-        except Exception as e:
-            return smi, None, None
+    # one entry per SMILES (system id md5(smi)); molecules that cannot be featurised are logged and skipped
+    dataset = PhysDockDataset.for_screening(input_pkl_path, smis, msa_features_dir, config=feature_config, on_error="skip")
+    dataloader = PhysDockDataloader(dataset, batch_size=1, num_workers=4)
 
-    dataloader = DataLoader(
-        smis,
-        collate_fn=_collator_fn,
-        batch_size=1,
-        num_workers=4,
-    )
-
-    config = PhysDockConfig(model_name="medium")
-    model = PhysDock(config).to(device).to(dtype)
-    import_state_dict(model, params_path)
-    model.eval()
+    model = load_pretrained(params_path, PhysDockConfig(model_name="medium"), device=device, dtype=dtype)
 
     print(f"Finish Initialization of model and feature loader!")
     print("################### Screening Configs #####################")
@@ -161,14 +140,14 @@ def screening(
     print(f"# Sidechain Relaxation: {sidechain_relaxation and ranking}")
     print("###########################################################")
 
-    for batch_id, (smi, tensors, infer_meta_data) in tqdm.tqdm(enumerate(dataloader), total=len(smis)):
-        if infer_meta_data is None:
+    for batch_id, sample in tqdm.tqdm(enumerate(dataloader), total=len(smis)):
+        if sample is None:
             continue
+        tensors, infer_meta_data = sample
         for k, v in tensors.items():
             tensors[k] = v.to(device)
         try:
-            sample_id = convert_md5_string(smi)
-            infer_meta_data["system_id"] = sample_id
+            sample_id = infer_meta_data.system_id
 
             accept_samples = []
             reject_samples = deque([], maxlen=max_samples)
@@ -194,9 +173,9 @@ def screening(
                     break
                 # Get Model Inputs and Meta Data
                 if recycle_id >= 1:
-                    tensors["msa_feat"] = tensors["batch_msa_feat"][recycle_id]
-                ref_mol = infer_meta_data["ref_mol"]
-                is_ligand_atom = tensors["is_ligand"][tensors["atom_id_to_token_id"]].bool()
+                    tensors["msa_feat"] = msa_feat_for_round(tensors, recycle_id)
+                ref_mol = infer_meta_data.ref_mol
+                is_ligand_atom = tensors["is_ligand"][tensors["atom_to_token"]].bool()
 
                 if os.path.exists(f"{output_dir}/{sample_id}/tmp/receptor_pred_4.pdb"):
                     continue
@@ -204,10 +183,10 @@ def screening(
                     if len(tensors["x_gt"][is_ligand_atom]) != ref_mol.GetNumAtoms():
                         ref_mol_num_error = True
 
-                    weights = (tensors["s_mask"] * tensors["is_protein"])[tensors["atom_id_to_token_id"].long()]
+                    weights = (tensors["token_mask"] * tensors["is_protein"])[tensors["atom_to_token"].long()]
                     if align_mode == "pocket_ca":
                         if use_pocket:
-                            weights = tensors["pocket_res_feat"][tensors["atom_id_to_token_id"].long()] * weights
+                            weights = tensors["is_pocket"][tensors["atom_to_token"].long()] * weights
                     else:
                         raise NotImplementedError()
                     #     if align_mode == "pocket_ca":
@@ -217,18 +196,9 @@ def screening(
                     os.makedirs(f"{output_dir}/{sample_id}", exist_ok=True)
                     os.makedirs(f"{output_dir}/{sample_id}/tmp", exist_ok=True)
 
-                    feature_loader.write_pdb(
-                        tensors["x_gt"],
-                        f"{output_dir}/{sample_id}/tmp/system_gt.pdb",
-                        infer_meta_data
-                    )
+                    infer_meta_data.write_pdb(f"{output_dir}/{sample_id}/tmp/system_gt.pdb", tensors["x_gt"])
 
-                    feature_loader.write_pdb(
-                        tensors["x_gt"],
-                        f"{output_dir}/{sample_id}/tmp/receptor_gt.pdb",
-                        infer_meta_data,
-                        receptor_only=True
-                    )
+                    infer_meta_data.write_pdb(f"{output_dir}/{sample_id}/tmp/receptor_gt.pdb", tensors["x_gt"], receptor_only=True)
                     ref_mol_copy = copy.deepcopy(ref_mol)
                     ligand_cpu = tensors["x_gt"][is_ligand_atom]
                     conf = ref_mol_copy.GetConformer()
@@ -240,11 +210,7 @@ def screening(
 
                     chiral_centers_init = {i[0]: i[1] for i in Chem.FindMolChiralCenters(ref_mol)}
                     chiral_centers_gt = {i[0]: i[1] for i in Chem.FindMolChiralCenters(Chem.MolFromPDBBlock(
-                        feature_loader.write_pdb_block(
-                            tensors["ref_pos"],  # Assert Ref Pos Chirality Centre is Accurate
-                            infer_meta_data=infer_meta_data,
-                            ligand_only=True
-                        ), sanitize=False
+                        infer_meta_data.to_pdb(tensors["ref_pos"], ligand_only=True), sanitize=False
                     ))}
                     chiral_centers = {k: v for k, v in chiral_centers_gt.items() if k in chiral_centers_init}
 
@@ -299,7 +265,7 @@ def screening(
                         mmff_gamma_0_factor=mmff_gamma_0_factor,
                         align_ref_pos=recycle_id > 0,
                         # ODE Config
-                        ref_mol=infer_meta_data["ref_mol"] if not ref_mol_num_error else None,
+                        ref_mol=infer_meta_data.ref_mol if not ref_mol_num_error else None,
                         ref_mol_poses=x_gt[:, is_ligand_atom] if use_x_gt_ligand_as_ref_pos else \
                             torch.stack(ligand_templates + reference_templates, dim=0) if recycle_id > 0 else None,
                         use_ref_mol_poses=recycle_id != 0 and physics_correction,
@@ -313,8 +279,7 @@ def screening(
                 for x_id, (x, x_cpu) in enumerate(zip(x_pred, x_pred_cpu)):
 
                     if physics_correction:
-                        ligand_pdb_block = feature_loader.write_pdb_block(x_cpu, infer_meta_data=infer_meta_data,
-                                                                          ligand_only=True)
+                        ligand_pdb_block = infer_meta_data.to_pdb(x_cpu, ligand_only=True)
                         pass_flag = _check_ref_mol_chirality(chiral_centers, ligand_pdb_block)
                     else:
                         pass_flag = True
@@ -350,9 +315,8 @@ def screening(
             is_ligand_atom = is_ligand_atom.cpu()
             for accept_sample_id, x in enumerate(accept_samples[:max_samples]):
                 x_aligned = weighted_rigid_align(x_gt, x, weights=weights)[0].cpu()
-                block = feature_loader.write_pdb_block(x_aligned, infer_meta_data=infer_meta_data)
-                receptor_block = feature_loader.write_pdb_block(x_aligned, infer_meta_data=infer_meta_data,
-                                                                receptor_only=True)
+                block = infer_meta_data.to_pdb(x_aligned)
+                receptor_block = infer_meta_data.to_pdb(x_aligned, receptor_only=True)
                 ref_mol_copy = copy.deepcopy(ref_mol)
                 ligand_cpu = x_aligned[is_ligand_atom]
                 conf = ref_mol_copy.GetConformer()

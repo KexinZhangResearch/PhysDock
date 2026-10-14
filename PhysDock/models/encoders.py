@@ -5,7 +5,7 @@ from typing import Literal, NamedTuple, Tuple
 
 from PhysDock.models.primitives import (AtomTransformer, Evoformer, FeedForward, Linear, Pairformer, RMSNorm,
                                         Triangleformer)
-from PhysDock.utils.tensor_utils import one_hot, segment_mean_pool, segment_unpool_1d, segment_unpool_2d
+from PhysDock.utils.tensor_utils import one_hot, pair_mask, segment_mean_pool, segment_unpool_1d, segment_unpool_2d
 from PhysDock.data import TensorDict
 
 
@@ -37,15 +37,15 @@ class TemplatePairEmbedder(nn.Module):
     ) -> torch.Tensor:
         templ_feat = batch["templ_feat"]
         asym_id = batch["asym_id"]
-        t_mask = batch["t_mask"]
+        templ_mask = batch["templ_mask"]
         chain_same = (asym_id[None] == asym_id[:, None]).type_as(templ_feat)
-        z_mask = batch["z_mask"] * templ_feat[..., 39] * chain_same
+        z_mask = pair_mask(batch["token_mask"]) * templ_feat[..., 39] * chain_same
 
         z = self.linear_in(self.norm_in(z)) + self.linear_templ_feat(templ_feat)
 
         z = self.triangleformer(z, z_mask)
 
-        z = self.linear_out(F.relu(self.norm_out(z))).float() * t_mask
+        z = self.linear_out(F.relu(self.norm_out(z))).float() * templ_mask
 
         return z.float()
 
@@ -68,7 +68,7 @@ class RelPosEmbedder(nn.Module):
             sym_id = batch["sym_id"]
             entity_id = batch["entity_id"]
             residue_index = batch["residue_index"]
-            rel_tok_feat = batch["rel_tok_feat"]
+            ligand_pair_feat = batch["ligand_pair_feat"]
 
             chain_same = (asym_id[..., None] == asym_id[..., None, :])
             entity_same = (entity_id[..., None] == entity_id[..., None, :])
@@ -86,7 +86,7 @@ class RelPosEmbedder(nn.Module):
             rel_chain_feat = one_hot(d_chain, boundaries)
             rel_feat = torch.cat([
                 rel_pos_feat,
-                rel_tok_feat,
+                ligand_pair_feat,
                 entity_same[..., None],
                 rel_chain_feat,
             ], dim=-1)
@@ -110,12 +110,12 @@ class AtomEmbedder(nn.Module):
     def forward(self, batch: TensorDict) -> Tuple[torch.Tensor, torch.Tensor]:
         ref_feat = batch["ref_feat"]
         ref_pos = batch["ref_pos"]
-        ref_space_uid = batch["ref_space_uid"]
-        ap_mask = batch["ap_mask"]
+        atom_to_conformer = batch["atom_to_conformer"]
+        ap_mask = pair_mask(batch["atom_mask"])
 
         with torch.no_grad():
             d = (ref_pos[:, None, :] - ref_pos[None, :, :]).float()
-            v = torch.eq(ref_space_uid[:, None], ref_space_uid[None, :]).float()
+            v = torch.eq(atom_to_conformer[:, None], atom_to_conformer[None, :]).float()
 
         a = self.linear_c(ref_feat)
         p = self.linear_p(d) * v[:, :, None]
@@ -169,27 +169,27 @@ class TokenEmbedder(nn.Module):
         """Average-pool atom features into tokens (the atoms of a token are contiguous).
 
         Args:
-            batch: Feature dict; uses ``token_id_to_chunk_sizes``, the number of atoms of every token.
+            batch: Feature dict; uses ``split_sizes``, the number of atoms of every token.
             a: Atom representation, shape ``[N_atom, c_a]``.
 
         Returns:
             Token representation, shape ``[N_token, c_s]``.
         """
-        return segment_mean_pool(F.silu(self.linear_a(a)), batch["token_id_to_chunk_sizes"])
+        return segment_mean_pool(F.silu(self.linear_a(a)), batch["split_sizes"])
 
     def forward(self, batch: TensorDict, a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         target_feat = batch["target_feat"]
         key_res_feat = batch["key_res_feat"]
-        pocket_res_feat = batch["pocket_res_feat"]
-        token_bonds_feature = batch["token_bonds_feature"]
+        is_pocket = batch["is_pocket"]
+        token_bonds = batch["token_bonds"]
         msa_feat = batch["msa_feat"]
-        z_mask = batch["z_mask"]
+        z_mask = pair_mask(batch["token_mask"])
 
         s = self.downscale(batch, a) + self.linear_target_feat(target_feat) + self.linear_key_res_feat(
-            key_res_feat) + self.linear_pocket_res_feat(pocket_res_feat[..., None])
+            key_res_feat) + self.linear_pocket_res_feat(is_pocket[..., None])
 
         z = self.linear_s_i(s)[:, None, :] + self.linear_s_j(s)[None, :, :] + self.rel_pos_embedder(
-            batch) + self.linear_bonds(token_bonds_feature[..., None])
+            batch) + self.linear_bonds(token_bonds[..., None])
 
         m = self.linear_msa_feat(msa_feat) + self.linear_s_input(s)
 
@@ -246,8 +246,8 @@ class MSATemplEncoder(nn.Module):
         no_blocks_atom: Blocks of the atom transformer.
         no_blocks_evoformer: Evoformer blocks.
         no_blocks_pairformer: Pairformer blocks.
-        unpool_method: How token features are broadcast to atoms: ``"index"`` (gather with ``atom_id_to_token_id``,
-            default) or ``"segment"`` (from ``token_id_to_chunk_sizes``), see
+        unpool_method: How token features are broadcast to atoms: ``"index"`` (gather with ``atom_to_token``,
+            default) or ``"segment"`` (from ``split_sizes``), see
             :func:`~PhysDock.utils.tensor_utils.segment_unpool_1d`.
     """
 
@@ -288,13 +288,13 @@ class MSATemplEncoder(nn.Module):
         Returns:
             The conditioning ``Conditions(a, ap, s, z)``.
         """
-        atom_id_to_token_id = batch["atom_id_to_token_id"]
-        sizes = batch["token_id_to_chunk_sizes"]
+        atom_to_token = batch["atom_to_token"]
+        sizes = batch["split_sizes"]
         a, ap = self.atom_embedder(batch)
         s, z = self.token_embedder(batch, a)
         n_atom = a.shape[0]
         a = a + segment_unpool_1d(self.linear_s(self.norm_s(s)), sizes, num_rows=n_atom, dim=0,
-                                  index=atom_id_to_token_id, method=self.unpool_method)
+                                  index=atom_to_token, method=self.unpool_method)
         ap = ap + segment_unpool_2d(self.linear_z(self.norm_z(z)), sizes, num_rows=n_atom,
-                                    row_index=atom_id_to_token_id, method=self.unpool_method)
+                                    row_index=atom_to_token, method=self.unpool_method)
         return Conditions(a, ap, s, z)
