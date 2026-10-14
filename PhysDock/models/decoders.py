@@ -1,148 +1,47 @@
-"""Decoder of PhysDock: the multi-scale all-atom network of the paper's diffusion module."""
-from __future__ import annotations
-
-from typing import Literal, Optional
-
+"""Decoder (the paper's DiffusionModule): atom DiT -> pool to tokens -> token DiT -> broadcast to atoms -> atom DiT."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from PhysDock.data import TensorDict
-from PhysDock.models.encoders import Conditions
-from PhysDock.models.primitives import DiT, LayerNorm, Linear, TimestepEmbeddings
-from PhysDock.utils.tensor_utils import pair_mask, segment_mean_pool, segment_unpool_1d
-
-__all__ = ["AllAtomDecoder"]
+from PhysDock.models.primitives import DiT, Linear, TimestepEmbeddings
+from PhysDock.utils.tensor_utils import pair_mask, segment_mean_pool
 
 
 class AllAtomDecoder(nn.Module):
-    """Multi-scale all-atom network: this is the *DiffusionModule* of the paper (AlphaFold 3 Algorithm 20).
+    """Multi-scale all-atom network. Pre-/post-conditioning (c_in, c_skip, c_out) is done by the diffuser."""
 
-    The noisy atom coordinates are embedded per atom and refined by an atom-level DiT encoder; the atoms of every
-    token are average-pooled into one token vector, which a token-level DiT processes conditioned on the single
-    (``s``) and pair (``z``) representation; the result is broadcast back to the atoms and refined by an atom-level
-    DiT decoder, which finally predicts a 3-D vector per atom. The three scales (atom, token, atom) are why the
-    module is called multi-scale.
-
-    Compared with the paper's DiffusionModule, the pre- and post-processing around the network is **not** part of
-    this class: scaling the noisy coordinates by ``c_in``, computing the noise-conditioning input and converting
-    the network output into the denoised structure (``c_skip * x + c_out * output``) are done by the
-    :class:`~PhysDock.models.diffusion.Diffuser` (PhysDock2 style). This module is the bare network, so its output
-    is the raw prediction ``F`` of the EDM parameterisation.
-
-    Args:
-        c_a: Atom channel size.
-        c_ap: Atom-pair channel size.
-        c_s: Token channel size.
-        c_z: Token-pair channel size.
-        inf: Magnitude of the value added to masked logits.
-        eps: Epsilon of the norms.
-        no_blocks_atom: Blocks in each of the atom-level DiT encoder and decoder.
-        no_blocks_dit: Blocks in the token-level DiT.
-        unpool_method: How token activations are broadcast to atoms: ``"index"`` (gather with
-            ``atom_to_token``, default) or ``"segment"`` (from ``split_sizes``), see
-            :func:`~PhysDock.utils.tensor_utils.segment_unpool_1d`.
-    """
-
-    def __init__(
-            self,
-            c_a: int,
-            c_ap: int,
-            c_s: int,
-            c_z: int,
-            inf: float,
-            eps: float,
-            no_blocks_atom: int,
-            no_blocks_dit: int,
-            unpool_method: Literal["index", "segment"] = "index",
-    ) -> None:
+    def __init__(self, c_a: int, c_ap: int, c_s: int, c_z: int, inf: float, eps: float, no_blocks_atom: int,
+                 no_blocks_dit: int) -> None:
         super().__init__()
-        self.unpool_method = unpool_method
         self.linear_x = Linear(3, c_a)
         self.linear_downscale = Linear(c_a, c_s)
         self.linear_upscale = Linear(c_s, c_a)
         self.time_embedder = TimestepEmbeddings()
-
         self.atom_dit_encoder = DiT(c_a, c_ap, inf, eps, no_blocks_atom)
         self.token_dit = DiT(c_s, c_z, inf, eps, no_blocks_dit)
         self.atom_dit_decoder = DiT(c_a, c_ap, inf, eps, no_blocks_atom)
-
-        self.norm_r = LayerNorm(c_a, eps)
+        self.norm_r = nn.LayerNorm(c_a, eps)
         self.linear_r = Linear(c_a, 3, bias=False)
 
-    def downscale(self, ba: torch.Tensor, s: torch.Tensor, split_sizes: torch.Tensor) -> torch.Tensor:
-        """Average-pool atom activations into tokens and add the single representation.
-
+    def forward(self, batch, x_in: torch.Tensor, t_in: torch.Tensor, conds) -> torch.Tensor:
+        """
         Args:
-            ba: Atom activations, shape ``[B, N_atom, c_a]`` (atoms of one token are contiguous).
-            s: Single representation, shape ``[N_token, c_s]``.
-            split_sizes: Number of atoms of every token, shape ``[N_token]``.
+            batch: atom_mask [N_atom], token_mask [N_token], split_sizes [N_token], atom_to_token [N_atom]
+            x_in: [B, N_atom, 3] preconditioned noisy coordinates
+            t_in: [B] noise-conditioning input
+            conds: encoder output (a, ap, s, z)
 
         Returns:
-            Token activations, shape ``[B, N_token, c_s]``.
+            [B, N_atom, 3] raw network output
         """
-        x = segment_mean_pool(F.silu(self.linear_downscale(ba)), split_sizes)
-        return x + s[None]
-
-    def upscale(
-            self,
-            ba: torch.Tensor,
-            bs: torch.Tensor,
-            atom_to_token: torch.Tensor,
-            split_sizes: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Broadcast token activations back to their atoms and add them.
-
-        Args:
-            ba: Atom activations, shape ``[B, N_atom, c_a]``.
-            bs: Token activations, shape ``[B, N_token, c_s]``.
-            atom_to_token: Token index of every atom, shape ``[N_atom]``.
-            split_sizes: Number of atoms of every token, shape ``[N_token]``; only needed when
-                ``unpool_method="segment"``.
-
-        Returns:
-            Atom activations, shape ``[B, N_atom, c_a]``.
-        """
-        up = segment_unpool_1d(self.linear_upscale(bs), split_sizes, num_rows=ba.shape[-2], dim=-2,
-                               index=atom_to_token, method=self.unpool_method)
-        return ba + up.float()
-
-    def forward(
-            self,
-            batch: TensorDict,
-            x_in: torch.Tensor,
-            t_in: torch.Tensor,
-            conds: Conditions,
-    ) -> torch.Tensor:
-        """Predict the raw network output for preconditioned noisy coordinates.
-
-        Args:
-            batch: Feature dict; uses ``atom_mask`` ``[N_atom]``, ``token_mask`` ``[N_token]``,
-                ``split_sizes`` ``[N_token]`` and ``atom_to_token`` ``[N_atom]``.
-            x_in: Preconditioned noisy coordinates, shape ``[B, N_atom, 3]``.
-            t_in: Noise-conditioning input of the timestep embedder, shape ``[B]``.
-            conds: Output of the encoder: atom ``a`` ``[N_atom, c_a]``, atom-pair ``ap`` ``[N_atom, N_atom, c_ap]``,
-                single ``s`` ``[N_token, c_s]`` and pair ``z`` ``[N_token, N_token, c_z]`` conditioning.
-
-        Returns:
-            Raw network output ``F``, shape ``[B, N_atom, 3]``.
-        """
-        ap_mask = pair_mask(batch["atom_mask"])
-        z_mask = pair_mask(batch["token_mask"])
-        split_sizes = batch["split_sizes"]
-        atom_to_token = batch["atom_to_token"]
         a, ap, s, z = conds
-
-        ba = self.linear_x(x_in) + a[None]
+        ap_mask = pair_mask(batch["atom_mask"])
         t = self.time_embedder(t_in)
 
-        ba = self.atom_dit_encoder(ba, ap, t, ap_mask, None)
-        bs = self.downscale(ba, s, split_sizes)
-
-        bs = self.token_dit(bs, z, t, z_mask, None)
-
-        ba = self.upscale(ba, bs, atom_to_token, split_sizes)
-
-        ba = self.atom_dit_decoder(ba, ap, t, ap_mask, None)
-
-        return self.linear_r(self.norm_r(ba))
+        x = self.linear_x(x_in) + a[None]
+        x = self.atom_dit_encoder(x, ap, t, ap_mask)
+        xs = segment_mean_pool(F.silu(self.linear_downscale(x)), batch["split_sizes"]) + s[None]   # atoms -> tokens
+        xs = self.token_dit(xs, z, t, pair_mask(batch["token_mask"]))
+        x = x + self.linear_upscale(xs)[:, batch["atom_to_token"]].float()                         # tokens -> atoms
+        x = self.atom_dit_decoder(x, ap, t, ap_mask)
+        return self.linear_r(self.norm_r(x))

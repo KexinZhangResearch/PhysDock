@@ -53,6 +53,7 @@ from PhysDock.utils.io_utils import convert_md5_string, dump_json, dump_txt, loa
 from PhysDock.utils.tensor_utils import weighted_rigid_align
 
 RDLogger.DisableLog("rdApp.*")
+torch.set_float32_matmul_precision("high")      # TF32 matmuls, as the released pipeline
 
 REPO = Path(__file__).resolve().parent
 PARAMS_CANDIDATES = [REPO / "data" / "params" / "params.pt", REPO / "params" / "params.pt"]

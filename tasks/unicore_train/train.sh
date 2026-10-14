@@ -102,18 +102,10 @@ python -m torch.distributed.run \
   --matmul-precision high \
   --model-name medium \
   --crop-size 256 \
-  --max-recycling-iters 3 \
   --max-msa-clusters 128 \
   --num-augmentation-sample 48 \
-  --alpha-bond 1 \
-  --alpha-pae 1 \
-  --use-template \
-  --mini-rollout-steps 12 \
   --ema-decay 0.999 \
-  --atom-attention-type spatial \
   --use-bf16 \
-  --interaction-aware \
-  --templ-dim 40 \
 #  --compile
 
 # --reset-optimizer \

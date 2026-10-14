@@ -1,19 +1,5 @@
-"""Residue, chemical-component and element constants of PhysDock.
-
-Component ids are PDB CCD codes padded to three characters (``"A  "`` for adenosine, ``"DA "`` for
-deoxyadenosine). The *standard* components are the 20 amino acids, the 4 + 4 nucleotides, the three unknown
-types ``UNK`` / ``N  `` / ``DN `` and ``GAP``; their index in :data:`standard_ccds` is the ``restype`` feature
-(every other component is ``restype`` 20). A standard residue is one token; every atom of any other component is
-its own token.
-
-Sections:
-
-* residue name maps (one-letter / three-letter codes),
-* standard components and their predicates (``is_standard``, ``is_unk``, ...),
-* special atoms of standard residues (token centre, pseudo-beta, frame atoms),
-* one-hot matrices used by the featuriser,
-* the element table and the reference conformers of the standard residues.
-"""
+"""Residue, component and element constants. CCD ids are padded to 3 characters ("A  ", "DA "); the index in
+standard_ccds (20 amino acids + UNK, RNA, DNA, GAP) is the restype feature, 20 for every other component."""
 import numpy as np
 
 from .PDBData import nucleic_letters_3to1_extended, protein_letters_3to1_extended

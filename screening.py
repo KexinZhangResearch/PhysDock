@@ -1,28 +1,24 @@
-import copy
-import sys
-import torch
-import os
-import tqdm
-import pandas as pd
 import argparse
-
-from PhysDock.utils.import_weights import load_pretrained
-from PhysDock.data import FeatureConfig, PhysDockDataloader, PhysDockDataset, msa_feat_for_round
-from PhysDock import PhysDock, PhysDockConfig
-from PhysDock.utils.tensor_utils import weighted_rigid_align
-from PhysDock.utils.io_utils import load_txt, dump_txt, chunk_lists, load_json, convert_md5_string, dump_json, \
-    find_files
-from collections import deque
-import numpy as np
+import copy
+import os
 import shutil
-from sklearn.cluster import KMeans
-from PhysDock.utils.relaxation import relax
-from rdkit import RDLogger
-from rdkit import Chem
-from rdkit.Chem import AllChem
+from collections import deque
+
+import numpy as np
+import torch
+import tqdm
+from rdkit import Chem, RDLogger
 from rdkit.Geometry import Point3D
 
+from PhysDock import PhysDockConfig
+from PhysDock.data import FeatureConfig, PhysDockDataloader, PhysDockDataset, msa_feat_for_round
+from PhysDock.models.guidance import embed_conformers
+from PhysDock.utils.import_weights import load_pretrained
+from PhysDock.utils.io_utils import convert_md5_string, dump_json, dump_txt, load_txt
+from PhysDock.utils.tensor_utils import weighted_rigid_align
+
 RDLogger.DisableLog('rdApp.*')
+torch.set_float32_matmul_precision("high")      # TF32 matmuls, as the released pipeline
 
 
 def screening(
@@ -214,22 +210,9 @@ def screening(
                     ))}
                     chiral_centers = {k: v for k, v in chiral_centers_gt.items() if k in chiral_centers_init}
 
-                    def _get_ref_mol_poses(ref_mol, num_confs=128):
-                        mol = copy.deepcopy(ref_mol)
-                        cids = AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, enforceChirality=True)
-                        num_atoms = mol.GetNumAtoms()
-                        coordinates = torch.zeros(num_confs, num_atoms, 3)
-                        for i, cid in enumerate(cids):
-                            conf = mol.GetConformer(cid)
-                            for j in range(num_atoms):
-                                pos = conf.GetAtomPosition(j)
-                                coordinates[i, j, 0] = pos.x
-                                coordinates[i, j, 1] = pos.y
-                                coordinates[i, j, 2] = pos.z
-                        return coordinates
 
                     if physics_correction:
-                        ref_mol_poses = _get_ref_mol_poses(ref_mol, num_confs=num_confs).to(device)[:,
+                        ref_mol_poses = embed_conformers(ref_mol, num_confs).to(device)[:,
                                         :len(tensors["x_gt"][is_ligand_atom])]
                         ref_mol_poses_dist = torch.norm(ref_mol_poses[:, :, None] - ref_mol_poses[:, None], dim=-1)
                     else:
@@ -369,6 +352,7 @@ def screening(
                     for i in range(num_elements):
                         coordinates[i] = distance_matrix[i]
 
+                    from sklearn.cluster import KMeans         # only needed for ranking
                     kmeans = KMeans(n_clusters=num_clusters, random_state=0)
                     kmeans.fit(coordinates)
 
@@ -410,6 +394,7 @@ def screening(
                     shutil.copy(f"{output_dir}/{sample_id}/tmp/receptor_pred_{i}.pdb",
                                 f"{output_dir}/{sample_id}/receptor_rank_{rank_id}.pdb")
                 if sidechain_relaxation:
+                    from PhysDock.utils.relaxation import relax   # needs openmm / pdbfixer
                     # print("Start Relaxation!")
                     for rank_id, i in enumerate(ids):
                         # print(rank_id)
