@@ -32,7 +32,7 @@ def lecun_normal_init_(weight: torch.Tensor) -> None:
 
 
 class Linear(nn.Linear):
-    """nn.Linear with AlphaFold init ("default" LeCun, "final" zeros, "gating" zeros + bias 1); bf16 stays bf16."""
+    """nn.Linear with AlphaFold init ("default" LeCun, "final" zeros, "gating" zeros + bias 1)."""
 
     def __init__(self, in_dim: int, out_dim: int, bias: bool = True, init: str = "default") -> None:
         super().__init__(in_dim, out_dim, bias=bias)
@@ -48,14 +48,6 @@ class Linear(nn.Linear):
                     self.bias.fill_(1.0)
             else:
                 raise ValueError(f"unknown init {init!r}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [..., in_dim] -> [..., out_dim]"""
-        if x.dtype is torch.bfloat16:
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                bias = self.bias.to(torch.bfloat16) if self.bias is not None else None
-                return F.linear(x, self.weight.to(torch.bfloat16), bias)
-        return F.linear(x, self.weight, self.bias)
 
 
 class RMSNorm(nn.Module):

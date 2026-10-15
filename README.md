@@ -165,10 +165,15 @@ The released training set is downloaded with `python scripts/download/download_d
 python scripts/train/train.py                                   # released model size, 1 GPU
 python scripts/train/train.py trainer=ddp                       # all GPUs of the node
 python scripts/train/train.py compile=true                      # torch.compile the training forward pass
+python scripts/train/train.py trainer.precision=bf16-mixed      # bf16 encoder (decoder, distogram, loss stay fp32)
 python scripts/train/train.py init_from=data/params/params.pt   # fine-tune the released weights
 python scripts/train/train.py ckpt_path=logs/train/<run>/checkpoints/last.ckpt    # resume
 sh scripts/train/train.sh                                                           # quick test (toy model)
 ```
+
+Precision: float32 matmuls use TF32 wherever the GPU supports it (`matmul_precision=auto`, the default of all
+configs; `highest` = full float32). Under bf16 autocast the decoder, the distogram head, the loss and the coordinate
+geometry (rotations, superposition) still run in float32: the generated coordinates are sensitive to rounding there.
 
 Runs are written to `logs/train/<date>/` (checkpoints, wandb files, config). A training checkpoint can be used for
 inference directly (`params=logs/train/<run>/checkpoints/last.ckpt`, the EMA weights are used).

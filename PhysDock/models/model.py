@@ -6,6 +6,7 @@ features (ref_pos, distances in the features) stay in Angstrom: the encoder was 
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from rdkit import Chem
 
 from PhysDock.models.decoders import AllAtomDecoder
@@ -55,11 +56,21 @@ class PhysDock(nn.Module):
         x_gt = batch["x_gt"] / self.sigma_data
         conds = self.diffusion_conditioning(batch)
         z, t = self.diffuser.noising(x_gt, batch["atom_mask"], self.num_augmentation_sample)
-        x_denoised = self.diffuser.denoise(self.dit, batch, z, t, conds)
-        p_distogram = self.linear_distogram(conds.z)
-        p_distogram = p_distogram + p_distogram.transpose(-2, -3)
+        x_denoised = self.diffuser.denoise(self.dit, batch, z, t, self.dit.condition(batch, conds))
         return {"x_gt": x_gt, "x_denoised": x_denoised, "x_hat": z, "t_hat": self.diffuser.noise_level(t),
-                "p_distogram": p_distogram}
+                "p_distogram": self.distogram_logits(conds.z)}
+
+    def distogram_logits(self, z: torch.Tensor) -> torch.Tensor:
+        """z: [N_token, N_token, c_z] -> symmetric logits [N_token, N_token, bins], in float32.
+
+        The released head adds a shift of ~1e3 shared by all bins (bin differences ~30); the softmax ignores it, but
+        it cancels catastrophically in low precision (TF32 / bf16 log-prob errors 0.15 / 2). The shift is removed
+        from weight and bias first: the same distribution and gradients, ~15x smaller rounding errors.
+        """
+        w, b = self.linear_distogram.weight, self.linear_distogram.bias
+        with torch.autocast(z.device.type, enabled=False):
+            logits = F.linear(z.float(), w - w.mean(dim=0), b - b.mean())
+        return logits + logits.transpose(-2, -3)
 
     @torch.no_grad()
     def sample_diffusion(self, batch, num_sample: int = 5, steps: int = 200, gamma_0: float = None,
@@ -81,7 +92,7 @@ class PhysDock(nn.Module):
         Returns:
             [num_sample, N_atom, 3] Angstrom
         """
-        conds = self.diffusion_conditioning(batch)
+        conds = self.dit.condition(batch, self.diffusion_conditioning(batch))     # once for all steps
         sampler = replace(self.diffuser.sampler, gamma_0=gamma_0, gamma_min=gamma_min, noise_scale=noise_scale_lambda,
                           step_scale=step_scale_eta, ode_step_scale=ode_step_scale_eta)
         schedule = replace(self.diffuser.noise_schedule, rho=karras_noise_schedule_power)

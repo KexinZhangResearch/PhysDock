@@ -24,12 +24,13 @@ from lightning.pytorch.loggers import WandbLogger  # noqa: E402
 from omegaconf import DictConfig  # noqa: E402
 
 from PhysDock.configs import to_dict  # noqa: E402
+from PhysDock.utils.precision import set_matmul_precision  # noqa: E402
 from PhysDock.training import EMA, PhysDockDataModule, PhysDockLitModule  # noqa: E402
 
 
 @hydra.main(config_path="../../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
-    torch.set_float32_matmul_precision(cfg.matmul_precision)
+    set_matmul_precision(cfg.matmul_precision)
     L.seed_everything(cfg.seed)
     datamodule = PhysDockDataModule(features=to_dict(cfg.features), val_features=to_dict(cfg.val_features),
                                     **to_dict(cfg.data))

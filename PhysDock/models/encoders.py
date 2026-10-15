@@ -47,7 +47,7 @@ class TemplatePairEmbedder(nn.Module):
         z = self.linear_in(self.norm_in(z)) + \
             self.linear_templ_feat(templ_feat)
         z = self.triangleformer(z, z_mask)
-        return (self.linear_out(F.relu(self.norm_out(z))).float() * batch["templ_mask"]).float()
+        return self.linear_out(F.relu(self.norm_out(z))) * batch["templ_mask"]
 
 
 class RelPosEmbedder(nn.Module):
@@ -113,7 +113,7 @@ class AtomEmbedder(nn.Module):
         """
         ref_pos = batch["ref_pos"]
         with torch.no_grad():
-            d = (ref_pos[:, None, :] - ref_pos[None, :, :]).float()
+            d = ref_pos[:, None, :] - ref_pos[None, :, :]
             conf = batch["atom_to_conformer"]
             # 1 for atom pairs of the same conformer
             v = (conf[:, None] == conf[None, :]).float()[..., None]

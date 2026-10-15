@@ -41,6 +41,7 @@ from rdkit.Chem import AllChem  # noqa: E402
 from rdkit.Geometry import Point3D  # noqa: E402
 
 from PhysDock.configs import to_dict  # noqa: E402
+from PhysDock.utils.precision import set_matmul_precision  # noqa: E402
 from PhysDock.data import CCDLibrary, FeatureConfig, PhysDockDataset, SystemEntry, msa_feat_for_round  # noqa: E402
 from PhysDock.data.constants.PDBData import protein_letters_3to1_extended  # noqa: E402
 from PhysDock.utils.import_weights import load_pretrained  # noqa: E402
@@ -309,7 +310,7 @@ def redock_single(cfg: DictConfig) -> dict:
 
 @hydra.main(config_path="../../configs", config_name="infer", version_base="1.3")
 def main(cfg: DictConfig) -> int:
-    torch.set_float32_matmul_precision(cfg.matmul_precision)
+    set_matmul_precision(cfg.matmul_precision)
     try:
         res = redock_single(cfg)
     except InputError as e:

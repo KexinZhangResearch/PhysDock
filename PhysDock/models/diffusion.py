@@ -101,7 +101,7 @@ class Diffuser:
         Args:
             decoder: network called as decoder(batch, x_in, t_in, conds)
             batch: features; x_gt [N_atom, 3] gives shape, dtype and device
-            conds: encoder output
+            conds: decoder conditioning (AllAtomDecoder.condition)
             atom_mask: [N_atom]
             num_samples, num_steps: number of structures, number of steps (>= 2)
             sampler, noise_schedule: override the configured ones

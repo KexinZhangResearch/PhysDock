@@ -544,8 +544,8 @@ class SystemFeaturizer:
         """Target and MSA features, padding (training), template, final protein/ligand flags."""
         cfg = self.config
         t = {k: torch.from_numpy(v) for k, v in feats.items()}
-        t["target_feat"] = torch.cat([F.one_hot(t["restype"].long(), 32).float(), t.pop("profile").float(),
-                                      t.pop("deletion_mean")[..., None].float()], dim=-1)
+        t["target_feat"] = torch.cat([F.one_hot(t["restype"].long(), 32).float(), t.pop("profile"),
+                                      t.pop("deletion_mean")[..., None]], dim=-1)
 
         msa, deletion = t.pop("msa"), t.pop("deletion_matrix")
         pi = torch.acos(torch.zeros(1)) * 2
@@ -554,8 +554,8 @@ class SystemFeaturizer:
             rows = [0] + torch.randperm(len(msa))[:cfg.max_msa_clusters - 1].tolist()
             msa, deletion = msa[rows], deletion[rows]                 # [legacy] each sample is drawn from the previous
             samples.append(torch.cat([F.one_hot(msa.long(), 32).float(),
-                                      torch.clamp(deletion.float(), min=0., max=1.)[..., None].float(),
-                                      (torch.atan(deletion / 3.) * (2. / pi))[..., None].float()], dim=-1))
+                                      torch.clamp(deletion.float(), min=0., max=1.)[..., None],
+                                      (torch.atan(deletion / 3.) * (2. / pi))[..., None]], dim=-1))
         t["msa_feat"] = samples[0]
         if len(samples) > 1:
             t["msa_feat_resampled"] = torch.stack(samples[1:], dim=0)
@@ -576,7 +576,7 @@ class SystemFeaturizer:
                 templ_pair = (bert[None] * bert[:, None]) * z_mask * protein2d
             else:
                 t["templ_mask"] = torch.tensor(0, dtype=torch.float32)
-        t["templ_feat"] = torch.cat([dgram * templ_pair[..., None], templ_pair[..., None]], dim=-1).float()
+        t["templ_feat"] = torch.cat([dgram * templ_pair[..., None], templ_pair[..., None]], dim=-1)
 
         is_short_poly = t.pop("is_short_poly")
         t["is_protein"] = t["is_protein"] + is_short_poly

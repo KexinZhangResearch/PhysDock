@@ -1,6 +1,4 @@
 """Attention layers. Every head has 32 channels; masks become additive -inf biases. Pair masks are symmetric."""
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,7 +47,7 @@ class AttentionWithPairBias(nn.Module):
         q, k, v = _heads(self.linear_q(s)), _heads(self.linear_k(s)), _heads(self.linear_v(s))
         bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(q), -self.inf)[None]
         o = F.scaled_dot_product_attention(q, k, v, bias)
-        return (self.linear_o(_merge(o)) * self.linear_g(s)).float()
+        return self.linear_o(_merge(o)) * self.linear_g(s)
 
 
 class MSARowAttentionWithPairBias(nn.Module):
@@ -81,7 +79,7 @@ class MSARowAttentionWithPairBias(nn.Module):
         q, k, v = _heads(self.linear_q(m)), _heads(self.linear_k(m)), _heads(self.linear_v(m))
         bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1)[None] + gen_attn_mask(z_mask.type_as(q), -self.inf)[None, None]
         o = F.scaled_dot_product_attention(q, k, v, bias)
-        return (self.linear_o(_merge(o)) * self.linear_g(m)).float()
+        return self.linear_o(_merge(o)) * self.linear_g(m)
 
 
 class MSAColumnAttention(nn.Module):
@@ -101,7 +99,7 @@ class MSAColumnAttention(nn.Module):
         m = self.norm_m(m.transpose(-2, -3))
         q, k, v = _heads(self.linear_q(m)), _heads(self.linear_k(m)), _heads(self.linear_v(m))
         o = F.scaled_dot_product_attention(q, k, v)
-        return (self.linear_o(_merge(o)) * self.linear_g(m)).transpose(-2, -3).float()
+        return (self.linear_o(_merge(o)) * self.linear_g(m)).transpose(-2, -3)
 
 
 class TriangleUpdate(nn.Module):
@@ -136,7 +134,7 @@ class TriangleUpdate(nn.Module):
         o = self.linear_z(self.norm_out(torch.einsum("...ijc,...Ijc->...iIc", q, k))) * torch.sigmoid(self.linear_g(z))
         if self.transpose:
             o = o.transpose(-2, -3)
-        return o.float()
+        return o
 
 
 class TriangleAttention(nn.Module):
@@ -171,11 +169,13 @@ class TriangleAttention(nn.Module):
         o = self.linear_o(_merge(F.scaled_dot_product_attention(q, k, v, bias))) * self.linear_g(z)
         if self.transpose:
             o = o.transpose(-2, -3)
-        return o.float()
+        return o
 
 
 class DiTAttention(nn.Module):
-    """DiT self-attention: AdaLN-Zero input, RMS-normalised q/k, pair bias shared by all samples, gated output."""
+    """DiT self-attention: AdaLN-Zero input, RMS-normalised q/k, pair bias shared by all samples, gated output.
+
+    The pair bias linear_z(norm_z(z)) + mask is computed by DiT.pair_bias (once per structure for all blocks)."""
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
@@ -190,15 +190,12 @@ class DiTAttention(nn.Module):
         self.norm_k = RMSNorm(32, eps)
         self.linear_o = Linear(c_s, c_s)
 
-    def forward(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor, z_mask: torch.Tensor,
-                beta: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, bias: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, N, c_s]
-            z: [N, N, c_z]
+            bias: [H, N, N] contiguous logit bias (pair bias + mask, see DiT.pair_bias)
             t: [B, 256] timestep embedding
-            z_mask: [N, N]
-            beta: optional extra logit bias [B, N, N]
 
         Returns:
             [B, N, c_s] update
@@ -207,8 +204,5 @@ class DiTAttention(nn.Module):
         q = self.norm_q(_heads(self.linear_q(x)))
         k = self.norm_k(_heads(self.linear_k(x)))
         v = _heads(self.linear_v(x))
-        bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1)[None] + gen_attn_mask(z_mask.type_as(q), -self.inf)[None, None]
-        if beta is not None:
-            bias = bias + beta.type_as(q)[:, None]
-        o = F.scaled_dot_product_attention(q, k, v, bias)
-        return (self.linear_o(_merge(o)).float() * gate.float()).float()
+        o = F.scaled_dot_product_attention(q, k, v, bias[None])
+        return self.linear_o(_merge(o)) * gate

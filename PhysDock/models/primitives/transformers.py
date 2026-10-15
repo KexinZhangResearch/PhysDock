@@ -1,11 +1,13 @@
 """Transformer blocks and their stacks (Stack: atom, triangle, Evoformer, Pairformer, DiT)."""
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from PhysDock.models.primitives import (AttentionWithPairBias, DiTAttention, DiTTransition, MSAColumnAttention,
                                         MSARowAttentionWithPairBias, OuterProductMean, Transition, TriangleAttention,
                                         TriangleUpdate)
+from PhysDock.utils.tensor_utils import gen_attn_mask
 
 
 class Stack(nn.Module):
@@ -29,12 +31,16 @@ class Stack(nn.Module):
     def forward(self, *args):
         state, rest = args[:self.n_state], args[self.n_state:]
         for block in self.blocks:
-            if torch.is_grad_enabled():
-                out = checkpoint(block, *state, *rest, use_reentrant=False)
-            else:
-                out = block(*state, *rest)
+            out = self.run_block(block, *state, *rest)
             state = out if self.n_state > 1 else (out,)
         return state if self.n_state > 1 else state[0]
+
+    @staticmethod
+    def run_block(block, *args):
+        """block(*args), activation-checkpointed while grads are on"""
+        if torch.is_grad_enabled():
+            return checkpoint(block, *args, use_reentrant=False)
+        return block(*args)
 
 
 class AtomBlock(nn.Module):
@@ -157,16 +163,46 @@ class DiTBlock(nn.Module):
         self.attention = DiTAttention(c_s, c_z, inf, eps)
         self.transition = DiTTransition(c_s, eps)
 
-    def forward(self, x, z, t, z_mask, beta=None):
-        x = x + self.attention(x, z, t, z_mask, beta)
+    def forward(self, x, bias, t):
+        x = x + self.attention(x, bias, t)
         return x + self.transition(x, t)
 
 
 class DiT(Stack):
-    """Diffusion transformer conditioned on a timestep embedding.
+    """Diffusion transformer conditioned on a timestep embedding and per-block pair biases.
 
-    x: [B, N, c_s], z: [N, N, c_z], t: [B, 256], z_mask: [N, N], beta: optional [B, N, N] -> x: [B, N, c_s]
+    x: [B, N, c_s], bias: [no_blocks, H, N, N] (pair_bias(z, z_mask)), t: [B, 256] -> x: [B, N, c_s]
     """
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float, no_blocks: int = 12) -> None:
         super().__init__(DiTBlock, no_blocks, c_s, c_z, inf, eps)
+
+    def forward(self, x, bias, t):
+        for block, b in zip(self.blocks, bias):
+            x = self.run_block(block, x, b, t)
+        return x
+
+    def pair_bias(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
+        """Attention logit biases of all blocks, linear_z(norm_z(z)) + mask; they depend on the conditioning only,
+        so the decoder computes them once per structure instead of in every block of every denoising step.
+
+        Every block normalises the same z, so its LayerNorm statistics are computed once and each block's LayerNorm
+        affine is folded into its projection: linear_z(norm_z(z)) = z_hat @ (W * gamma)^T + W @ beta, one matmul for
+        all blocks (the same function and gradients as the blockwise form, up to float rounding).
+
+        Args:
+            z: [N, N, c_z]
+            z_mask: [N, N]
+
+        Returns:
+            [no_blocks, H, N, N] contiguous (the layout the fused attention kernels need)
+        """
+        attn = [block.attention for block in self.blocks]
+        eps = attn[0].norm_z.eps
+        if any(a.norm_z.eps != eps for a in attn):
+            raise ValueError("pair_bias needs the same LayerNorm eps in all blocks")
+        z_hat = F.layer_norm(z, z.shape[-1:], eps=eps)
+        weight = torch.cat([a.linear_z.weight * a.norm_z.weight for a in attn])             # [no_blocks * H, c_z]
+        bias = torch.cat([a.linear_z.weight @ a.norm_z.bias for a in attn])
+        logits = F.linear(z_hat, weight, bias).permute(2, 0, 1) + gen_attn_mask(z_mask, -attn[0].inf)
+        return logits.reshape(len(attn), -1, *z_mask.shape).contiguous()

@@ -21,4 +21,4 @@ class OuterProductMean(nn.Module):
         n = m.shape[1]
         m = self.norm_in(m)
         outer = torch.einsum("bic,bjd->ijcd", self.linear_q(m), self.linear_k(m)).reshape(n, n, -1)
-        return self.norm_out(self.linear_o(outer)).float()
+        return self.norm_out(self.linear_o(outer))

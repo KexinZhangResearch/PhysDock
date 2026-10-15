@@ -22,14 +22,14 @@ def load_checkpoint_state_dict(ckpt_path, mmap: bool = True, use_ema: bool = Tru
     return strip(strip(params, "model."), "_orig_mod.")
 
 
-def load_pretrained(ckpt_path, config=None, device="cuda", dtype: torch.dtype = None, eval_mode: bool = True):
-    """PhysDock with all parameters from a checkpoint.
+def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = True):
+    """PhysDock with all parameters from a checkpoint, in float32 (use bf16 autocast for low precision: the decoder,
+    distogram head and loss stay float32 under it).
 
     Args:
         ckpt_path: params.pt, a Lightning or a Uni-Core checkpoint
         config: model config (configs/model/*.yaml; default: "medium")
         device: target device
-        dtype: cast floating-point parameters (default: keep float32)
         eval_mode: return the model in eval mode
     """
     from PhysDock.configs import model_config
@@ -49,8 +49,7 @@ def load_pretrained(ckpt_path, config=None, device="cuda", dtype: torch.dtype = 
     for name, value in params.items():
         if value.shape != expected[name].shape:
             raise RuntimeError(f"{name}: checkpoint shape {tuple(value.shape)}, model shape {tuple(expected[name].shape)}")
-        target = dtype if dtype is not None and value.is_floating_point() else expected[name].dtype
-        on_device[name] = value.to(device=device, dtype=target, non_blocking=True)
+        on_device[name] = value.to(device=device, dtype=expected[name].dtype, non_blocking=True)
     model.load_state_dict(on_device, strict=True, assign=True)
     if any(t.is_meta for t in list(model.parameters()) + list(model.buffers())):
         raise RuntimeError("some tensors are not in the checkpoint and stay uninitialised")

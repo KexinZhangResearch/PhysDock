@@ -5,7 +5,8 @@ trainer:                          # lightning.pytorch.Trainer arguments
   devices: 1
   strategy: auto
   num_nodes: 1
-  precision: 32                   # bf16-mixed crashed in the OuterProductMean backward on torch 2.4 + H20
+  precision: 32                   # 32 (TF32 matmuls, see matmul_precision) or bf16-mixed: bf16 encoder, the decoder,
+                                  # distogram head and loss stay float32 (~20% less memory, ~3% faster)
   max_steps: 1000000
   gradient_clip_val: 10.0
   accumulate_grad_batches: 1

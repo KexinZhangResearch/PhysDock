@@ -32,7 +32,7 @@ class Transition(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [..., dim] -> update [..., dim]"""
-        return self.feed_forward(self.ffn_norm(x)).float()
+        return self.feed_forward(self.ffn_norm(x))
 
 
 class DiTTransition(nn.Module):
@@ -53,4 +53,4 @@ class DiTTransition(nn.Module):
             [B, N, dim] update
         """
         x, gate = self.ffn_norm(x, t)
-        return self.feed_forward(x).float() * gate.float()
+        return self.feed_forward(x) * gate

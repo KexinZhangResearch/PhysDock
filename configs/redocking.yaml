@@ -15,7 +15,7 @@ params: ${root_dir}/data/params/params.pt
 ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
 device_id: 0
 num_workers: 4                  # featurisation workers
-matmul_precision: high
+matmul_precision: auto          # float32 matmuls: auto = TF32 if the GPU supports it; highest = full float32
 ranking: false                  # K-means clustering and ranking of the samples (needs scikit-learn)
 sidechain_relaxation: false     # OpenMM side-chain relaxation of the ranked samples (needs openmm, pdbfixer)
 align_mode: pocket_ca

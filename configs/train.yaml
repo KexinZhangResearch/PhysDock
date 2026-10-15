@@ -21,7 +21,7 @@ seed: 42
 init_from: null                   # start from these weights (params.pt, Lightning or Uni-Core checkpoint)
 ckpt_path: null                   # resume this Lightning checkpoint (weights, optimiser, EMA, step)
 compile: false                    # torch.compile the training forward pass
-matmul_precision: high            # TF32 matmuls
+matmul_precision: auto          # float32 matmuls: auto = TF32 if the GPU supports it; highest = full float32
 
 val:                              # validation: diffusion loss, then sampling + structure metrics
   num_samples: 5

@@ -44,15 +44,14 @@ def segment_mean_pool(x: torch.Tensor, segment_sizes: torch.Tensor, eps: float =
     n_rows, n_seg = x.shape[-2], sizes.shape[0]
     # segment_reduce needs lengths that add up to N: the padding rows form a last segment that is dropped
     lengths = torch.cat([sizes, (n_rows - sizes.sum()).reshape(1)])
-    compute_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
-    flat = x.reshape(-1, n_rows, x.shape[-1]).to(compute_dtype)
+    flat = x.reshape(-1, n_rows, x.shape[-1])
     try:
         out = torch.segment_reduce(flat, "sum", lengths=lengths[None].expand(flat.shape[0], -1), axis=1)[:, :n_seg]
     except RuntimeError as e:
         if "negative" in str(e):
             raise ValueError(f"segment sizes add up to more than the number of rows ({n_rows})") from e
         raise
-    return out.reshape(*x.shape[:-2], n_seg, x.shape[-1]).to(x.dtype) / denom
+    return out.reshape(*x.shape[:-2], n_seg, x.shape[-1]) / denom
 
 
 def dict_map(fn, dic, leaf_type):
@@ -120,14 +119,17 @@ def uniform_random_rotation(size, device):
 
 
 def centre_random_augmentation(x: torch.Tensor, atom_mask: torch.Tensor, s: float = 1.0) -> torch.Tensor:
-    """Centre on the masked mean, random rotation, random translation N(0, s^2) per sample.
+    """Centre on the masked mean, random rotation, random translation N(0, s^2) per sample, in float32 (a bf16
+    rotation moves the atoms by ~0.06 Angstrom, the size of the smallest noise level).
 
-    x: [S, N, 3], atom_mask: [N] -> [S, N, 3]
+    x: [S, N, 3], atom_mask: [N] -> [S, N, 3] float32
     """
-    x = x - torch.sum(x * atom_mask[None, :, None], dim=-2, keepdim=True) / torch.sum(atom_mask)
-    R = uniform_random_rotation(x.shape[:-2], device=x.device)
-    x = torch.einsum("...ij,...kj->...ki", R, x)
-    return x + s * torch.normal(mean=0, std=1, size=x.shape[:-2] + (3,), device=x.device, dtype=x.dtype)[..., None, :]
+    with torch.autocast(x.device.type, enabled=False):
+        x, atom_mask = x.float(), atom_mask.float()
+        x = x - torch.sum(x * atom_mask[None, :, None], dim=-2, keepdim=True) / torch.sum(atom_mask)
+        R = uniform_random_rotation(x.shape[:-2], device=x.device)
+        x = torch.einsum("...ij,...kj->...ki", R, x)
+        return x + s * torch.normal(mean=0, std=1, size=x.shape[:-2] + (3,), device=x.device, dtype=x.dtype)[..., None, :]
 
 
 # ======================================================================================
@@ -161,7 +163,7 @@ def weighted_rigid_align(x_pred: torch.Tensor, x_gt: torch.Tensor, weights: torc
     Returns:
         x_gt aligned to x_pred, [..., S, N, 3]
     """
-    with torch.amp.autocast("cuda", enabled=False):
+    with torch.autocast(x_pred.device.type, enabled=False):
         x_pred, x_gt, weights = x_pred.float(), x_gt.float(), weights.float()
         if len(x_gt.shape) == 2:
             x_gt = x_gt[..., None, :, :]

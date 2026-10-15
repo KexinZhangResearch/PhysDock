@@ -13,6 +13,7 @@ import hydra  # noqa: E402
 from omegaconf import DictConfig  # noqa: E402
 
 from PhysDock.configs import to_dict  # noqa: E402
+from PhysDock.utils.precision import set_matmul_precision  # noqa: E402
 
 import numpy as np
 import torch
@@ -52,7 +53,6 @@ def screening(
         sidechain_relaxation=False,
         align_mode="pocket_ca",  # pocket_ca and ca
         device_id=0,
-        dtype=torch.float32,
 ):
     crop_size, atom_crop_size, pocket_type, pocket_cutoff, pocket_dist_type, use_pocket, use_key_res, \
         key_res_random_mask_ratio, use_x_gt_ligand_as_ref_pos = (features[k] for k in (
@@ -91,7 +91,7 @@ def screening(
     dataset = PhysDockDataset.for_screening(input_pkl_path, smis, msa_features_dir, ccd=ccd_path, config=feature_config, on_error="skip")
     dataloader = PhysDockDataloader(dataset, batch_size=1, num_workers=num_workers)
 
-    model = load_pretrained(params_path, model_cfg, device=device, dtype=dtype)
+    model = load_pretrained(params_path, model_cfg, device=device)
 
     print(f"Finish Initialization of model and feature loader!")
     print("################### Screening Configs #####################")
@@ -402,7 +402,7 @@ def screening(
 
 @hydra.main(config_path="../../configs", config_name="screening", version_base="1.3")
 def main(cfg: DictConfig) -> None:
-    torch.set_float32_matmul_precision(cfg.matmul_precision)
+    set_matmul_precision(cfg.matmul_precision)
     sp = cfg.sampling
     screening(
         input_pkl_path=cfg.input_pkl,

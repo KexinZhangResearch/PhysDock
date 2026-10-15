@@ -19,7 +19,7 @@ params: ${root_dir}/data/params/params.pt         # model weights (params.pt or 
 ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
 device: null                    # default cuda:0 if available
 seed: null                      # null = nondeterministic
-matmul_precision: high          # TF32 matmuls, as the released pipeline
+matmul_precision: auto          # float32 matmuls: auto = TF32 if the GPU supports it; highest = full float32
 
 sampling:
   max_samples: 5                # samples to keep
