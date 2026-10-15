@@ -70,7 +70,7 @@ class PhysDockLitModule(L.LightningModule):
             return None
         if isinstance(batch, Sample):           # validation: features + metadata
             return Sample({k: v.to(device) for k, v in batch.features.items()}, batch.meta)
-        return {k: v.to(device) for k, v in batch.items()}
+        return {k: v.to(device, non_blocking=True) for k, v in batch.items()}      # pinned by the train loader
 
     # ------------------------------------------------------------------ training
     def training_step(self, batch, batch_idx):
@@ -89,10 +89,12 @@ class PhysDockLitModule(L.LightningModule):
         if not named:
             return
         grads = [p.grad.detach() for _, p in named]
+        flat = torch.cat([g.reshape(-1) for g in grads]).abs_()
+        abs_min = torch.segment_reduce(flat, "min", lengths=torch.tensor([g.numel() for g in grads], device=flat.device))
         stats = torch.stack([
             torch.stack(torch._foreach_norm(grads)),
-            torch.stack([g.abs().max() for g in grads]),
-            torch.stack([g.abs().min() for g in grads]),
+            torch.stack(torch._foreach_norm(grads, float("inf"))),          # abs max
+            abs_min,
             torch.stack(torch._foreach_norm([p.detach() for _, p in named])),
         ]).float().cpu()
         g_norm, g_max, g_min, p_norm = stats
@@ -128,8 +130,19 @@ class PhysDockLitModule(L.LightningModule):
             if torch.isfinite(value):           # e.g. inter_clash stays empty if every system has one chain
                 self.log(f"val/{name}", value, prog_bar=name in ("loss", "lrmsd"))
 
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None) -> None:
+        """Gradient norm clipping (trainer.gradient_clip_val) without Lightning's precision plugin, which refuses fused
+        optimizers under mixed precision; with fp32 / bf16 the gradients are not loss-scaled."""
+        if not gradient_clip_val:
+            return
+        if self.trainer.precision in ("16-mixed", "16", "16-true"):
+            raise ValueError("fp16 (loss scaling) is not supported, use precision 32 or bf16-mixed")
+        if gradient_clip_algorithm not in (None, "norm"):
+            raise ValueError(f"only norm clipping is supported, got {gradient_clip_algorithm!r}")
+        torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_val)
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.optim["lr"], betas=tuple(self.optim["betas"]),
-                                     eps=self.optim["eps"])
+                                     eps=self.optim["eps"], fused=self.device.type == "cuda")
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, af3_lr_lambda(**self.optim["scheduler"]))
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}

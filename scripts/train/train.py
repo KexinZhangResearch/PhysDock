@@ -18,15 +18,14 @@ os.environ.setdefault("PHYSDOCK_ROOT", str(ROOT))
 
 import hydra  # noqa: E402
 import lightning.pytorch as L  # noqa: E402
-import torch  # noqa: E402
 from lightning.pytorch.callbacks import ModelCheckpoint  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
 from omegaconf import DictConfig  # noqa: E402
 
 from PhysDock.configs import to_dict  # noqa: E402
-from PhysDock.models.primitives import compile_blocks  # noqa: E402
+from PhysDock.models.primitives import set_checkpointing  # noqa: E402
 from PhysDock.utils.precision import set_matmul_precision  # noqa: E402
-from PhysDock.training import EMA, PhysDockDataModule, PhysDockLitModule  # noqa: E402
+from PhysDock.training import EMA, PhysDockDataModule, PhysDockLitModule, compile_training  # noqa: E402
 
 
 @hydra.main(config_path="../../configs", config_name="train", version_base="1.3")
@@ -37,16 +36,9 @@ def main(cfg: DictConfig) -> None:
                                     **to_dict(cfg.data))
     module = PhysDockLitModule(model=to_dict(cfg.model), loss=to_dict(cfg.loss), optim=to_dict(cfg.optim),
                                init_from=cfg.init_from, val=to_dict(cfg.val), grad_stats=cfg.grad_stats)
-    if cfg.compile not in (False, True, "full"):
-        raise ValueError(f"compile must be false, true (every block) or full, got {cfg.compile!r}")
-    if cfg.compile == "full":
-        # compiles model.__call__ (the training forward); validation calls model.forward / sampling eagerly,
-        # parameter names and checkpoints are unchanged. Dynamo's DDP graph splitting does not support the
-        # activation checkpointing of the blocks (torch 2.4), so DDP syncs one bucket for the whole graph.
-        torch._dynamo.config.optimize_ddp = False
-        module.model.compile()
-    elif cfg.compile:
-        compile_blocks(module.model)                # every block, memory as eager
+    set_checkpointing(module.model, to_dict(cfg.checkpointing))
+    if cfg.compile:
+        compile_training(module.model, module.loss_fn)          # region by region, memory as eager
 
     logger = False
     if cfg.logger is not None:

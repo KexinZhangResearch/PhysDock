@@ -20,8 +20,16 @@ ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
 seed: 42
 init_from: null                   # start from these weights (params.pt, Lightning or Uni-Core checkpoint)
 ckpt_path: null                   # resume this Lightning checkpoint (weights, optimiser, EMA, step)
-compile: false                    # true: torch.compile every block (memory as eager); full: the whole forward
-                                  # (~10% faster, ~40% more memory)
+compile: false                    # torch.compile the training step region by region (faster, less memory)
+checkpointing:                    # activation checkpointing per stack: full (recompute in the backward), none (keep
+                                  # all activations: faster, more memory); DiT also attention (keep only the attention)
+                                  # medium, bf16-mixed, compile, crop 256: all full 0.94 s / 12 GiB per step, default
+                                  # 0.83 s / 15 GiB, DiT + Evoformer + AtomTransformer none 0.80 s / 30 GiB
+  AtomTransformer: full
+  Triangleformer: full
+  Evoformer: full
+  Pairformer: full
+  DiT: attention
 matmul_precision: auto          # float32 matmuls: auto = TF32 if the GPU supports it; highest = full float32
 
 val:                              # validation: diffusion loss, then sampling + structure metrics

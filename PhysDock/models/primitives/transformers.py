@@ -15,6 +15,11 @@ def checkpointed(block, *args):
     return checkpoint(block, *args, use_reentrant=False, preserve_rng_state=False)
 
 
+def call(block, *args):
+    """block(*args) (without checkpointing)"""
+    return block(*args)
+
+
 class Stack(nn.Module):
     """no_blocks copies of a block, applied in sequence (activation checkpointing while grads are on).
 
@@ -40,32 +45,32 @@ class Stack(nn.Module):
             state = out if self.n_state > 1 else (out,)
         return state if self.n_state > 1 else state[0]
 
-    checkpointed = staticmethod(checkpointed)       # replaced by a compiled version in compile_blocks
+    checkpoint = True                               # activation checkpointing while grads are on (see set_checkpointing)
+    checkpointed = staticmethod(checkpointed)       # both compiled by PhysDock.training.compile_training
+    call = staticmethod(call)
 
     def run_block(self, block, *args):
-        """block(*args), activation-checkpointed while grads are on"""
+        """block(*args), activation-checkpointed while grads are on (if self.checkpoint)"""
         if torch.is_grad_enabled():
-            return self.checkpointed(block, *args)
+            return (self.checkpointed if self.checkpoint else self.call)(block, *args)
         return block(*args)
 
 
-def compile_blocks(model: nn.Module) -> int:
-    """torch.compile the checkpointed training call of every block of every Stack in model (regional compilation).
+def set_checkpointing(model: nn.Module, modes: dict) -> None:
+    """Activation checkpointing per Stack class, e.g. {"Pairformer": "full", "DiT": "attention"}:
+    "full" (recompute every block in the backward), "none" (keep all activations: faster, more memory) or, for DiT,
+    "attention" (keep the attention inputs / outputs, recompute the rest)."""
+    stacks = {cls.__name__: cls for cls in (AtomTransformer, Triangleformer, Evoformer, Pairformer, DiT)}
+    for name, mode in modes.items():
+        if name not in stacks:
+            raise ValueError(f"unknown stack {name!r}, expected one of {sorted(stacks)}")
+        if mode not in ("full", "none") + (("attention",) if name == "DiT" else ()):
+            raise ValueError(f"checkpointing of {name} must be full, none{' or attention' * (name == 'DiT')}, got {mode!r}")
+    for module in model.modules():
+        mode = modes.get(type(module).__name__) if isinstance(module, Stack) else None
+        if mode is not None:
+            module.checkpoint = {"full": True, "none": False}.get(mode, mode)
 
-    Every block call is its own small graph, so its backward recomputes one block at a time like eager checkpointing;
-    compiling the whole model instead lets the backward hold the recomputed activations of several blocks at once
-    (medium, bf16, crop 256: 27 GiB instead of 19 GiB). Parameters are graph inputs, so the blocks of one class share a
-    compiled graph. Calls without gradients (validation, sampling) stay eager.
-
-    Returns:
-        number of compiled stacks
-    """
-    torch._dynamo.config.inline_inbuilt_nn_modules = True
-    compiled = torch.compile(checkpointed)
-    stacks = [m for m in model.modules() if isinstance(m, Stack)]
-    for stack in stacks:
-        stack.checkpointed = compiled
-    return len(stacks)
 
 
 class AtomBlock(nn.Module):
@@ -193,10 +198,23 @@ class DiTBlock(nn.Module):
         return x + self.transition(x, t)
 
 
+def _dit_attention_inputs(block: DiTBlock, x, t):
+    return block.attention.project(x, t)
+
+
+def _dit_block_output(block: DiTBlock, x, o, gate, t):
+    x = x + block.attention.output(o, gate)
+    return x + block.transition(x, t)
+
+
 class DiT(Stack):
     """Diffusion transformer conditioned on a timestep embedding and per-block pair biases.
 
     x: [B, N, c_s], bias: [no_blocks, H, N, N] (pair_bias(z, z_mask)), t: [B, 256] -> x: [B, N, c_s]
+
+    checkpoint "attention" (selective checkpointing, DiTBlock.forward split in three): the attention inputs / outputs
+    are kept and only the projections, norms and the transition around them are recomputed in the backward, so the
+    expensive attention (fp32, B noisy samples) runs once.
     """
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float, no_blocks: int = 12) -> None:
@@ -204,7 +222,12 @@ class DiT(Stack):
 
     def forward(self, x, bias, t):
         for block, b in zip(self.blocks, bias):
-            x = self.run_block(block, x, b, t)
+            if self.checkpoint == "attention" and torch.is_grad_enabled():
+                q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, t)
+                o = F.scaled_dot_product_attention(q, k, v, b[None])
+                x = self.checkpointed(_dit_block_output, block, x, o, gate, t)
+            else:
+                x = self.run_block(block, x, b, t)
         return x
 
     def pair_bias(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:

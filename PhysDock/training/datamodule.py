@@ -50,7 +50,7 @@ class PhysDockDataModule(L.LightningDataModule):
         # weighted draws split over the DDP ranks; Lightning must not replace this sampler (use_distributed_sampler)
         return PhysDockDataloader(self.train_set, weighted_sampling=True, num_samples=self.samples_per_epoch,
                                   num_workers=self.num_workers, collate_fn=_features_only, distributed=True,
-                                  seed=self.seed)
+                                  seed=self.seed, pin_memory=torch.cuda.is_available())
 
     def val_dataloader(self):
         # every rank validates its own slice of the systems (metrics are synced at the end of the epoch)

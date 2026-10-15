@@ -111,6 +111,11 @@ class AtomEmbedder(nn.Module):
         Returns:
             a: [N_atom, c_a], ap: [N_atom, N_atom, c_ap]
         """
+        a, ap = self.embed(batch)
+        return self.atom_transformer(a, ap, pair_mask(batch["atom_mask"])), ap
+
+    def embed(self, batch):
+        """Atom and atom-pair features before the atom transformer: a [N_atom, c_a], ap [N_atom, N_atom, c_ap]"""
         ref_pos = batch["ref_pos"]
         with torch.no_grad():
             d = ref_pos[:, None, :] - ref_pos[None, :, :]
@@ -122,9 +127,7 @@ class AtomEmbedder(nn.Module):
             self.linear_c_m(F.relu(a))[None, :]
         ap = ap + (self.linear_p(d) * v + self.linear_d(1 / (1 + torch.norm(d, dim=-1)[..., None])) * v
                    + self.linear_v(v) * v)
-        ap = ap + self.ffn(ap)
-        a = self.atom_transformer(a, ap, pair_mask(batch["atom_mask"]))
-        return a, ap
+        return a, ap + self.ffn(ap)
 
 
 class TokenEmbedder(nn.Module):
@@ -161,17 +164,21 @@ class TokenEmbedder(nn.Module):
             s: [N_token, c_s], z: [N_token, N_token, c_z]
         """
         z_mask = pair_mask(batch["token_mask"])
+        s, z, m = self.embed(batch, a)
+        m, z = self.evoformer(m, z, z_mask)
+        z = z + self.template_pair_embedder(batch, z)
+        s = self.linear_m(m[0]) + self.linear_s(s)
+        return self.pairformer(s, z, z_mask)
+
+    def embed(self, batch, a: torch.Tensor):
+        """Inputs of the Evoformer: s [N_token, c_s], z [N_token, N_token, c_z], m [N_msa, N_token, c_m]"""
         s = (segment_mean_pool(F.silu(self.linear_a(a)), batch["split_sizes"])
              + self.linear_target_feat(batch["target_feat"])
              + self.linear_key_res_feat(batch["key_res_feat"])
              + self.linear_pocket_res_feat(batch["is_pocket"][..., None]))
         z = (self.linear_s_i(s)[:, None] + self.linear_s_j(s)[None, :] + self.rel_pos_embedder(batch)
              + self.linear_bonds(batch["token_bonds"][..., None]))
-        m = self.linear_msa_feat(batch["msa_feat"]) + self.linear_s_input(s)
-        m, z = self.evoformer(m, z, z_mask)
-        z = z + self.template_pair_embedder(batch, z)
-        s = self.linear_m(m[0]) + self.linear_s(s)
-        return self.pairformer(s, z, z_mask)
+        return s, z, self.linear_msa_feat(batch["msa_feat"]) + self.linear_s_input(s)
 
 
 class MSATemplEncoder(nn.Module):
@@ -194,11 +201,13 @@ class MSATemplEncoder(nn.Module):
 
     def forward(self, batch) -> Conditions:
         """batch: unbatched feature dict (see PhysDock.data.FEATURES) -> Conditions(a, ap, s, z)"""
-        idx = batch["atom_to_token"]
         a, ap = self.atom_embedder(batch)
         s, z = self.token_embedder(batch, a)
-        # token -> atom
-        a = a + self.linear_s(self.norm_s(s))[idx]
-        # token pair -> atom pair
-        ap = ap + self.linear_z(self.norm_z(z))[idx][:, idx]
+        return self.broadcast(batch, a, ap, s, z)
+
+    def broadcast(self, batch, a, ap, s, z) -> Conditions:
+        """Add the token (pair) representation to the atom (pair) representation."""
+        idx = batch["atom_to_token"]
+        a = a + self.linear_s(self.norm_s(s))[idx]                  # token -> atom
+        ap = ap + self.linear_z(self.norm_z(z))[idx][:, idx]        # token pair -> atom pair
         return Conditions(a, ap, s, z)

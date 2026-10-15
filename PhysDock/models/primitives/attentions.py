@@ -200,9 +200,16 @@ class DiTAttention(nn.Module):
         Returns:
             [B, N, c_s] update
         """
+        q, k, v, gate = self.project(x, t)
+        return self.output(F.scaled_dot_product_attention(q, k, v, bias[None]), gate)
+
+    def project(self, x: torch.Tensor, t: torch.Tensor):
+        """Attention inputs: q, k, v [B, H, N, 32] and the output gate [B, 1, c_s]"""
         x, gate = self.norm_s(x, t)
         q = self.norm_q(_heads(self.linear_q(x)))
         k = self.norm_k(_heads(self.linear_k(x)))
-        v = _heads(self.linear_v(x))
-        o = F.scaled_dot_product_attention(q, k, v, bias[None])
+        return q, k, _heads(self.linear_v(x)), gate
+
+    def output(self, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Attention output o [B, H, N, 32] -> gated update [B, N, c_s]"""
         return self.linear_o(_merge(o)) * gate

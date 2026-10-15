@@ -164,7 +164,8 @@ The released training set is downloaded with `python scripts/download/download_d
 ```shell
 python scripts/train/train.py                                   # released model size, 1 GPU
 python scripts/train/train.py trainer=ddp                       # all GPUs of the node
-python scripts/train/train.py compile=true                      # torch.compile every block (compile=full: whole model)
+python scripts/train/train.py compile=true                      # torch.compile the training step
+python scripts/train/train.py checkpointing.Evoformer=none      # activation checkpointing per stack (full / none)
 python scripts/train/train.py trainer.precision=bf16-mixed      # bf16 encoder (decoder, distogram, loss stay fp32)
 python scripts/train/train.py init_from=data/params/params.pt   # fine-tune the released weights
 python scripts/train/train.py ckpt_path=logs/train/<run>/checkpoints/last.ckpt    # resume

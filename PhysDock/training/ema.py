@@ -36,9 +36,8 @@ class EMA(L.Callback):
             return
         self.step = step
         decay = min(self.decay, (1 + step) / (10 + step)) if self.warm_start else self.decay
-        for k, w in pl_module.state_dict().items():
-            if w.dtype.is_floating_point:
-                self.weights[k].lerp_(w, 1 - decay)
+        pairs = [(self.weights[k], w) for k, w in pl_module.state_dict().items() if w.dtype.is_floating_point]
+        torch._foreach_lerp_([e for e, _ in pairs], [w for _, w in pairs], 1 - decay)
 
     # ---------------------------------------------------------------- evaluation with the EMA weights
     def _swap_in(self, pl_module) -> None:

@@ -122,7 +122,20 @@ class PhysDockLoss(nn.Module):
         Returns:
             (loss, {name: detached value})
         """
-        with torch.autocast(batch["x_gt"].device.type, enabled=False):         # loss in float32
+        total = 0.
+        logs = {}
+        for name, loss in self.terms(outputs, batch).items():
+            if not torch.isfinite(loss):
+                logging.warning(f"{name} is not finite, skipped")
+                loss = torch.zeros_like(loss, requires_grad=True)
+            total = total + self.weights.get(name, 0.) * loss
+            logs[name] = loss.detach().clone()
+        logs["loss"] = total.detach().clone()
+        return total, logs
+
+    def terms(self, outputs, batch) -> dict:
+        """Unweighted loss terms {name: scalar}, in float32 (arguments as forward)."""
+        with torch.autocast(batch["x_gt"].device.type, enabled=False):
             outputs = {k: v.float() for k, v in outputs.items()}
             x, x_gt, atom_mask = outputs["x_denoised"], outputs["x_gt"], batch["atom_mask"]       # normalised
             is_lig = batch["is_ligand"][batch["atom_to_token"]] * atom_mask          # real ligand atoms
@@ -140,13 +153,4 @@ class PhysDockLoss(nn.Module):
             if self.weights.get("distogram"):
                 terms["distogram"] = distogram_loss(outputs["p_distogram"], batch["x_gt"], batch["token_mask"],
                                                     batch["token_to_pseudo_beta_atom"], **self.distogram)
-            total = 0.
-            logs = {}
-            for name, loss in terms.items():
-                if not torch.isfinite(loss):
-                    logging.warning(f"{name} is not finite, skipped")
-                    loss = torch.zeros_like(loss, requires_grad=True)
-                total = total + self.weights.get(name, 0.) * loss
-                logs[name] = loss.detach().clone()
-            logs["loss"] = total.detach().clone()
-            return total, logs
+            return terms
