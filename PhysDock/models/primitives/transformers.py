@@ -10,6 +10,11 @@ from PhysDock.models.primitives import (AttentionWithPairBias, DiTAttention, DiT
 from PhysDock.utils.tensor_utils import gen_attn_mask
 
 
+def checkpointed(block, *args):
+    """Activation-checkpointed block(*args). The blocks use no randomness, so the RNG state is not saved."""
+    return checkpoint(block, *args, use_reentrant=False, preserve_rng_state=False)
+
+
 class Stack(nn.Module):
     """no_blocks copies of a block, applied in sequence (activation checkpointing while grads are on).
 
@@ -35,12 +40,32 @@ class Stack(nn.Module):
             state = out if self.n_state > 1 else (out,)
         return state if self.n_state > 1 else state[0]
 
-    @staticmethod
-    def run_block(block, *args):
+    checkpointed = staticmethod(checkpointed)       # replaced by a compiled version in compile_blocks
+
+    def run_block(self, block, *args):
         """block(*args), activation-checkpointed while grads are on"""
         if torch.is_grad_enabled():
-            return checkpoint(block, *args, use_reentrant=False)
+            return self.checkpointed(block, *args)
         return block(*args)
+
+
+def compile_blocks(model: nn.Module) -> int:
+    """torch.compile the checkpointed training call of every block of every Stack in model (regional compilation).
+
+    Every block call is its own small graph, so its backward recomputes one block at a time like eager checkpointing;
+    compiling the whole model instead lets the backward hold the recomputed activations of several blocks at once
+    (medium, bf16, crop 256: 27 GiB instead of 19 GiB). Parameters are graph inputs, so the blocks of one class share a
+    compiled graph. Calls without gradients (validation, sampling) stay eager.
+
+    Returns:
+        number of compiled stacks
+    """
+    torch._dynamo.config.inline_inbuilt_nn_modules = True
+    compiled = torch.compile(checkpointed)
+    stacks = [m for m in model.modules() if isinstance(m, Stack)]
+    for stack in stacks:
+        stack.checkpointed = compiled
+    return len(stacks)
 
 
 class AtomBlock(nn.Module):
