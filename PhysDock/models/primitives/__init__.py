@@ -89,7 +89,8 @@ class AdaLayerNormZero(nn.Module):
 from .transitions import FeedForward, Transition, DiTTransition  # noqa: E402
 from .opm import OuterProductMean  # noqa: E402
 from .attentions import (AttentionWithPairBias, MSARowAttentionWithPairBias, MSAColumnAttention,  # noqa: E402
-                         TriangleUpdate, TriangleAttention, DiTAttention)
+                         TriangleUpdate, TriangleAttention, DiTAttention, set_attention_backend,
+                         set_triangle_update_backend)
 from .timestep_embeddings import TimestepEmbeddings  # noqa: E402
 from .transformers import (Stack, AtomTransformer, Triangleformer, Evoformer, Pairformer, DiT,  # noqa: E402
                            set_checkpointing)

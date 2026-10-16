@@ -224,7 +224,7 @@ class DiT(Stack):
         for block, b in zip(self.blocks, bias):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
                 q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, t)
-                o = F.scaled_dot_product_attention(q, k, v, b[None])
+                o = block.attention.attend(q, k, v, b)
                 x = self.checkpointed(_dit_block_output, block, x, o, gate, t)
             else:
                 x = self.run_block(block, x, b, t)

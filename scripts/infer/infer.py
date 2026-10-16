@@ -159,6 +159,9 @@ def redock_single(cfg: DictConfig) -> dict:
     if str(device).startswith("cuda") and not torch.cuda.is_available():
         raise InputError("CUDA is not available; use device=cpu (very slow) or run on a GPU machine")
     device = torch.device(device)
+    precision = str(cfg.precision)                       # Hydra reads `precision=32` as an integer
+    if precision not in ("32", "bf16-mixed"):
+        raise InputError(f"precision must be 32 or bf16-mixed, got {cfg.precision!r}")
     features = dict(to_dict(cfg.features), num_msa_samples=max_rounds if physics_correction else 1)
     use_pocket = features["use_pocket"]
     use_x_gt_ligand_as_ref_pos = features["use_x_gt_ligand_as_ref_pos"]
@@ -240,7 +243,7 @@ def redock_single(cfg: DictConfig) -> dict:
         if recycle_id >= 1:
             tensors["msa_feat"] = msa_feat_for_round(tensors, recycle_id)
         t0 = time.time()
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=precision == "bf16-mixed"):
             x_pred = model.sample_diffusion(
                 tensors, num_sample=num_samples_per_round, steps=steps,
                 mmff_gamma_0_factor=gamma, align_ref_pos=recycle_id > 0,
@@ -302,7 +305,7 @@ def redock_single(cfg: DictConfig) -> dict:
 
     result["seconds"] = round(time.time() - t_start, 1)
     summary = {"input_pkl": str(input_pkl), "msa_features": str(msa_dir), "uniprot_msa_features": str(uni_dir),
-               "params": str(params_path), "seed": seed, "device": str(device), **result,
+               "params": str(params_path), "seed": seed, "device": str(device), "precision": precision, **result,
                "settings": {**to_dict(cfg.sampling), "features": features}}
     dump_json(summary, str(out / "summary.json"))
     return result

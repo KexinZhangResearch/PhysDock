@@ -8,6 +8,7 @@ c_z: ${global.c_z}              # input of the distogram head
 sigma_data: ${global.sigma_data}
 num_augmentation_sample: 48     # noisy samples per structure in training
 distogram_bins: ${global.distogram_bins}
+attention_backend: sdpa         # triangle + DiT attention: sdpa (torch) | triton (PhysDock.models.kernels, TF32 / bf16)
 
 encoder:                        # MSATemplEncoder (DiffusionConditioning)
   ref_dim: 167                  # per-atom reference features (see PhysDock.data.FEATURES)
