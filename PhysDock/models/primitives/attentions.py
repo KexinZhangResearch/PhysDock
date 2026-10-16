@@ -60,10 +60,7 @@ class AttentionWithPairBias(nn.Module):
         self.norm_s = RMSNorm(c_s, eps)
         self.norm_z = RMSNorm(c_z, eps)
         self.linear_z = Linear(c_z, c_s // 32, bias=False)
-        self.linear_q = Linear(c_s, c_s, bias=False)
-        self.linear_k = Linear(c_s, c_s, bias=False)
-        self.linear_v = Linear(c_s, c_s, bias=False)
-        self.linear_g = Linear(c_s, c_s)
+        self.linear_qkvg = QKVG(c_s)
         self.linear_o = Linear(c_s, c_s)
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
@@ -77,10 +74,11 @@ class AttentionWithPairBias(nn.Module):
             [N, c_s] update
         """
         s = self.norm_s(s)
-        q, k, v = _heads(self.linear_q(s)), _heads(self.linear_k(s)), _heads(self.linear_v(s))
+        q, k, v, g = self.linear_qkvg(s)
+        q, k, v = _heads(q), _heads(k), _heads(v)
         bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(q), -self.inf)[None]
         o = F.scaled_dot_product_attention(q, k, v, bias)
-        return self.linear_o(_merge(o)) * self.linear_g(s)
+        return self.linear_o(_merge(o)) * g
 
 
 class MSARowAttentionWithPairBias(nn.Module):
@@ -92,10 +90,7 @@ class MSARowAttentionWithPairBias(nn.Module):
         self.norm_m = RMSNorm(c_m, eps)
         self.norm_z = RMSNorm(c_z, eps)
         self.linear_z = Linear(c_z, c_m // 32, bias=False)
-        self.linear_q = Linear(c_m, c_m, bias=False)
-        self.linear_k = Linear(c_m, c_m, bias=False)
-        self.linear_v = Linear(c_m, c_m, bias=False)
-        self.linear_g = Linear(c_m, c_m)
+        self.linear_qkvg = QKVG(c_m)
         self.linear_o = Linear(c_m, c_m)
 
     def forward(self, m: torch.Tensor, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
@@ -109,10 +104,11 @@ class MSARowAttentionWithPairBias(nn.Module):
             [N_msa, N_token, c_m] update
         """
         m = self.norm_m(m)
-        q, k, v = _heads(self.linear_q(m)), _heads(self.linear_k(m)), _heads(self.linear_v(m))
+        q, k, v, g = self.linear_qkvg(m)
+        q, k, v = _heads(q), _heads(k), _heads(v)
         bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1)[None] + gen_attn_mask(z_mask.type_as(q), -self.inf)[None, None]
         o = F.scaled_dot_product_attention(q, k, v, bias)
-        return self.linear_o(_merge(o)) * self.linear_g(m)
+        return self.linear_o(_merge(o)) * g
 
 
 class MSAColumnAttention(nn.Module):
@@ -121,36 +117,33 @@ class MSAColumnAttention(nn.Module):
     def __init__(self, c_m: int, inf: float, eps: float) -> None:
         super().__init__()
         self.norm_m = RMSNorm(c_m, eps)
-        self.linear_q = Linear(c_m, c_m, bias=False)
-        self.linear_k = Linear(c_m, c_m, bias=False)
-        self.linear_v = Linear(c_m, c_m, bias=False)
-        self.linear_g = Linear(c_m, c_m)
+        self.linear_qkvg = QKVG(c_m)
         self.linear_o = Linear(c_m, c_m)
 
     def forward(self, m: torch.Tensor) -> torch.Tensor:
         """m: [N_msa, N_token, c_m] -> update [N_msa, N_token, c_m]"""
         m = self.norm_m(m.transpose(-2, -3))
-        q, k, v = _heads(self.linear_q(m)), _heads(self.linear_k(m)), _heads(self.linear_v(m))
+        q, k, v, g = self.linear_qkvg(m)
+        q, k, v = _heads(q), _heads(k), _heads(v)
         o = F.scaled_dot_product_attention(q, k, v)
-        return (self.linear_o(_merge(o)) * self.linear_g(m)).transpose(-2, -3)
+        return (self.linear_o(_merge(o)) * g).transpose(-2, -3)
 
 
-# Row order of TriangleUpdate.linear_in: the four projections of the two 32-channel products (value, gate) x (q, k)
-# and the output gate. Checkpoints of the original layout (one Linear per block of rows) are converted on loading.
-_TRIANGLE_UPDATE_LEGACY_LAYERS = ("linear_qx", "linear_q", "linear_kx", "linear_k", "linear_g")
+class QKVG(nn.Module):
+    """q, k, v (no bias) and the output gate g (with bias) of an attention as one matmul: the rows of `weight` are
+    [q | k | v | g] and `gate_bias` is the bias of g alone. Same function and initialisation as four Linear layers
+    (checkpoint_keys.upgrade_legacy_keys converts the old layout)."""
 
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.weight = nn.Parameter(Linear(dim, 4 * dim, bias=False).weight.detach())
+        self.gate_bias = nn.Parameter(torch.zeros(dim))
 
-def upgrade_triangle_update_keys(state_dict: dict, prefix: str = "") -> dict:
-    """In place: replace the parameters linear_qx / linear_q / linear_kx / linear_k / linear_g of every TriangleUpdate
-    below `prefix` by the single linear_in (rows in that order). Other keys, and state dicts that are already in the new
-    layout, are left alone. Returns state_dict."""
-    for key in [k for k in state_dict if k.startswith(prefix) and k.endswith("linear_qx.weight")]:
-        base = key[:-len("linear_qx.weight")]
-        for kind in ("weight", "bias"):
-            parts = [base + layer + "." + kind for layer in _TRIANGLE_UPDATE_LEGACY_LAYERS]
-            if all(k in state_dict for k in parts):
-                state_dict[base + "linear_in." + kind] = torch.cat([state_dict.pop(k) for k in parts])
-    return state_dict
+    def forward(self, x: torch.Tensor):
+        """x [..., dim] -> q, k, v, g, each [..., dim]"""
+        bias = F.pad(self.gate_bias, (3 * self.dim, 0))                 # zero for q, k, v
+        return F.linear(x, self.weight, bias).split(self.dim, dim=-1)
 
 
 class TriangleUpdate(nn.Module):
@@ -171,11 +164,6 @@ class TriangleUpdate(nn.Module):
                 self.linear_in.weight[rows[0]:rows[1]] = Linear(c_z, 32).weight
             self.linear_in.bias[4 * 32:] = 1.0                                  # gate: zero weight, bias 1
         self.backend = "torch"                          # see set_triangle_update_backend
-        self._register_load_state_dict_pre_hook(self._upgrade_legacy_keys)
-
-    @staticmethod
-    def _upgrade_legacy_keys(state_dict, prefix, *args) -> None:
-        upgrade_triangle_update_keys(state_dict, prefix)
 
     def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -210,11 +198,8 @@ class TriangleAttention(nn.Module):
         self.inf = inf
         self.transpose = transpose
         self.norm = RMSNorm(c_z, eps=eps)
-        self.linear_q = Linear(c_z, c_z, bias=False)
-        self.linear_k = Linear(c_z, c_z, bias=False)
-        self.linear_v = Linear(c_z, c_z, bias=False)
+        self.linear_qkvg = QKVG(c_z)
         self.linear_z = Linear(c_z, c_z // 32, bias=False)
-        self.linear_g = Linear(c_z, c_z)
         self.linear_o = Linear(c_z, c_z)
         self.backend = "sdpa"                           # see set_attention_backend
 
@@ -230,9 +215,10 @@ class TriangleAttention(nn.Module):
         if self.transpose:
             z = z.transpose(-2, -3)
         z = self.norm(z)
-        q, k, v = _heads(self.linear_q(z)), _heads(self.linear_k(z)), _heads(self.linear_v(z))
+        q, k, v, g = self.linear_qkvg(z)
+        q, k, v = _heads(q), _heads(k), _heads(v)
         bias = self.linear_z(z).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(q), -self.inf)[None]       # [H, N, N]
-        o = self.linear_o(_merge(_shared_bias_attention(q, k, v, bias, self.backend))) * self.linear_g(z)
+        o = self.linear_o(_merge(_shared_bias_attention(q, k, v, bias, self.backend))) * g
         if self.transpose:
             o = o.transpose(-2, -3)
         return o
@@ -248,9 +234,7 @@ class DiTAttention(nn.Module):
         self.inf = inf
         self.norm_s = AdaLayerNormZero(c_s, eps)
         self.norm_z = nn.LayerNorm(c_z)
-        self.linear_q = Linear(c_s, c_s, bias=False)
-        self.linear_k = Linear(c_s, c_s, bias=False)
-        self.linear_v = Linear(c_s, c_s, bias=False)
+        self.linear_qkv = Linear(c_s, 3 * c_s, bias=False)              # rows q, k, v
         self.linear_z = Linear(c_z, c_s // 32, bias=False)
         self.norm_q = RMSNorm(32, eps)
         self.norm_k = RMSNorm(32, eps)
@@ -277,9 +261,8 @@ class DiTAttention(nn.Module):
     def project(self, x: torch.Tensor, t: torch.Tensor):
         """Attention inputs: q, k, v [B, H, N, 32] and the output gate [B, 1, c_s]"""
         x, gate = self.norm_s(x, t)
-        q = self.norm_q(_heads(self.linear_q(x)))
-        k = self.norm_k(_heads(self.linear_k(x)))
-        return q, k, _heads(self.linear_v(x)), gate
+        q, k, v = self.linear_qkv(x).split(x.shape[-1], dim=-1)
+        return self.norm_q(_heads(q)), self.norm_k(_heads(k)), _heads(v), gate
 
     def output(self, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Attention output o [B, H, N, 32] -> gated update [B, N, c_s]"""

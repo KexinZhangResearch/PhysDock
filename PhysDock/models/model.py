@@ -14,6 +14,11 @@ from PhysDock.models.diffusion import build_diffuser, replace
 from PhysDock.models.encoders import MSATemplEncoder
 from PhysDock.models.guidance import LigandGuidance
 from PhysDock.models.primitives import Linear, set_attention_backend, set_triangle_update_backend
+from PhysDock.models.primitives.checkpoint_keys import upgrade_legacy_keys
+
+
+def _upgrade_legacy_state_dict(state_dict, prefix, *args) -> None:
+    upgrade_legacy_keys(state_dict, prefix)
 
 
 class PhysDock(nn.Module):
@@ -43,6 +48,7 @@ class PhysDock(nn.Module):
         self.linear_distogram = Linear(c_z, distogram_bins, init="final")
         set_attention_backend(self, attention_backend)
         set_triangle_update_backend(self, triangle_update_backend)
+        self._register_load_state_dict_pre_hook(_upgrade_legacy_state_dict)     # every load accepts the old layout
 
     @classmethod
     def from_config(cls, cfg) -> "PhysDock":

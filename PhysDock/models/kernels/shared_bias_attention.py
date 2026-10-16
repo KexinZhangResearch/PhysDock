@@ -128,7 +128,8 @@ def _delta(O, DO, Delta, N, sob, soh, son, sdb, sdh, sdn, H,
                  reset_to_zero=["DQ", "DK", "DV"])          # the tuning runs repeat the kernel: clear the atomic sums
 @triton.jit
 def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N,
-         sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sdob, sdoh, sdon, sbh, sbm, sbs,
+         sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sdob, sdoh, sdon, sdqb, sdqh, sdqn, sdkb, sdkh, sdkn, sdvb, sdvh, sdvn,
+         sbh, sbm, sbs,
          D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, SPLIT: tl.constexpr,
          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     """One pass over the score tiles: recomputes p once and produces dq, dk, dv and dbias (see the module docstring).
@@ -149,6 +150,7 @@ def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B
     for b in tl.range(b_lo, b_hi):
         b64 = b.to(tl.int64)
         qo, ko, vo, doo = b64 * sqb + h64 * sqh, b64 * skb + h64 * skh, b64 * svb + h64 * svh, b64 * sdob + h64 * sdoh
+        dqo, dko, dvo = b64 * sdqb + h64 * sdqh, b64 * sdkb + h64 * sdkh, b64 * sdvb + h64 * sdvh
         q = tl.load(Q + qo + offs_m[:, None] * sqn + offs_d[None, :], mask=md, other=0.0)
         q = (q * scale_log2e).to(q.dtype)
         kt = tl.load(K + ko + offs_n[None, :] * skn + offs_d[:, None], mask=n_in[None, :] & d_in[:, None], other=0.0)
@@ -171,9 +173,9 @@ def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B
         dq = tl.dot(dsc, tl.trans(kt), input_precision=PREC)
         dq = dq * scale                                     # q was pre-scaled by scale * log2(e); dk picks it up via q
         dk = dk * 0.6931471805599453                        # 1 / log2(e)
-        tl.atomic_add(DQ + qo + offs_m[:, None] * sqn + offs_d[None, :], dq, mask=md, sem="relaxed")
-        tl.atomic_add(DK + ko + offs_n[:, None] * skn + offs_d[None, :], dk, mask=nd, sem="relaxed")
-        tl.atomic_add(DV + vo + offs_n[:, None] * svn + offs_d[None, :], dv, mask=nd, sem="relaxed")
+        tl.atomic_add(DQ + dqo + offs_m[:, None] * sdqn + offs_d[None, :], dq, mask=md, sem="relaxed")
+        tl.atomic_add(DK + dko + offs_n[:, None] * sdkn + offs_d[None, :], dk, mask=nd, sem="relaxed")
+        tl.atomic_add(DV + dvo + offs_n[:, None] * sdvn + offs_d[None, :], dv, mask=nd, sem="relaxed")
     tl.store(DBias + sid.to(tl.int64) * sbs + h64 * sbh + tile, dbias, mask=m_in[:, None] & n_in[None, :])
 
 
@@ -245,8 +247,9 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
     scale = D ** -0.5
     _bwd[lambda c: (triton.cdiv(N, c["BLOCK_M"]), triton.cdiv(N, c["BLOCK_N"]), H * split)](
         q, k, v, bias, dov, lse, delta, dqv, dkv, dvv, dbias, scale, scale * 1.4426950408889634, B, H, N,
-        *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *dov.stride()[:3], bias.stride(0), bias.stride(1),
-        dbias.stride(0), D_HEAD=D, BLOCK_D=block_d, PREC=prec, RN=rn, SPLIT=split)
+        *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *dov.stride()[:3], *dqv.stride()[:3], *dkv.stride()[:3],
+        *dvv.stride()[:3], bias.stride(0), bias.stride(1), dbias.stride(0), D_HEAD=D, BLOCK_D=block_d, PREC=prec, RN=rn,
+        SPLIT=split)
     return dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype), dbias[0] if split == 1 else dbias.sum(0)
 
 

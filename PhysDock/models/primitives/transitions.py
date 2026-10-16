@@ -13,13 +13,13 @@ class FeedForward(nn.Module):
         super().__init__()
         hidden = int(2 * (4 * dim) / 3)
         hidden = 128 * ((hidden + 127) // 128)
-        self.w1 = Linear(dim, hidden, bias=False)
+        self.w13 = Linear(dim, 2 * hidden, bias=False)              # rows w1 | w3 (one matmul)
         self.w2 = Linear(hidden, dim, bias=False)
-        self.w3 = Linear(dim, hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [..., dim] -> [..., dim]"""
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        a, b = self.w13(x).chunk(2, dim=-1)
+        return self.w2(F.silu(a) * b)
 
 
 class Transition(nn.Module):
