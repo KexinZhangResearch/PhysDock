@@ -37,25 +37,26 @@ def _round_tf32(x):
     return ((x.to(tl.int32, bitcast=True) + 0x1000) & -8192).to(tl.float32, bitcast=True)
 
 
-def _configs(blocks):
+def _configs(blocks, warps=(4, 8), stages=(1, 2, 3)):
     """(BLOCK_M, BLOCK_N, num_warps, num_stages) combinations that compile on triton 3.2 / sm_90 (some crash the
-    compiler: 64x64 with 8 warps, 128x128 with 3 stages)."""
+    compiler: 64x64 with 8 warps, 128x128 with 3 stages). The head dim is only 32, so the score tile dominates the
+    registers and the best tiles are small ones with few warps (32 x 16 with 2 warps beats 64 x 64 with 4 by 1.5x)."""
     out = []
     for m, n in blocks:
-        for w in (4, 8):
-            for st in (1, 2, 3):
-                if (m == n == 128 and st == 3) or (m == n == 64 and w == 8):
+        for w in warps:
+            for st in stages:
+                if (m == n == 128 and st == 3) or (m == n == 64 and w == 8) or (m <= 32 and w > 2 * m // 16) or (m == 16 and w > 1):
                     continue
                 out.append(triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=w, num_stages=st))
     return out
 
 
-_FWD_BLOCKS = ((64, 64), (128, 64), (64, 128), (128, 128), (32, 64))
-_BWD_BLOCKS = ((64, 64), (64, 32), (32, 64), (128, 32), (32, 128), (128, 64), (64, 128))
+_FWD_BLOCKS = ((16, 64), (32, 16), (32, 32), (64, 16), (64, 32), (64, 64), (128, 32), (128, 64))
+_BWD_BLOCKS = ((64, 64), (64, 32), (32, 64), (128, 32), (32, 128), (128, 64), (64, 128), (32, 32), (64, 16), (16, 64), (32, 16))
 
 
 # ----------------------------------------------------------------------------------------------- forward
-@triton.autotune(_configs(_FWD_BLOCKS), key=["N", "D_HEAD", "PREC", "RN"])
+@triton.autotune(_configs(_FWD_BLOCKS, (1, 2, 4, 8), (1, 2, 3, 4)), key=["N", "D_HEAD", "PREC", "RN"])
 @triton.jit
 def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sob, soh, son, sbh, sbm,
@@ -123,7 +124,7 @@ def _delta(O, DO, Delta, N, sob, soh, son, sdb, sdh, sdn, H,
 
 
 # ----------------------------------------------------------------------------------------------- backward
-@triton.autotune(_configs(_BWD_BLOCKS), key=["N", "D_HEAD", "PREC", "RN", "SPLIT"],
+@triton.autotune(_configs(_BWD_BLOCKS, (2, 4, 8)), key=["N", "D_HEAD", "PREC", "RN", "SPLIT"],
                  reset_to_zero=["DQ", "DK", "DV"])          # the tuning runs repeat the kernel: clear the atomic sums
 @triton.jit
 def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N,

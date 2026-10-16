@@ -135,21 +135,47 @@ class MSAColumnAttention(nn.Module):
         return (self.linear_o(_merge(o)) * self.linear_g(m)).transpose(-2, -3)
 
 
+# Row order of TriangleUpdate.linear_in: the four projections of the two 32-channel products (value, gate) x (q, k)
+# and the output gate. Checkpoints of the original layout (one Linear per block of rows) are converted on loading.
+_TRIANGLE_UPDATE_LEGACY_LAYERS = ("linear_qx", "linear_q", "linear_kx", "linear_k", "linear_g")
+
+
+def upgrade_triangle_update_keys(state_dict: dict, prefix: str = "") -> dict:
+    """In place: replace the parameters linear_qx / linear_q / linear_kx / linear_k / linear_g of every TriangleUpdate
+    below `prefix` by the single linear_in (rows in that order). Other keys, and state dicts that are already in the new
+    layout, are left alone. Returns state_dict."""
+    for key in [k for k in state_dict if k.startswith(prefix) and k.endswith("linear_qx.weight")]:
+        base = key[:-len("linear_qx.weight")]
+        for kind in ("weight", "bias"):
+            parts = [base + layer + "." + kind for layer in _TRIANGLE_UPDATE_LEGACY_LAYERS]
+            if all(k in state_dict for k in parts):
+                state_dict[base + "linear_in." + kind] = torch.cat([state_dict.pop(k) for k in parts])
+    return state_dict
+
+
 class TriangleUpdate(nn.Module):
-    """Gated triangular multiplicative update out[i, k] = sum_j q[i, j] * k[k, j]; transpose=True for incoming edges."""
+    """Gated triangular multiplicative update out[i, k] = sum_j q[i, j] * k[k, j]; transpose=True for incoming edges.
+
+    All projections of the normalised input are one Linear (linear_in, C -> 4 * 32 + C): a = (qx * sigmoid(q)) and
+    b = (kx * sigmoid(k)) (32 channels each, masked) feed the product, the last C rows are the output gate."""
 
     def __init__(self, c_z: int, eps: float, transpose: bool = False) -> None:
         super().__init__()
         self.transpose = transpose
         self.norm_in = RMSNorm(c_z, eps)
         self.norm_out = RMSNorm(32, eps)
-        self.linear_q = Linear(c_z, 32)
-        self.linear_qx = Linear(c_z, 32)
-        self.linear_k = Linear(c_z, 32)
-        self.linear_kx = Linear(c_z, 32)
-        self.linear_g = Linear(c_z, c_z, init="gating")
+        self.linear_in = Linear(c_z, 4 * 32 + c_z, init="final")
         self.linear_z = Linear(32, c_z, init="final")
+        with torch.no_grad():                       # the initial values of the original layout, drawn in its order
+            for rows in ((32, 64), (0, 32), (96, 128), (64, 96)):               # q, qx, k, kx
+                self.linear_in.weight[rows[0]:rows[1]] = Linear(c_z, 32).weight
+            self.linear_in.bias[4 * 32:] = 1.0                                  # gate: zero weight, bias 1
         self.backend = "torch"                          # see set_triangle_update_backend
+        self._register_load_state_dict_pre_hook(self._upgrade_legacy_keys)
+
+    @staticmethod
+    def _upgrade_legacy_keys(state_dict, prefix, *args) -> None:
+        upgrade_triangle_update_keys(state_dict, prefix)
 
     def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -162,15 +188,15 @@ class TriangleUpdate(nn.Module):
         """
         if self.backend == "triton":
             from PhysDock.models.kernels.triangle_update import triangle_update
-            return triangle_update(z, z_mask, self.norm_in.weight, self.linear_q, self.linear_qx, self.linear_k,
-                                   self.linear_kx, self.linear_g, self.norm_out.weight, self.linear_z, self.norm_in.eps,
-                                   outgoing=not self.transpose)
+            return triangle_update(z, z_mask, self.norm_in.weight, self.linear_in, self.norm_out.weight, self.linear_z,
+                                   self.norm_in.eps, outgoing=not self.transpose)
         if self.transpose:
             z = z.transpose(-2, -3)
         z = self.norm_in(z)
-        q = self.linear_qx(z) * torch.sigmoid(self.linear_q(z)) * z_mask[..., None]
-        k = self.linear_kx(z) * torch.sigmoid(self.linear_k(z)) * z_mask[..., None]
-        o = self.linear_z(self.norm_out(torch.einsum("...ijc,...Ijc->...iIc", q, k))) * torch.sigmoid(self.linear_g(z))
+        qx, q, kx, k, g = self.linear_in(z).split([32, 32, 32, 32, z.shape[-1]], dim=-1)
+        q = qx * torch.sigmoid(q) * z_mask[..., None]
+        k = kx * torch.sigmoid(k) * z_mask[..., None]
+        o = self.linear_z(self.norm_out(torch.einsum("...ijc,...Ijc->...iIc", q, k))) * torch.sigmoid(g)
         if self.transpose:
             o = o.transpose(-2, -3)
         return o

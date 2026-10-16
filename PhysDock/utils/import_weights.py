@@ -19,7 +19,8 @@ def load_checkpoint_state_dict(ckpt_path, mmap: bool = True, use_ema: bool = Tru
     if not isinstance(params, dict) or not all(isinstance(v, torch.Tensor) for v in params.values()):
         raise ValueError(f"{ckpt_path} does not contain a parameter dict")
     strip = lambda d, p: {(k[len(p):] if k.startswith(p) else k): v for k, v in d.items()}
-    return strip(strip(params, "model."), "_orig_mod.")
+    from PhysDock.models.primitives.attentions import upgrade_triangle_update_keys
+    return upgrade_triangle_update_keys(strip(strip(params, "model."), "_orig_mod."))        # original TriangleUpdate layout
 
 
 def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = True):
