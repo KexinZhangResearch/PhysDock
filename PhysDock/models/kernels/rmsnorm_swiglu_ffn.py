@@ -1,8 +1,8 @@
-"""Triton kernels of PhysDock's Transition: a residual SwiGLU feed-forward behind an RMSNorm, forward and backward.
+"""Triton kernels of RMSNormSwiGLUFFN: a residual SwiGLU feed-forward behind an RMSNorm, forward and backward.
 
     y = x + w2( silu(w1 n) * (w3 n) ),   n = RMSNorm(x) = x * rsqrt(mean(x^2) + eps) * norm_weight
 
-x [..., C], w13 = [w1; w3] [2 * HID, C] (the merged FeedForward.w13), w2 [C, HID]. The pair transition (C = 128, HID = 384, M = 147456
+x [..., C], w13 = [w1; w3] [2 * HID, C] (the merged SwiGLUFFN.w13), w2 [C, HID]. The pair transition (C = 128, HID = 384, M = 147456
 rows at 384 tokens), the MSA transition (256 / 768) and the other Transitions are this operator.
 
 Why a kernel. torch runs it as an RMSNorm (several passes over x), a matmul to [M, 2 * HID], a silu * product, a matmul back, the

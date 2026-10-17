@@ -1,16 +1,14 @@
-"""Triton kernels of the plain SwiGLU feed-forward (no norm) on narrow features, forward and backward, with the residual. Used for the
-atom-pair features of the AtomEmbedder (the other two fused feed-forwards are rmsnorm_swiglu_ffn and adaln_swiglu_ffn):
+"""Triton kernels of the plain SwiGLU feed-forward (no norm) on narrow features, forward and backward, with the residual:
 
     out = x + w2(silu(w1 x) * (w3 x))        x [M, C] with C = 16 channels (M = N_atom^2 = 9.4 million pairs), hidden 128
 
-(PhysDock's AtomEmbedder: ap + ffn(ap)). torch runs this as three matmuls with K = 16 or N = 16, a silu and a product and keeps
-the hidden activations for the backward: three [M, 128] tensors = 7.2 GiB at 3072 atoms (bfloat16), and its backward spends
-7 ms on a concatenation of the two hidden gradients. The kernels keep a tile of x in registers, compute the hidden units for
-it and write only the [M, C] result; the backward recomputes the hidden units from x, so only x is saved.
+(SwiGLUFFN on the atom-pair features of the AtomEmbedder: ap + ffn(ap)). torch runs this as three matmuls with K = 16 or N = 16, a
+silu and a product and keeps the hidden activations for the backward: three [M, 128] tensors = 7.2 GiB at 3072 atoms (bfloat16),
+and its backward spends 7 ms on a concatenation of the two hidden gradients. The kernels keep a tile of x in registers, compute the
+hidden units for it and write only the [M, C] result; the backward recomputes the hidden units from x, so only x is saved.
 
-Precision, per mode the same as the torch expression (never lower): "bf16" (autocast): matmul inputs rounded to bfloat16, float32
-accumulation, the residual x kept in its own dtype (float32 in the model); "tf32" (float32 inputs, TF32 matmuls like torch's default): inputs rounded to the nearest TF32 value; "fp32":
-float32 FMAs. The hidden units, the silu and the products are float32 (torch rounds them to the matmul dtype), the result is
+Precision: see kernels/_common.py (bf16 under autocast, TF32 or float32 otherwise, the residual x kept in its own dtype: float32 in
+the model). The hidden units, the silu and the products are float32 (torch rounds them to the matmul dtype), the result is
 x + ffn(x) in float32, rounded once to the dtype of x. Weight gradients are summed in float32 from per-program partial sums.
 """
 from typing import Tuple
@@ -19,15 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-MODES = {"fp32": 0, "tf32": 1, "bf16": 2}
-_NUM_SMS = {}
-
-
-def _nsm() -> int:
-    dev = torch.cuda.current_device()
-    if dev not in _NUM_SMS:
-        _NUM_SMS[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
-    return _NUM_SMS[dev]
+from ._common import matmul_mode, mm, mm_act, num_sms, prep_weight
 
 
 def can_fuse(x: torch.Tensor, hidden: int) -> bool:
@@ -36,33 +26,17 @@ def can_fuse(x: torch.Tensor, hidden: int) -> bool:
 
 
 @triton.jit
-def _round_tf32(x):
-    return ((x.to(tl.int32, bitcast=True) + 0x1000) & -8192).to(tl.float32, bitcast=True)
-
-
-@triton.jit
-def _dot(a, b, MODE: tl.constexpr):
-    if MODE == 0:
-        return tl.dot(a, b, input_precision="ieee")
-    elif MODE == 1:
-        return tl.dot(_round_tf32(a), _round_tf32(b), input_precision="tf32")
-    else:
-        return tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
-
-
-@triton.jit
 def _fwd_kernel(X, W1, W3, W2, OUT, M, C: tl.constexpr, HID: tl.constexpr, MODE: tl.constexpr, BLOCK_P: tl.constexpr):
     pos = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     pm = pos < M
     oc, oh = tl.arange(0, C), tl.arange(0, HID)
     x = tl.load(X + pos[:, None] * C + oc[None, :], mask=pm[:, None], other=0.0).to(tl.float32)
-    w1 = tl.load(W1 + oh[None, :] * C + oc[:, None]).to(tl.float32)                  # [C, HID] = W1^T
-    w3 = tl.load(W3 + oh[None, :] * C + oc[:, None]).to(tl.float32)
-    w2 = tl.load(W2 + oc[None, :] * HID + oh[:, None]).to(tl.float32)                # [HID, C] = W2^T
-    h1 = _dot(x, w1, MODE)
-    h3 = _dot(x, w3, MODE)
-    s = h1 * tl.sigmoid(h1) * h3
-    y = _dot(s, w2, MODE) + x
+    w1 = tl.load(W1 + oh[None, :] * C + oc[:, None])                                 # [C, HID] = W1^T
+    w3 = tl.load(W3 + oh[None, :] * C + oc[:, None])
+    w2 = tl.load(W2 + oc[None, :] * HID + oh[:, None])                               # [HID, C] = W2^T
+    h1 = mm(x, w1, MODE)
+    h3 = mm(x, w3, MODE)
+    y = mm(h1 * tl.sigmoid(h1) * h3, w2, MODE) + x
     tl.store(OUT + pos[:, None] * C + oc[None, :], y.to(OUT.dtype.element_ty), mask=pm[:, None])
 
 
@@ -87,23 +61,23 @@ def _bwd_kernel(X, DY, W1, W3, W2, DX, PART, M, ntiles, NPROG: tl.constexpr, C: 
         dx = dy
         for c in tl.static_range(2):
             oh = c * HC + ohc
-            w1 = tl.load(W1 + oh[None, :] * C + oc[:, None]).to(tl.float32)             # [C, HC]
-            w3 = tl.load(W3 + oh[None, :] * C + oc[:, None]).to(tl.float32)
-            w2 = tl.load(W2 + oc[:, None] * HID + oh[None, :]).to(tl.float32)           # [C, HC]
-            h1 = _dot(x, w1, MODE)
-            h3 = _dot(x, w3, MODE)
+            w1 = tl.load(W1 + oh[None, :] * C + oc[:, None])                            # [C, HC]
+            w3 = tl.load(W3 + oh[None, :] * C + oc[:, None])
+            w2 = tl.load(W2 + oc[:, None] * HID + oh[None, :])                          # [C, HC]
+            h1 = mm(x, w1, MODE)
+            h3 = mm(x, w3, MODE)
             sg = tl.sigmoid(h1)
             a = h1 * sg
-            ds = _dot(dy, w2, MODE)                                                     # [BLOCK_P, HC]
+            ds = mm(dy, w2, MODE)                                                       # [BLOCK_P, HC]
             dh3 = ds * a
             dh1 = ds * h3 * sg * (1.0 + h1 * (1.0 - sg))
             s = a * h3
-            w1n = tl.load(W1 + oh[:, None] * C + oc[None, :]).to(tl.float32)            # [HC, C]
-            w3n = tl.load(W3 + oh[:, None] * C + oc[None, :]).to(tl.float32)
-            dx += _dot(dh1, w1n, MODE) + _dot(dh3, w3n, MODE)
-            g1 = _dot(tl.trans(dh1), x, MODE)                                           # [HC, C]
-            g3 = _dot(tl.trans(dh3), x, MODE)
-            g2 = _dot(tl.trans(dy), s, MODE)                                            # [C, HC]
+            w1n = tl.load(W1 + oh[:, None] * C + oc[None, :])                           # [HC, C]
+            w3n = tl.load(W3 + oh[:, None] * C + oc[None, :])
+            dx += mm(dh1, w1n, MODE) + mm(dh3, w3n, MODE)
+            g1 = mm_act(tl.trans(dh1), x, MODE)                                         # [HC, C]
+            g3 = mm_act(tl.trans(dh3), x, MODE)
+            g2 = mm_act(tl.trans(dy), s, MODE)                                          # [C, HC]
             if c == 0:
                 dw1_0 += g1
                 dw3_0 += g3
@@ -122,9 +96,9 @@ def _bwd_kernel(X, DY, W1, W3, W2, DX, PART, M, ntiles, NPROG: tl.constexpr, C: 
     tl.store(base + 2 * HID * C + oc[:, None] * HID + HC + ohc[None, :], dw2_1)
 
 
-def _split_weights(w13: torch.Tensor):
+def _weights(w13: torch.Tensor, w2: torch.Tensor, mode: int):
     h = w13.shape[0] // 2
-    return w13[:h].contiguous(), w13[h:].contiguous()
+    return prep_weight(w13[:h], mode), prep_weight(w13[h:], mode), prep_weight(w2, mode)
 
 
 @torch.library.custom_op("physdock::swiglu_ffn_fwd", mutates_args=())
@@ -132,10 +106,10 @@ def _swiglu_ffn_fwd(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: 
     C, hid = x.shape[-1], w2.shape[1]
     x = x.contiguous()
     M = x.numel() // C
-    w1, w3 = _split_weights(w13)
+    w1, w3, w2p = _weights(w13, w2, mode)
     out = torch.empty_like(x)
     bp = 64                                                     # fixed configuration (swept on an H20: 64 positions, 4 warps)
-    _fwd_kernel[(triton.cdiv(M, bp),)](x, w1, w3, w2.contiguous(), out, M, C=C, HID=hid, MODE=mode, BLOCK_P=bp, num_warps=4, num_stages=2)
+    _fwd_kernel[(triton.cdiv(M, bp),)](x, w1, w3, w2p, out, M, C=C, HID=hid, MODE=mode, BLOCK_P=bp, num_warps=4, num_stages=2)
     return out
 
 
@@ -145,17 +119,18 @@ def _(x, w13, w2, mode):
 
 
 @torch.library.custom_op("physdock::swiglu_ffn_bwd", mutates_args=())
-def _swiglu_ffn_bwd(dy: torch.Tensor, x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _swiglu_ffn_bwd(dy: torch.Tensor, x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: int
+                    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     C, hid = x.shape[-1], w2.shape[1]
     x, dy = x.contiguous(), dy.contiguous()
     M = x.numel() // C
-    w1, w3 = _split_weights(w13)
+    w1, w3, w2p = _weights(w13, w2, mode)
     dx = torch.empty_like(x)
     bp = 64
     ntiles = triton.cdiv(M, bp)
-    nprog = min(2 * _nsm(), ntiles)
+    nprog = min(2 * num_sms(), ntiles)
     part = torch.empty(nprog, 3 * hid * C, device=x.device, dtype=torch.float32)
-    _bwd_kernel[(nprog,)](x, dy, w1, w3, w2.contiguous(), dx, part, M, ntiles, NPROG=nprog, C=C, HID=hid, MODE=mode, HC=hid // 2,
+    _bwd_kernel[(nprog,)](x, dy, w1, w3, w2p, dx, part, M, ntiles, NPROG=nprog, C=C, HID=hid, MODE=mode, HC=hid // 2,
                           BLOCK_P=bp, num_warps=4, num_stages=2)
     tot = part.sum(0)
     dw13 = torch.cat([tot[:hid * C].view(hid, C), tot[hid * C:2 * hid * C].view(hid, C)])
@@ -184,12 +159,5 @@ _swiglu_ffn_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 def swiglu_ffn(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
     """x + w2(silu(w1 x) * (w3 x)) with w13 = [w1; w3] [2 * hidden, C], w2 [C, hidden]; differentiable w.r.t. x, w13 and w2.
-
-    The residual is added to x itself, in the dtype of x (the float32 pair features under autocast: the residual stream is not
-    rounded to bfloat16). The matmul precision follows torch's: bfloat16 inputs under autocast, else TF32 unless
-    torch.set_float32_matmul_precision("highest")."""
-    if torch.is_autocast_enabled():
-        mode = "bf16"
-    else:
-        mode = "tf32" if torch.get_float32_matmul_precision() != "highest" else "fp32"
-    return _swiglu_ffn_fwd(x, w13, w2, MODES[mode])
+    The matmul precision follows torch's (see kernels/_common.py)."""
+    return _swiglu_ffn_fwd(x, w13, w2, matmul_mode())

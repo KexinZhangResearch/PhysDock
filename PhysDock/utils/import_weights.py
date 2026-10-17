@@ -1,6 +1,9 @@
 """Checkpoint loading. load_pretrained builds the model on the meta device and assigns the checkpoint tensors
-directly (no initialisation, one copy per tensor): about 1 s for the released 153M-parameter model."""
+directly (no initialisation, one copy per tensor): about 1 s for the released 153M-parameter model. Checkpoints of older versions
+(the released params.pt) are converted to the current parameter names here, by import_old_weights; nothing else in the code knows them."""
 import torch
+
+from PhysDock.utils.import_old_weights import import_old_weights
 
 
 def load_checkpoint_state_dict(ckpt_path, mmap: bool = True, use_ema: bool = True) -> dict:
@@ -19,8 +22,7 @@ def load_checkpoint_state_dict(ckpt_path, mmap: bool = True, use_ema: bool = Tru
     if not isinstance(params, dict) or not all(isinstance(v, torch.Tensor) for v in params.values()):
         raise ValueError(f"{ckpt_path} does not contain a parameter dict")
     strip = lambda d, p: {(k[len(p):] if k.startswith(p) else k): v for k, v in d.items()}
-    from PhysDock.models.primitives.checkpoint_keys import upgrade_legacy_keys
-    return upgrade_legacy_keys(strip(strip(params, "model."), "_orig_mod."))                 # the layout of the released checkpoint
+    return import_old_weights(strip(strip(params, "model."), "_orig_mod."))
 
 
 def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = True):

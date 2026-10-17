@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from PhysDock.models.primitives import (AtomTransformer, Evoformer, FeedForward, Linear, Pairformer, RMSNorm,
+from PhysDock.models.primitives import (AtomTransformer, Evoformer, Linear, Pairformer, RMSNorm, SwiGLUFFN,
                                         Triangleformer)
 from PhysDock.utils.tensor_utils import pair_mask, segment_mean_pool
 
@@ -99,10 +99,9 @@ class AtomEmbedder(nn.Module):
         self.linear_v = Linear(1, c_ap, bias=False)
         self.linear_c_l = Linear(c_a, c_ap, bias=False)
         self.linear_c_m = Linear(c_a, c_ap, bias=False)
-        self.ffn = FeedForward(c_ap)
+        self.ffn = SwiGLUFFN(c_ap)
         self.atom_transformer = AtomTransformer(
             c_a, c_ap, inf, eps, no_blocks_atom)
-        self.ffn_backend = "torch"                      # see set_ffn_backend (triton: fused atom-pair feed-forward)
 
     def forward(self, batch):
         """
@@ -128,7 +127,7 @@ class AtomEmbedder(nn.Module):
             self.linear_c_m(F.relu(a))[None, :]
         ap = ap + (self.linear_p(d) * v + self.linear_d(1 / (1 + torch.norm(d, dim=-1)[..., None])) * v
                    + self.linear_v(v) * v)
-        return a, self.ffn.residual(ap, fused=self.ffn_backend == "triton")
+        return a, self.ffn(ap)
 
 
 class TokenEmbedder(nn.Module):

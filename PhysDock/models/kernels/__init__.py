@@ -1,5 +1,5 @@
-"""Triton kernels."""
-from PhysDock.models.kernels import adaln_swiglu_ffn, pair_bias, rmsnorm_swiglu_ffn, swiglu_ffn  # noqa: F401  (modules)
-from PhysDock.models.kernels.shared_bias_attention import shared_bias_attention
+"""Triton kernels: functions with torch.library custom ops (a fused forward and backward, opaque for torch.compile) and the
+conditions under which they apply (can_fuse). The nn.Module wrappers with their torch fallbacks are in PhysDock.models.primitives."""
+from PhysDock.models.kernels import pair_bias, rmsnorm_swiglu_ffn, shared_bias_attention, swiglu_ffn, triangle_update  # noqa: F401
 
-__all__ = ["adaln_swiglu_ffn", "pair_bias", "rmsnorm_swiglu_ffn", "shared_bias_attention", "swiglu_ffn"]
+__all__ = ["pair_bias", "rmsnorm_swiglu_ffn", "shared_bias_attention", "swiglu_ffn", "triangle_update"]

@@ -1,4 +1,24 @@
-"""Basic layers: Linear, RMSNorm, AdaLayerNormZero; the other building blocks are re-exported from the submodules."""
+"""Layers of the model, bottom up.
+
+Base layers      Linear, RMSNorm, AdaLayerNormZero.
+
+Kernel-level modules: operators that are one fused kernel in the Triton backend and a few torch ops in the torch backend, with the
+same parameters, the same function and the same matmul precision in both. Every one has a `backend` ("torch" | "triton"), set for a
+whole model by set_backend. The Triton path is taken where it applies and is faster (see the can_fuse functions of
+PhysDock.models.kernels); anywhere else the module runs its torch path.
+  SwiGLUFFN            x + w2(silu(w1 x) * w3 x)                     (w1 and w3 merged: w13)
+  RMSNormSwiGLUFFN     x + SwiGLUFFN-update(RMSNorm(x))              (the Transition of the pair, MSA, single and atom streams)
+  AdaLNSwiGLUFFN       x + gate * SwiGLUFFN-update(AdaLN(x, t))      (the transition of the DiT blocks; torch only, see its docstring)
+  RMSNormLinear        RMSNorm + one linear layer (the merged q, k, v, g projection of the attentions; torch only so far)
+  OuterProductMean     z + the pair update from the outer product of two MSA projections (torch only so far)
+  RMSNormPairBias      linear(RMSNorm(z)) + attention mask -> [H, N, N]    (norm + linear + mask of a pair bias)
+  SharedBiasAttention  softmax(q k^T / sqrt(32) + bias) v for a bias shared by the batch (no parameters)
+  TriangleMultiplication  the gated triangular multiplicative update (outgoing / incoming edges)
+The SwiGLU feed-forwards return the residual-added x + update (the fused kernels add the residual in their epilogue); the attention-
+like modules return the update and the block adds it.
+
+Blocks built from them: attentions.py (the attention layers), transformers.py (the blocks and stacks); timestep_embeddings.py.
+"""
 import contextlib
 import math
 
@@ -8,9 +28,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import truncnorm
 
+from PhysDock.models import kernels
+from PhysDock.utils.tensor_utils import gen_attn_mask
+
+BACKENDS = ("torch", "triton")
 _SKIP_INIT = False
 
 
+# ---------------------------------------------------------------------------------------------------------- initialisation
 @contextlib.contextmanager
 def skip_weight_init():
     """Skip the slow truncated-normal init of Linear (use only when all weights are loaded afterwards)."""
@@ -31,6 +56,7 @@ def lecun_normal_init_(weight: torch.Tensor) -> None:
         weight.copy_(torch.tensor(np.reshape(samples, weight.shape), device=weight.device))
 
 
+# ---------------------------------------------------------------------------------------------------------- base layers
 class Linear(nn.Linear):
     """nn.Linear with AlphaFold init ("default" LeCun, "final" zeros, "gating" zeros + bias 1)."""
 
@@ -85,12 +111,222 @@ class AdaLayerNormZero(nn.Module):
         return self.norm(x) * (1 + scale) + shift, gate
 
 
-# the submodules use the layers above, so they are imported last
-from .transitions import FeedForward, Transition, DiTTransition, set_ffn_backend  # noqa: E402
-from .opm import OuterProductMean  # noqa: E402
-from .attentions import (AttentionWithPairBias, MSARowAttentionWithPairBias, MSAColumnAttention,  # noqa: E402
-                         TriangleUpdate, TriangleAttention, DiTAttention, set_attention_backend,
-                         set_triangle_update_backend)
+# ---------------------------------------------------------------------------------------------------------- kernel-level modules
+class KernelModule(nn.Module):
+    """Base of the modules with a Triton implementation: `backend` is "torch" or "triton" (see set_backend)."""
+    backend = "torch"
+
+
+def set_backend(model: nn.Module, backend: str) -> None:
+    """Implementation of every kernel-level module of `model`: "torch" or "triton" (PhysDock.models.kernels; the matmul precision of
+    the torch path: bfloat16 under autocast, TF32 / float32 otherwise)."""
+    if backend not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
+    for module in model.modules():
+        if isinstance(module, KernelModule):
+            module.backend = backend
+
+
+class SwiGLUFFN(KernelModule):
+    """SwiGLU feed-forward with its residual: forward(x) = x + w2(silu(w1 x) * w3 x); the hidden size is 2/3 * 4 * dim rounded up to
+    a multiple of 128 and w1, w3 are one matrix (rows w1 | w3). Triton: the fused kernel of the narrow atom-pair features (16 / 32
+    channels, hidden 128, kernels.swiglu_ffn), which keeps no [..., hidden] activation for the backward (7 GiB for 3072 atoms)."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        hidden = int(2 * (4 * dim) / 3)
+        hidden = 128 * ((hidden + 127) // 128)
+        self.w13 = Linear(dim, 2 * hidden, bias=False)
+        self.w2 = Linear(hidden, dim, bias=False)
+
+    def update(self, x: torch.Tensor) -> torch.Tensor:
+        """w2(silu(w1 x) * w3 x), the torch computation without the residual"""
+        a, b = self.w13(x).chunk(2, dim=-1)
+        return self.w2(F.silu(a) * b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [..., dim] -> x + update(x)"""
+        if self.backend == "triton" and kernels.swiglu_ffn.can_fuse(x, self.w2.in_features):
+            return kernels.swiglu_ffn.swiglu_ffn(x, self.w13.weight, self.w2.weight)
+        return x + self.update(x)
+
+
+class RMSNormSwiGLUFFN(KernelModule):
+    """Pre-norm SwiGLU feed-forward with its residual: forward(x) = x + SwiGLUFFN.update(RMSNorm(x)) (the Transition of the pair, MSA,
+    single and atom streams). Triton: norm, both matmul stages and the residual in one kernel pair (kernels.rmsnorm_swiglu_ffn),
+    without the [..., 2 * hidden] activations the torch backward keeps (361 MiB per pair transition at 384 tokens); used where it is
+    faster than torch: the 128-channel pair transition in bfloat16 (1.2x forward, 1.07x forward + backward) and, without gradients,
+    in TF32."""
+
+    def __init__(self, dim: int, eps: float) -> None:
+        super().__init__()
+        self.norm = RMSNorm(dim, eps=eps)
+        self.ffn = SwiGLUFFN(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [..., dim] -> x + update"""
+        if self.backend == "triton" and kernels.rmsnorm_swiglu_ffn.can_fuse(x, self.ffn.w2.in_features):
+            return kernels.rmsnorm_swiglu_ffn.rmsnorm_swiglu_ffn(x, self.norm.weight, self.ffn.w13.weight, self.ffn.w2.weight, self.norm.eps)
+        return x + self.ffn.update(self.norm(x))
+
+
+class AdaLNSwiGLUFFN(nn.Module):
+    """Gated residual SwiGLU feed-forward behind an adaptive LayerNorm: forward(x, t) = x + gate * SwiGLUFFN.update(AdaLN(x, t)) (the
+    transition of the DiT blocks). Torch only: a fused kernel pair (norm, both stages, the gate and the gradients of scale, shift and
+    gate in one) was written and measured on an H20 for the atom DiT transition (3072 atoms, TF32, the decoder's precision): the
+    forward is 1.1x faster, the backward 2x slower than torch (the recomputation adds three TF32 matmuls, which are slower in Triton
+    than in cuBLAS, and 71% of torch's time is cuBLAS already: at most ~1 ms per block is left to fuse), so it was removed (git history:
+    kernels/adaln_swiglu_ffn.py)."""
+
+    def __init__(self, dim: int, eps: float) -> None:
+        super().__init__()
+        self.norm = AdaLayerNormZero(dim, eps=eps)
+        self.ffn = SwiGLUFFN(dim)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, N, dim]
+            t: [B, 256] timestep embedding
+
+        Returns:
+            [B, N, dim] x + update
+        """
+        n, gate = self.norm(x, t)
+        return x + self.ffn.update(n) * gate
+
+
+class RMSNormLinear(KernelModule):
+    """RMSNorm of the input and one linear layer: forward(x) = linear(RMSNorm(x)) with a bias on the last `bias_dim` output columns only
+    (bias_dim=0: none; the q, k, v, g projection of the attentions has the bias of g alone, the q, k projection of the outer product mean
+    a bias on all columns). The projections merged into one matmul are split by the caller. Torch only so far (backend is accepted for
+    the day a fused kernel exists)."""
+
+    def __init__(self, in_dim: int, out_dim: int, eps: float, bias_dim: int = 0) -> None:
+        super().__init__()
+        self.norm = RMSNorm(in_dim, eps)
+        self.linear = Linear(in_dim, out_dim, bias=False)
+        if bias_dim:
+            self.bias = nn.Parameter(torch.zeros(bias_dim))
+
+    def forward(self, x: torch.Tensor, return_normed: bool = False):
+        """x [..., in_dim] -> [..., out_dim]; with return_normed also the normalised x (for a bias computed from it)"""
+        x = self.norm(x)
+        bias = F.pad(self.bias, (self.linear.out_features - self.bias.numel(), 0)) if hasattr(self, "bias") else None
+        out = F.linear(x, self.linear.weight, bias)
+        return (out, x) if return_normed else out
+
+
+class OuterProductMean(KernelModule):
+    """Pair update from the outer product q_i x k_j of two MSA projections, summed (not averaged) over rows; forward(m, z) = z + update.
+    q and k are one RMSNormLinear (c_m -> 2 * 32, split here). Torch only so far."""
+
+    def __init__(self, c_m: int, c_z: int, eps: float) -> None:
+        super().__init__()
+        self.qk = RMSNormLinear(c_m, 2 * 32, eps, bias_dim=2 * 32)
+        self.linear_o = Linear(32 * 32, c_z, init="final")
+        self.norm_out = RMSNorm(c_z, eps)
+
+    def forward(self, m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """m: [N_msa, N_token, c_m], z: [N_token, N_token, c_z] -> z + update"""
+        n = m.shape[1]
+        q, k = self.qk(m).chunk(2, dim=-1)
+        outer = torch.einsum("bic,bjd->ijcd", q, k).reshape(n, n, -1)
+        return z + self.norm_out(self.linear_o(outer))
+
+
+class RMSNormPairBias(KernelModule):
+    """Attention logit bias of a pair representation: linear(RMSNorm(z)) as [H, N, N] plus a large negative number where the pair is
+    masked (norm + linear + mask of the single and MSA row attention). Triton: one kernel pair (kernels.pair_bias) instead of an
+    RMSNorm, a matmul with 4-16 output columns, a permute and a mask add, and for the backward their six counterparts (the weight
+    gradient contracts over N^2 positions); 6.2 -> 0.96 ms for the atom pairs of 2048 atoms."""
+
+    def __init__(self, c_z: int, heads: int, inf: float, eps: float) -> None:
+        super().__init__()
+        self.inf = inf
+        self.norm = RMSNorm(c_z, eps)
+        self.linear = Linear(c_z, heads, bias=False)
+
+    def forward(self, z: torch.Tensor, z_mask: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [N, N, c_z]
+            z_mask: [N, N]
+            like: a tensor of the dtype of the result (the queries of the attention: bfloat16 under autocast)
+
+        Returns:
+            [H, N, N]
+        """
+        if self.backend == "triton" and kernels.pair_bias.can_fuse(z, self.linear.out_features):
+            return kernels.pair_bias.pair_bias(z, z_mask, self.norm.weight, self.linear.weight, self.norm.eps, self.inf,
+                                               out_dtype=like.dtype, pad=z.shape[0] >= 1024)
+        return self.linear(self.norm(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(like), -self.inf)[None]
+
+
+class SharedBiasAttention(KernelModule):
+    """softmax(q k^T / sqrt(D) + bias) v for q, k, v [..., H, N, D] and a logit bias [H, N, N] shared by all leading (batch) entries: the
+    noisy samples of the DiT, the rows of the triangle and MSA row attention. No parameters. Torch: sdpa; Triton: the fused forward and
+    backward of kernels.shared_bias_attention (the bias tile is loaded once for the whole batch, dbias accumulated in registers; the
+    TF32 inputs are rounded as cuBLAS does), 1.7-2x faster than sdpa in forward + backward in bfloat16 and 2-5x in the TF32 forward."""
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        """q, k, v: [H, N, D] or [B, H, N, D]; bias [H, N, N] -> o of the shape of q"""
+        if self.backend == "triton":
+            if q.dim() == 3:
+                return kernels.shared_bias_attention.shared_bias_attention(q[None], k[None], v[None], bias)[0]
+            return kernels.shared_bias_attention.shared_bias_attention(q, k, v, bias)
+        return F.scaled_dot_product_attention(q, k, v, bias)
+
+
+class TriangleMultiplication(KernelModule):
+    """Gated triangular multiplicative update out[i, k] = sum_j a[i, j] * b[k, j] of the pair representation (outgoing=False: the
+    incoming edges, the same on the transposed pair), returned as the update the block adds.
+
+    All projections of the normalised input are one Linear (linear_in, C -> 4 * 32 + C): a = qx * sigmoid(q) and b = kx * sigmoid(k)
+    (32 channels each, masked) feed the product, the last C rows are the output gate. Triton: norm, projection, products and
+    output projection in six kernels (kernels.triangle_update; TF32 for float32 inputs, bf16 under autocast); 2.5-4x faster than torch
+    eager and ahead of torch.compile in forward + backward."""
+
+    def __init__(self, c_z: int, eps: float, outgoing: bool = True) -> None:
+        super().__init__()
+        self.outgoing = outgoing
+        self.norm_in = RMSNorm(c_z, eps)
+        self.norm_out = RMSNorm(32, eps)
+        self.linear_in = Linear(c_z, 4 * 32 + c_z, init="final")
+        self.linear_z = Linear(32, c_z, init="final")
+        with torch.no_grad():                       # the initial values of the original layout, drawn in its order
+            for rows in ((32, 64), (0, 32), (96, 128), (64, 96)):               # q, qx, k, kx
+                self.linear_in.weight[rows[0]:rows[1]] = Linear(c_z, 32).weight
+            self.linear_in.bias[4 * 32:] = 1.0                                  # gate: zero weight, bias 1
+
+    def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [N, N, c_z]
+            z_mask: [N, N]
+
+        Returns:
+            [N, N, c_z] update
+        """
+        if self.backend == "triton":
+            return kernels.triangle_update.triangle_update(
+                z, z_mask, self.norm_in.weight, self.linear_in.weight, self.linear_in.bias, self.norm_out.weight,
+                self.linear_z.weight, self.linear_z.bias, self.norm_in.eps, self.outgoing)
+        if not self.outgoing:
+            z = z.transpose(-2, -3)
+        z = self.norm_in(z)
+        qx, q, kx, k, g = self.linear_in(z).split([32, 32, 32, 32, z.shape[-1]], dim=-1)
+        q = qx * torch.sigmoid(q) * z_mask[..., None]
+        k = kx * torch.sigmoid(k) * z_mask[..., None]
+        o = self.linear_z(self.norm_out(torch.einsum("...ijc,...Ijc->...iIc", q, k))) * torch.sigmoid(g)
+        if not self.outgoing:
+            o = o.transpose(-2, -3)
+        return o
+
+
+# the blocks use the layers above, so they are imported last
+from .attentions import (AttentionWithBias, MSARowAttentionWithBias, MSAColumnAttention,  # noqa: E402
+                         TriangleAttention, DiTAttention)
 from .timestep_embeddings import TimestepEmbeddings  # noqa: E402
 from .transformers import (Stack, AtomTransformer, Triangleformer, Evoformer, Pairformer, DiT,  # noqa: E402
                            set_checkpointing)

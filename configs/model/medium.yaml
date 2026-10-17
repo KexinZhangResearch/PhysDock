@@ -8,9 +8,8 @@ c_z: ${global.c_z}              # input of the distogram head
 sigma_data: ${global.sigma_data}
 num_augmentation_sample: 48     # noisy samples per structure in training
 distogram_bins: ${global.distogram_bins}
-triangle_update_backend: torch  # triangle multiplicative updates: torch | triton (PhysDock.models.kernels.triangle_update, TF32 / bf16)
-ffn_backend: torch              # SwiGLU feed-forwards / transitions: torch | triton (fused kernels, where faster; same matmul precision)
-attention_backend: sdpa         # triangle + DiT attention: sdpa (torch) | triton (PhysDock.models.kernels, TF32 / bf16)
+backend: torch                  # attention, triangle update, SwiGLU feed-forwards, pair bias: torch | triton (PhysDock.models.kernels;
+                                # same matmul precision as torch: bfloat16 under autocast, TF32 for float32)
 
 encoder:                        # MSATemplEncoder (DiffusionConditioning)
   ref_dim: 167                  # per-atom reference features (see PhysDock.data.FEATURES)

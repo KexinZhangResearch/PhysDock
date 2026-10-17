@@ -1,16 +1,18 @@
-"""Attention layers. Every head has 32 channels; masks become additive -inf biases. Pair masks are symmetric."""
+"""Attention layers, built from the kernel-level modules of PhysDock.models.primitives. Every head has 32 channels; masks become
+additive -inf biases. Pair masks are symmetric. Every layer returns the update that its block adds to the stream."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from PhysDock.models.primitives import AdaLayerNormZero, Linear, RMSNorm
-from PhysDock.models.kernels.pair_bias import can_fuse, matmul_mode, pair_bias
+from PhysDock.models.primitives import (AdaLayerNormZero, Linear, RMSNorm, RMSNormLinear, RMSNormPairBias, SharedBiasAttention)
 from PhysDock.utils.tensor_utils import gen_attn_mask
+
+HEAD_DIM = 32
 
 
 def _heads(x: torch.Tensor) -> torch.Tensor:
     """[..., N, H * 32] -> [..., H, N, 32]"""
-    return x.reshape(*x.shape[:-1], -1, 32).transpose(-2, -3)
+    return x.reshape(*x.shape[:-1], -1, HEAD_DIM).transpose(-2, -3)
 
 
 def _merge(x: torch.Tensor) -> torch.Tensor:
@@ -19,71 +21,16 @@ def _merge(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(*x.shape[:-2], -1)
 
 
-ATTENTION_BACKENDS = ("sdpa", "triton")
-
-
-def _shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
-                           backend: str) -> torch.Tensor:
-    """softmax(q k^T / sqrt(32) + bias) v for q, k, v [B, H, N, 32] and a logit bias [H, N, N] shared by the B entries
-    (the noisy samples of the DiT, the rows of triangle attention). "sdpa": torch's fused attention; "triton":
-    PhysDock.models.kernels.shared_bias_attention (TF32 for float32, bf16 for bfloat16 inputs)."""
-    if backend == "triton":
-        from PhysDock.models.kernels import shared_bias_attention
-        return shared_bias_attention(q, k, v, bias)
-    return F.scaled_dot_product_attention(q, k, v, bias[None])
-
-
-def _use_triton_attention(backend: str, q: torch.Tensor, bias: torch.Tensor) -> bool:
-    """Whether the pair-bias attentions with a few long sequences (single attention: B = 1, MSA rows, atoms: [B, H, N, 32]) run
-    the Triton kernel instead of sdpa. With the fixed configurations of PhysDock.models.kernels.shared_bias_attention it is
-    1.7-2x faster than sdpa in forward + backward in bfloat16 (B = 1, N = 384: 0.067 vs 0.114 ms; 64 MSA rows: 0.80 vs 1.64
-    ms) and 2-5x in the TF32 forward."""
-    return backend == "triton"
-
-
-def _pair_attention_bias(module, z: torch.Tensor, z_mask: torch.Tensor, like: torch.Tensor, pad: bool) -> torch.Tensor:
-    """linear_z(norm_z(z)) + attention mask, [H, N, N], in the dtype of `like` (the queries). With the Triton backend one
-    fused kernel pair (forward and backward) with the matmul precision of the torch expression it replaces (bf16 under
-    autocast, TF32 / float32 otherwise; see PhysDock.models.kernels.pair_bias); the torch expression otherwise."""
-    if module.backend == "triton" and can_fuse(z, module.linear_z.out_features):
-        return pair_bias(z, z_mask, module.norm_z.weight, module.linear_z.weight, module.norm_z.eps, module.inf,
-                         out_dtype=like.dtype, pad=pad, precision=matmul_mode(like))
-    return module.linear_z(module.norm_z(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(like), -module.inf)[None]
-
-
-def set_triangle_update_backend(model: nn.Module, backend: str) -> None:
-    """Implementation of the triangle multiplicative updates of model: "torch" or "triton"
-    (PhysDock.models.kernels.triangle_update; TF32 for float32, bf16 matmuls under autocast)."""
-    if backend not in ("torch", "triton"):
-        raise ValueError(f"triangle update backend must be torch or triton, got {backend!r}")
-    for module in model.modules():
-        if isinstance(module, TriangleUpdate):
-            module.backend = backend
-
-
-def set_attention_backend(model: nn.Module, backend: str) -> None:
-    """Attention implementation of the layers of model with a pair bias: triangle attention, DiT attention, MSA row
-    attention and the single attention (atoms, tokens) ("sdpa" or "triton"; the last two only for large problems and
-    where it is faster, see _use_triton_attention)."""
-    if backend not in ATTENTION_BACKENDS:
-        raise ValueError(f"attention backend must be one of {ATTENTION_BACKENDS}, got {backend!r}")
-    for module in model.modules():
-        if isinstance(module, (TriangleAttention, DiTAttention, AttentionWithPairBias, MSARowAttentionWithPairBias)):
-            module.backend = backend
-
-
-class AttentionWithPairBias(nn.Module):
-    """Gated self-attention over N positions with a per-head logit bias from the pair representation."""
+class AttentionWithBias(nn.Module):
+    """Gated self-attention over N positions (the single representation of the Pairformer, the atoms of the AtomTransformer) with a
+    per-head logit bias from the pair representation."""
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.inf = inf
-        self.norm_s = RMSNorm(c_s, eps)
-        self.norm_z = RMSNorm(c_z, eps)
-        self.linear_z = Linear(c_z, c_s // 32, bias=False)
-        self.linear_qkvg = QKVG(c_s)
+        self.pair_bias = RMSNormPairBias(c_z, c_s // HEAD_DIM, inf, eps)
+        self.qkvg = RMSNormLinear(c_s, 4 * c_s, eps, bias_dim=c_s)
+        self.attend = SharedBiasAttention()
         self.linear_o = Linear(c_s, c_s)
-        self.backend = "sdpa"                           # see set_attention_backend
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -95,29 +42,21 @@ class AttentionWithPairBias(nn.Module):
         Returns:
             [N, c_s] update
         """
-        s = self.norm_s(s)
-        q, k, v, g = self.linear_qkvg(s)
+        q, k, v, g = self.qkvg(s).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        bias = _pair_attention_bias(self, z, z_mask, q, pad=z.shape[0] >= 1024)
-        if _use_triton_attention(self.backend, q[None], bias):
-            o = _shared_bias_attention(q[None], k[None], v[None], bias, "triton")[0]
-        else:
-            o = F.scaled_dot_product_attention(q, k, v, bias)
+        o = self.attend(q, k, v, self.pair_bias(z, z_mask, q))
         return self.linear_o(_merge(o)) * g
 
 
-class MSARowAttentionWithPairBias(nn.Module):
+class MSARowAttentionWithBias(nn.Module):
     """Gated attention along the tokens of every MSA row, with a logit bias from the pair representation."""
 
     def __init__(self, c_m: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.inf = inf
-        self.norm_m = RMSNorm(c_m, eps)
-        self.norm_z = RMSNorm(c_z, eps)
-        self.linear_z = Linear(c_z, c_m // 32, bias=False)
-        self.linear_qkvg = QKVG(c_m)
+        self.pair_bias = RMSNormPairBias(c_z, c_m // HEAD_DIM, inf, eps)
+        self.qkvg = RMSNormLinear(c_m, 4 * c_m, eps, bias_dim=c_m)
+        self.attend = SharedBiasAttention()
         self.linear_o = Linear(c_m, c_m)
-        self.backend = "sdpa"                           # see set_attention_backend
 
     def forward(self, m: torch.Tensor, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -129,108 +68,40 @@ class MSARowAttentionWithPairBias(nn.Module):
         Returns:
             [N_msa, N_token, c_m] update
         """
-        m = self.norm_m(m)
-        q, k, v, g = self.linear_qkvg(m)
+        q, k, v, g = self.qkvg(m).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        bias = _pair_attention_bias(self, z, z_mask, q, pad=z.shape[0] >= 1024)
-        if _use_triton_attention(self.backend, q, bias):
-            o = _shared_bias_attention(q, k, v, bias, "triton")
-        else:
-            o = F.scaled_dot_product_attention(q, k, v, bias[None])
+        o = self.attend(q, k, v, self.pair_bias(z, z_mask, q))
         return self.linear_o(_merge(o)) * g
 
 
 class MSAColumnAttention(nn.Module):
     """Gated attention along the MSA rows of every token (no mask, no bias)."""
 
-    def __init__(self, c_m: int, inf: float, eps: float) -> None:
+    def __init__(self, c_m: int, eps: float) -> None:
         super().__init__()
-        self.norm_m = RMSNorm(c_m, eps)
-        self.linear_qkvg = QKVG(c_m)
+        self.qkvg = RMSNormLinear(c_m, 4 * c_m, eps, bias_dim=c_m)
         self.linear_o = Linear(c_m, c_m)
 
     def forward(self, m: torch.Tensor) -> torch.Tensor:
         """m: [N_msa, N_token, c_m] -> update [N_msa, N_token, c_m]"""
-        m = self.norm_m(m.transpose(-2, -3))
-        q, k, v, g = self.linear_qkvg(m)
+        q, k, v, g = self.qkvg(m.transpose(-2, -3)).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
         o = F.scaled_dot_product_attention(q, k, v)
         return (self.linear_o(_merge(o)) * g).transpose(-2, -3)
 
 
-class QKVG(nn.Module):
-    """q, k, v (no bias) and the output gate g (with bias) of an attention as one matmul: the rows of `weight` are
-    [q | k | v | g] and `gate_bias` is the bias of g alone. Same function and initialisation as four Linear layers
-    (checkpoint_keys.upgrade_legacy_keys converts the old layout)."""
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.dim = dim
-        self.weight = nn.Parameter(Linear(dim, 4 * dim, bias=False).weight.detach())
-        self.gate_bias = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x: torch.Tensor):
-        """x [..., dim] -> q, k, v, g, each [..., dim]"""
-        bias = F.pad(self.gate_bias, (3 * self.dim, 0))                 # zero for q, k, v
-        return F.linear(x, self.weight, bias).split(self.dim, dim=-1)
-
-
-class TriangleUpdate(nn.Module):
-    """Gated triangular multiplicative update out[i, k] = sum_j q[i, j] * k[k, j]; transpose=True for incoming edges.
-
-    All projections of the normalised input are one Linear (linear_in, C -> 4 * 32 + C): a = (qx * sigmoid(q)) and
-    b = (kx * sigmoid(k)) (32 channels each, masked) feed the product, the last C rows are the output gate."""
-
-    def __init__(self, c_z: int, eps: float, transpose: bool = False) -> None:
-        super().__init__()
-        self.transpose = transpose
-        self.norm_in = RMSNorm(c_z, eps)
-        self.norm_out = RMSNorm(32, eps)
-        self.linear_in = Linear(c_z, 4 * 32 + c_z, init="final")
-        self.linear_z = Linear(32, c_z, init="final")
-        with torch.no_grad():                       # the initial values of the original layout, drawn in its order
-            for rows in ((32, 64), (0, 32), (96, 128), (64, 96)):               # q, qx, k, kx
-                self.linear_in.weight[rows[0]:rows[1]] = Linear(c_z, 32).weight
-            self.linear_in.bias[4 * 32:] = 1.0                                  # gate: zero weight, bias 1
-        self.backend = "torch"                          # see set_triangle_update_backend
-
-    def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [N, N, c_z]
-            z_mask: [N, N]
-
-        Returns:
-            [N, N, c_z] update
-        """
-        if self.backend == "triton":
-            from PhysDock.models.kernels.triangle_update import triangle_update
-            return triangle_update(z, z_mask, self.norm_in.weight, self.linear_in, self.norm_out.weight, self.linear_z,
-                                   self.norm_in.eps, outgoing=not self.transpose)
-        if self.transpose:
-            z = z.transpose(-2, -3)
-        z = self.norm_in(z)
-        qx, q, kx, k, g = self.linear_in(z).split([32, 32, 32, 32, z.shape[-1]], dim=-1)
-        q = qx * torch.sigmoid(q) * z_mask[..., None]
-        k = kx * torch.sigmoid(k) * z_mask[..., None]
-        o = self.linear_z(self.norm_out(torch.einsum("...ijc,...Ijc->...iIc", q, k))) * torch.sigmoid(g)
-        if self.transpose:
-            o = o.transpose(-2, -3)
-        return o
-
-
 class TriangleAttention(nn.Module):
-    """Gated attention along the rows of z with a bias from z; transpose=True attends along the columns."""
+    """Gated attention along the rows of z with a bias from z (starting node); starting_node=False attends along the columns (ending
+    node). The bias comes from the same normalised z as q, k, v: the norm and the projection (qkvg) are shared."""
 
-    def __init__(self, c_z: int, inf: float, eps: float, transpose: bool = False) -> None:
+    def __init__(self, c_z: int, inf: float, eps: float, starting_node: bool = True) -> None:
         super().__init__()
         self.inf = inf
-        self.transpose = transpose
-        self.norm = RMSNorm(c_z, eps=eps)
-        self.linear_qkvg = QKVG(c_z)
-        self.linear_z = Linear(c_z, c_z // 32, bias=False)
+        self.starting_node = starting_node
+        self.qkvg = RMSNormLinear(c_z, 4 * c_z, eps, bias_dim=c_z)
+        self.linear_z = Linear(c_z, c_z // HEAD_DIM, bias=False)
+        self.attend = SharedBiasAttention()
         self.linear_o = Linear(c_z, c_z)
-        self.backend = "sdpa"                           # see set_attention_backend
 
     def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -241,14 +112,14 @@ class TriangleAttention(nn.Module):
         Returns:
             [N, N, c_z] update
         """
-        if self.transpose:
+        if not self.starting_node:
             z = z.transpose(-2, -3)
-        z = self.norm(z)
-        q, k, v, g = self.linear_qkvg(z)
+        qkvg, z = self.qkvg(z, return_normed=True)
+        q, k, v, g = qkvg.chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
         bias = self.linear_z(z).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(q), -self.inf)[None]       # [H, N, N]
-        o = self.linear_o(_merge(_shared_bias_attention(q, k, v, bias, self.backend))) * g
-        if self.transpose:
+        o = self.linear_o(_merge(self.attend(q, k, v, bias))) * g
+        if not self.starting_node:
             o = o.transpose(-2, -3)
         return o
 
@@ -256,7 +127,8 @@ class TriangleAttention(nn.Module):
 class DiTAttention(nn.Module):
     """DiT self-attention: AdaLN-Zero input, RMS-normalised q/k, pair bias shared by all samples, gated output.
 
-    The pair bias linear_z(norm_z(z)) + mask is computed by DiT.pair_bias (once per structure for all blocks)."""
+    The pair bias linear_z(norm_z(z)) + mask is computed by DiT.pair_bias (once per structure for all blocks, from the norm_z and
+    linear_z of every block)."""
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
@@ -264,21 +136,17 @@ class DiTAttention(nn.Module):
         self.norm_s = AdaLayerNormZero(c_s, eps)
         self.norm_z = nn.LayerNorm(c_z)
         self.linear_qkv = Linear(c_s, 3 * c_s, bias=False)              # rows q, k, v
-        self.linear_z = Linear(c_z, c_s // 32, bias=False)
-        self.norm_q = RMSNorm(32, eps)
-        self.norm_k = RMSNorm(32, eps)
+        self.linear_z = Linear(c_z, c_s // HEAD_DIM, bias=False)
+        self.norm_q = RMSNorm(HEAD_DIM, eps)
+        self.norm_k = RMSNorm(HEAD_DIM, eps)
+        self.attend = SharedBiasAttention()
         self.linear_o = Linear(c_s, c_s)
-        self.backend = "sdpa"                           # see set_attention_backend
-
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        """q, k, v [B, H, N, 32], bias [H, N, N] -> [B, H, N, 32]"""
-        return _shared_bias_attention(q, k, v, bias, self.backend)
 
     def forward(self, x: torch.Tensor, bias: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, N, c_s]
-            bias: [H, N, N] contiguous logit bias (pair bias + mask, see DiT.pair_bias)
+            bias: [H, N, N] logit bias (pair bias + mask, see DiT.pair_bias)
             t: [B, 256] timestep embedding
 
         Returns:

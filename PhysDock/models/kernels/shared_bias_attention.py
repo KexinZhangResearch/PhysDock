@@ -1,5 +1,5 @@
-"""Triton attention with a pair bias shared by the batch: the DiT attentions of the decoder (atoms, tokens) and the
-triangle attention of the pair stack.
+"""Triton attention with a pair bias shared by the batch (SharedBiasAttention): the DiT attentions of the decoder (atoms, tokens),
+the triangle attention of the pair stack, the single attention and the MSA row attention.
 
     o[b, h] = softmax(q[b, h] k[b, h]^T / sqrt(D) + bias[h]) v[b, h]
 
@@ -10,8 +10,7 @@ q, k, v and bias (summed over b).
 
 Precision (float32 inputs): TF32 matmuls with the inputs rounded to nearest, like cuBLAS does for torch's TF32 matmuls
 (the Triton default truncates the low 13 mantissa bits, which makes the gradients ~6x less accurate than torch's TF32);
-softmax and accumulators in float32. precision="tf32x3" (3xTF32, fp32-grade) is available at ~3x the cost. bfloat16
-inputs use plain bf16 matmuls. Scores are kept in log2 units (exp2 is a hardware instruction).
+softmax and accumulators in float32. bfloat16 inputs use plain bf16 matmuls. Scores are kept in log2 units (exp2 is a hardware instruction).
 
 Backward, one fused kernel instead of the usual three passes: grid (query block, key block, head [x batch split]),
 looping over the batch inside. The bias tile is loaded once for all b, the scores are recomputed once, and dbias is
@@ -27,14 +26,9 @@ import torch
 import triton
 import triton.language as tl
 
-PRECISIONS = ("tf32", "tf32x3")
+from ._common import num_sms, round_tf32_ as _round_tf32
+
 _MAX_SPLIT = 8
-
-
-@triton.jit
-def _round_tf32(x):
-    """x rounded to the nearest TF32 value (10 mantissa bits): add half an ulp, clear the low 13 bits"""
-    return ((x.to(tl.int32, bitcast=True) + 0x1000) & -8192).to(tl.float32, bitcast=True)
 
 
 def _programs(B: int, H: int, N: int) -> int:
@@ -245,15 +239,10 @@ def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B
 
 
 # ----------------------------------------------------------------------------------------------- torch ops
-_NUM_SMS = {}
-
-
 def _split(B, H, N):
     """batch chunks of the backward: enough programs (~4 per SM, counted for 64 x 64 tiles) to fill the GPU"""
-    dev = torch.cuda.current_device()
-    sms = _NUM_SMS.setdefault(dev, torch.cuda.get_device_properties(dev).multi_processor_count)
     programs = triton.cdiv(N, 64) ** 2 * H
-    return max(1, min(B, _MAX_SPLIT, triton.cdiv(4 * sms, programs)))
+    return max(1, min(B, _MAX_SPLIT, triton.cdiv(4 * num_sms(), programs)))
 
 
 def _pad16(n: int) -> int:
@@ -273,21 +262,20 @@ def aligned_bias(bias: torch.Tensor) -> torch.Tensor:
     return out[..., :N]
 
 
-def _prep(dtype, precision):
+def _prep(dtype):
     """(tl.dot input_precision, round the inputs to TF32?)"""
     if dtype == torch.bfloat16:
         return "ieee", False                                # bf16 inputs: the plain tensor-core product
-    return ("tf32", True) if precision == "tf32" else ("tf32x3", False)
+    return "tf32", True
 
 
 @torch.library.custom_op("physdock::shared_bias_attention_fwd", mutates_args=())
-def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
-                   precision: str) -> Tuple[torch.Tensor, torch.Tensor]:
+def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """-> o [B, N, H, D] contiguous (the caller transposes to [B, H, N, D]), lse [B, H, N] (log2 units)"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
     bias = aligned_bias(bias)
-    prec, rn = _prep(q.dtype, precision)
+    prec, rn = _prep(q.dtype)
     o = torch.empty(B, N, H, D, device=q.device, dtype=q.dtype)
     ov = o.transpose(1, 2)
     lse = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
@@ -304,22 +292,21 @@ def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torc
 
 
 @_attention_fwd.register_fake
-def _(q, k, v, bias, precision):
+def _(q, k, v, bias):
     B, H, N, D = q.shape
     return q.new_empty(B, N, H, D), q.new_empty(B, H, N, dtype=torch.float32)
 
 
 @torch.library.custom_op("physdock::shared_bias_attention_bwd", mutates_args=())
 def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
-                   o: torch.Tensor, lse: torch.Tensor,
-                   precision: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                   o: torch.Tensor, lse: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """do, o: [B, N, H, D] -> dq, dk, dv [B, N, H, D], dbias [H, N, N]"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
     bias = aligned_bias(bias)
     if do.stride(-1) != 1:
         do = do.contiguous()
-    prec, rn = _prep(q.dtype, precision)
+    prec, rn = _prep(q.dtype)
     block_d = max(16, triton.next_power_of_2(D))
     ov, dov = o.transpose(1, 2), do.transpose(1, 2)
     delta = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
@@ -345,35 +332,32 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
 
 
 @_attention_bwd.register_fake
-def _(do, q, k, v, bias, o, lse, precision):
+def _(do, q, k, v, bias, o, lse):
     B, H, N, D = q.shape
     return (q.new_empty(B, N, H, D), q.new_empty(B, N, H, D), q.new_empty(B, N, H, D),
             bias.new_empty(H, N, N, dtype=torch.float32))
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, bias, precision = inputs
+    q, k, v, bias = inputs
     ctx.save_for_backward(q, k, v, bias, output[0], output[1])
-    ctx.precision = precision
 
 
 def _backward(ctx, do, dlse):
     q, k, v, bias, o, lse = ctx.saved_tensors
-    dq, dk, dv, dbias = _attention_bwd(do, q, k, v, bias, o, lse, ctx.precision)
-    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype), None
+    dq, dk, dv, dbias = _attention_bwd(do, q, k, v, bias, o, lse)
+    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype)
 
 
 _attention_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
-def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
-                          precision: str = "tf32") -> torch.Tensor:
+def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """softmax(q k^T / sqrt(D) + bias) v with a bias shared by the batch.
 
     Args:
         q, k, v: [B, H, N, D] float32 or bfloat16
         bias: [H, N, N] attention logit bias (pair features + key mask), shared by the B batch entries
-        precision: float32 matmuls, "tf32" (like torch's TF32) or "tf32x3" (fp32-grade); ignored for bfloat16
 
     Returns:
         [B, H, N, D]
@@ -387,6 +371,4 @@ def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bia
         raise ValueError(f"q, k, v must be float32 or bfloat16 of the same dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
     if D > 128:
         raise ValueError(f"head dim must be <= 128, got {D}")
-    if precision not in PRECISIONS:
-        raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
-    return _attention_fwd(q, k, v, bias, precision)[0].transpose(1, 2)
+    return _attention_fwd(q, k, v, bias)[0].transpose(1, 2)

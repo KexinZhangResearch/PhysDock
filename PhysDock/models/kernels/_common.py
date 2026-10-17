@@ -1,6 +1,6 @@
-"""Helpers shared by the fused SwiGLU feed-forward kernels (swiglu_ffn, rmsnorm_swiglu_ffn, adaln_swiglu_ffn).
+"""Helpers shared by the Triton kernels.
 
-Precision of the three matmul modes (the same as the torch expressions the kernels replace, never lower):
+Matmul precision of the fused SwiGLU kernels and pair_bias (the same as the torch expressions they replace, never lower):
   "bf16"  under autocast: the matmul inputs are rounded to bfloat16, products and sums in float32;
   "tf32"  float32 inputs with torch.set_float32_matmul_precision("high" / "medium"): inputs rounded to the nearest TF32 value
           (what cuBLAS does; the Triton default truncates), float32 accumulation;
@@ -23,7 +23,7 @@ def num_sms() -> int:
 
 
 def matmul_mode() -> int:
-    """MODES value of the matmuls of the current autocast / float32 matmul precision state"""
+    """MODES value of the matmuls under the current autocast / float32 matmul precision state"""
     if torch.is_autocast_enabled():
         return MODES["bf16"]
     return MODES["fp32"] if torch.get_float32_matmul_precision() == "highest" else MODES["tf32"]
@@ -46,17 +46,37 @@ def compute_dtype(mode: int) -> torch.dtype:
 
 
 @triton.jit
-def _round_tf32(x):
+def round_tf32_(x):
     return ((x.to(tl.int32, bitcast=True) + 0x1000) & -8192).to(tl.float32, bitcast=True)
 
 
 @triton.jit
+def cast_in(x, BF16: tl.constexpr):
+    """x as a matmul input: bfloat16, or float32 rounded to the nearest TF32 value (TriangleMultiplication's two modes)"""
+    if BF16:
+        return x.to(tl.bfloat16)
+    else:
+        return round_tf32_(x)
+
+
+@triton.jit
 def mm(a, b, MODE: tl.constexpr):
-    """a @ b of the precision MODE, float32 accumulation. a is a float32 value (rounded here); b is a weight tile that prep_weight
+    """a @ b of the precision MODE, float32 accumulation. a is a float32 value (converted here); b is a weight tile that prep_weight
     already converted (bfloat16 / TF32-rounded float32 / float32)"""
     if MODE == 0:
         return tl.dot(a, b, input_precision="ieee")
     elif MODE == 1:
-        return tl.dot(_round_tf32(a), b, input_precision="tf32")
+        return tl.dot(round_tf32_(a), b, input_precision="tf32")
     else:
         return tl.dot(a.to(tl.bfloat16), b)
+
+
+@triton.jit
+def mm_act(a, b, MODE: tl.constexpr):
+    """a @ b of the precision MODE for two float32 activations (both converted here)"""
+    if MODE == 0:
+        return tl.dot(a, b, input_precision="ieee")
+    elif MODE == 1:
+        return tl.dot(round_tf32_(a), round_tf32_(b), input_precision="tf32")
+    else:
+        return tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))

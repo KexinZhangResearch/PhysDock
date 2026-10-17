@@ -4,9 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from PhysDock.models.primitives import (AttentionWithPairBias, DiTAttention, DiTTransition, MSAColumnAttention,
-                                        MSARowAttentionWithPairBias, OuterProductMean, Transition, TriangleAttention,
-                                        TriangleUpdate)
+from PhysDock.models.primitives import (AdaLNSwiGLUFFN, AttentionWithBias, DiTAttention, MSAColumnAttention,
+                                        MSARowAttentionWithBias, OuterProductMean, RMSNormSwiGLUFFN, TriangleAttention,
+                                        TriangleMultiplication)
 from PhysDock.models.kernels.shared_bias_attention import aligned_bias
 from PhysDock.utils.tensor_utils import gen_attn_mask
 
@@ -92,12 +92,12 @@ def set_checkpointing(model: nn.Module, modes: dict) -> None:
 class AtomBlock(nn.Module):
     def __init__(self, c_a: int, c_ap: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.attention = AttentionWithPairBias(c_a, c_ap, inf, eps)
-        self.transition = Transition(c_a, eps)
+        self.attention = AttentionWithBias(c_a, c_ap, inf, eps)
+        self.transition = RMSNormSwiGLUFFN(c_a, eps)
 
     def forward(self, a, ap, ap_mask):
         a = a + self.attention(a, ap, ap_mask)
-        return a + self.transition(a)
+        return self.transition(a)
 
 
 class AtomTransformer(Stack):
@@ -113,18 +113,18 @@ class AtomTransformer(Stack):
 class TriangleBlock(nn.Module):
     def __init__(self, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.triangle_row_update = TriangleUpdate(c_z, eps)
-        self.triangle_col_update = TriangleUpdate(c_z, eps, transpose=True)
-        self.triangle_row_attention = TriangleAttention(c_z, inf, eps)
-        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, transpose=True)
-        self.pair_transition = Transition(c_z, eps)
+        self.triangle_row_update = TriangleMultiplication(c_z, eps, outgoing=True)
+        self.triangle_col_update = TriangleMultiplication(c_z, eps, outgoing=False)
+        self.triangle_row_attention = TriangleAttention(c_z, inf, eps, starting_node=True)
+        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, starting_node=False)
+        self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
 
     def forward(self, z, z_mask):
         z = z + self.triangle_row_update(z, z_mask)
         z = z + self.triangle_col_update(z, z_mask)
         z = z + self.triangle_row_attention(z, z_mask)
         z = z + self.triangle_col_attention(z, z_mask)
-        return self.pair_transition.residual(z)
+        return self.pair_transition(z)
 
 
 class Triangleformer(Stack):
@@ -140,26 +140,26 @@ class Triangleformer(Stack):
 class EvoformerBlock(nn.Module):
     def __init__(self, c_m: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.msa_row_attention = MSARowAttentionWithPairBias(c_m, c_z, inf, eps)
-        self.msa_col_attention = MSAColumnAttention(c_m, inf, eps)
-        self.msa_transition = Transition(c_m, eps)
+        self.msa_row_attention = MSARowAttentionWithBias(c_m, c_z, inf, eps)
+        self.msa_col_attention = MSAColumnAttention(c_m, eps)
+        self.msa_transition = RMSNormSwiGLUFFN(c_m, eps)
         self.opm = OuterProductMean(c_m, c_z, eps)
-        self.triangle_row_update = TriangleUpdate(c_z, eps)
-        self.triangle_col_update = TriangleUpdate(c_z, eps, transpose=True)
-        self.triangle_row_attention = TriangleAttention(c_z, inf, eps)
-        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, transpose=True)
-        self.pair_transition = Transition(c_z, eps)
+        self.triangle_row_update = TriangleMultiplication(c_z, eps, outgoing=True)
+        self.triangle_col_update = TriangleMultiplication(c_z, eps, outgoing=False)
+        self.triangle_row_attention = TriangleAttention(c_z, inf, eps, starting_node=True)
+        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, starting_node=False)
+        self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
 
     def forward(self, m, z, z_mask):
         m = m + self.msa_row_attention(m, z, z_mask)
         m = m + self.msa_col_attention(m)
-        m = m + self.msa_transition(m)
-        z = z + self.opm(m)
+        m = self.msa_transition(m)
+        z = self.opm(m, z)
         z = z + self.triangle_row_update(z, z_mask)
         z = z + self.triangle_col_update(z, z_mask)
         z = z + self.triangle_row_attention(z, z_mask)
         z = z + self.triangle_col_attention(z, z_mask)
-        return m, self.pair_transition.residual(z)
+        return m, self.pair_transition(z)
 
 
 class Evoformer(Stack):
@@ -175,22 +175,22 @@ class Evoformer(Stack):
 class PairFormerBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.triangle_row_update = TriangleUpdate(c_z, eps)
-        self.triangle_col_update = TriangleUpdate(c_z, eps, transpose=True)
-        self.triangle_row_attention = TriangleAttention(c_z, inf, eps)
-        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, transpose=True)
-        self.pair_transition = Transition(c_z, eps)
-        self.attention = AttentionWithPairBias(c_s, c_z, inf, eps)
-        self.transition = Transition(c_s, eps)
+        self.triangle_row_update = TriangleMultiplication(c_z, eps, outgoing=True)
+        self.triangle_col_update = TriangleMultiplication(c_z, eps, outgoing=False)
+        self.triangle_row_attention = TriangleAttention(c_z, inf, eps, starting_node=True)
+        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, starting_node=False)
+        self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
+        self.attention = AttentionWithBias(c_s, c_z, inf, eps)
+        self.transition = RMSNormSwiGLUFFN(c_s, eps)
 
     def forward(self, s, z, z_mask):
         z = z + self.triangle_row_update(z, z_mask)
         z = z + self.triangle_col_update(z, z_mask)
         z = z + self.triangle_row_attention(z, z_mask)
         z = z + self.triangle_col_attention(z, z_mask)
-        z = self.pair_transition.residual(z)
+        z = self.pair_transition(z)
         s = s + self.attention(s, z, z_mask)
-        return s + self.transition(s), z
+        return self.transition(s), z
 
 
 class Pairformer(Stack):
@@ -207,11 +207,11 @@ class DiTBlock(nn.Module):
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
         self.attention = DiTAttention(c_s, c_z, inf, eps)
-        self.transition = DiTTransition(c_s, eps)
+        self.transition = AdaLNSwiGLUFFN(c_s, eps)
 
     def forward(self, x, bias, t):
         x = x + self.attention(x, bias, t)
-        return self.transition.residual(x, t)
+        return self.transition(x, t)
 
 
 def _dit_attention_inputs(block: DiTBlock, x, t):
@@ -220,7 +220,7 @@ def _dit_attention_inputs(block: DiTBlock, x, t):
 
 def _dit_block_output(block: DiTBlock, x, o, gate, t):
     x = x + block.attention.output(o, gate)
-    return block.transition.residual(x, t)
+    return block.transition(x, t)
 
 
 class DiT(Stack):
@@ -277,4 +277,4 @@ class DiT(Stack):
         logits = logits.reshape(len(attn), -1, *z_mask.shape)
         # the padded layout only pays off in the Triton kernels; sdpa keeps the contiguous bias (torch.compile handles its
         # alignment itself and fails on the padded view)
-        return aligned_bias(logits) if attn[0].backend == "triton" else logits.contiguous()
+        return aligned_bias(logits) if attn[0].attend.backend == "triton" else logits.contiguous()

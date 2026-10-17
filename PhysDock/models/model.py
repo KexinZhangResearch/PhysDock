@@ -13,12 +13,7 @@ from PhysDock.models.decoders import AllAtomDecoder
 from PhysDock.models.diffusion import build_diffuser, replace
 from PhysDock.models.encoders import MSATemplEncoder
 from PhysDock.models.guidance import LigandGuidance
-from PhysDock.models.primitives import Linear, set_attention_backend, set_ffn_backend, set_triangle_update_backend
-from PhysDock.models.primitives.checkpoint_keys import upgrade_legacy_keys
-
-
-def _upgrade_legacy_state_dict(state_dict, prefix, *args) -> None:
-    upgrade_legacy_keys(state_dict, prefix)
+from PhysDock.models.primitives import Linear, set_backend
 
 
 class PhysDock(nn.Module):
@@ -33,13 +28,12 @@ class PhysDock(nn.Module):
         diffusion: diffusion settings (see models/diffusion.py), in normalised units
         sigma_data: data scale (Angstrom); x_normalised = x_Angstrom / sigma_data
         distogram_bins: distogram head bins
-        attention_backend: "sdpa" (torch) or "triton" (PhysDock.models.kernels) for the triangle and DiT attention
-        triangle_update_backend: "torch" or "triton" (PhysDock.models.kernels.triangle_update) for the triangle updates
-        ffn_backend: "torch" or "triton" (PhysDock.models.kernels.*swiglu_ffn) for the SwiGLU feed-forwards (transitions)
+        backend: "torch" or "triton" for every kernel-level module (attention, triangle update, SwiGLU feed-forwards, pair bias; see
+            PhysDock.models.primitives and PhysDock.models.kernels)
     """
 
     def __init__(self, c_z: int, num_augmentation_sample: int, encoder, decoder, diffusion, sigma_data: float,
-                 distogram_bins: int, attention_backend: str, triangle_update_backend: str, ffn_backend: str = "torch") -> None:
+                 distogram_bins: int, backend: str = "torch") -> None:
         super().__init__()
         self.num_augmentation_sample = num_augmentation_sample
         self.sigma_data = sigma_data
@@ -47,10 +41,7 @@ class PhysDock(nn.Module):
         self.diffusion_conditioning = MSATemplEncoder(**encoder)
         self.dit = AllAtomDecoder(**decoder)
         self.linear_distogram = Linear(c_z, distogram_bins, init="final")
-        set_attention_backend(self, attention_backend)
-        set_triangle_update_backend(self, triangle_update_backend)
-        set_ffn_backend(self, ffn_backend)
-        self._register_load_state_dict_pre_hook(_upgrade_legacy_state_dict)     # every load accepts the old layout
+        set_backend(self, backend)
 
     @classmethod
     def from_config(cls, cfg) -> "PhysDock":

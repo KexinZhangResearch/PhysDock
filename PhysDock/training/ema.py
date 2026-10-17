@@ -71,5 +71,4 @@ class EMA(L.Callback):
 
     def on_load_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         if "ema" in checkpoint:
-            from PhysDock.models.primitives.checkpoint_keys import upgrade_legacy_keys
-            self.weights, self.step = upgrade_legacy_keys(checkpoint["ema"]["weights"]), checkpoint["ema"]["step"]
+            self.weights, self.step = checkpoint["ema"]["weights"], checkpoint["ema"]["step"]
