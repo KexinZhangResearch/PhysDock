@@ -1,14 +1,12 @@
 """Transformer blocks and their stacks (Stack: atom, triangle, Evoformer, Pairformer, DiT)."""
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from PhysDock.models.primitives import (AdaLNSwiGLUFFN, AttentionWithBias, DiTAttention, MSAColumnAttention,
-                                        MSARowAttentionWithBias, OuterProductMean, RMSNormSwiGLUFFN, TriangleAttention,
-                                        TriangleMultiplication)
-from PhysDock.models.kernels.shared_bias_attention import aligned_bias
-from PhysDock.utils.tensor_utils import gen_attn_mask
+from PhysDock.models.primitives import (AdaLNSwiGLUFFN, AttentionWithBias, DiTAttention, LayerNormPairBias, MSAColumnAttention,
+                                        MSARowAttentionWithBias, OuterProductMean, RMSNormSwiGLUFFN, TimeModulation,
+                                        TriangleAttention, TriangleMultiplication)
+from PhysDock.models.primitives.attentions import HEAD_DIM
 
 
 def checkpointed(block, *args):
@@ -96,7 +94,7 @@ class AtomBlock(nn.Module):
         self.transition = RMSNormSwiGLUFFN(c_a, eps)
 
     def forward(self, a, ap, ap_mask):
-        a = a + self.attention(a, ap, ap_mask)
+        a = self.attention(a, ap, ap_mask)
         return self.transition(a)
 
 
@@ -120,10 +118,10 @@ class TriangleBlock(nn.Module):
         self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
 
     def forward(self, z, z_mask):
-        z = z + self.triangle_row_update(z, z_mask)
-        z = z + self.triangle_col_update(z, z_mask)
-        z = z + self.triangle_row_attention(z, z_mask)
-        z = z + self.triangle_col_attention(z, z_mask)
+        z = self.triangle_row_update(z, z_mask)
+        z = self.triangle_col_update(z, z_mask)
+        z = self.triangle_row_attention(z, z_mask)
+        z = self.triangle_col_attention(z, z_mask)
         return self.pair_transition(z)
 
 
@@ -151,14 +149,14 @@ class EvoformerBlock(nn.Module):
         self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
 
     def forward(self, m, z, z_mask):
-        m = m + self.msa_row_attention(m, z, z_mask)
-        m = m + self.msa_col_attention(m)
+        m = self.msa_row_attention(m, z, z_mask)
+        m = self.msa_col_attention(m)
         m = self.msa_transition(m)
         z = self.opm(m, z)
-        z = z + self.triangle_row_update(z, z_mask)
-        z = z + self.triangle_col_update(z, z_mask)
-        z = z + self.triangle_row_attention(z, z_mask)
-        z = z + self.triangle_col_attention(z, z_mask)
+        z = self.triangle_row_update(z, z_mask)
+        z = self.triangle_col_update(z, z_mask)
+        z = self.triangle_row_attention(z, z_mask)
+        z = self.triangle_col_attention(z, z_mask)
         return m, self.pair_transition(z)
 
 
@@ -184,12 +182,12 @@ class PairFormerBlock(nn.Module):
         self.transition = RMSNormSwiGLUFFN(c_s, eps)
 
     def forward(self, s, z, z_mask):
-        z = z + self.triangle_row_update(z, z_mask)
-        z = z + self.triangle_col_update(z, z_mask)
-        z = z + self.triangle_row_attention(z, z_mask)
-        z = z + self.triangle_col_attention(z, z_mask)
+        z = self.triangle_row_update(z, z_mask)
+        z = self.triangle_col_update(z, z_mask)
+        z = self.triangle_row_attention(z, z_mask)
+        z = self.triangle_col_attention(z, z_mask)
         z = self.pair_transition(z)
-        s = s + self.attention(s, z, z_mask)
+        s = self.attention(s, z, z_mask)
         return self.transition(s), z
 
 
@@ -204,29 +202,30 @@ class Pairformer(Stack):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
+    def __init__(self, c_s: int, eps: float) -> None:
         super().__init__()
-        self.attention = DiTAttention(c_s, c_z, inf, eps)
+        self.attention = DiTAttention(c_s, eps)
         self.transition = AdaLNSwiGLUFFN(c_s, eps)
 
-    def forward(self, x, bias, t):
-        x = x + self.attention(x, bias, t)
-        return self.transition(x, t)
+    def forward(self, x, bias, mod):
+        x = self.attention(x, bias, mod[:, :1])
+        return self.transition(x, mod[:, 1:])
 
 
-def _dit_attention_inputs(block: DiTBlock, x, t):
-    return block.attention.project(x, t)
+def _dit_attention_inputs(block: DiTBlock, x, mod):
+    return block.attention.project(x, mod[:, :1])
 
 
-def _dit_block_output(block: DiTBlock, x, o, gate, t):
-    x = x + block.attention.output(o, gate)
-    return block.transition(x, t)
+def _dit_block_output(block: DiTBlock, x, o, gate, mod):
+    x = block.attention.output(x, o, gate)
+    return block.transition(x, mod[:, 1:])
 
 
 class DiT(Stack):
     """Diffusion transformer conditioned on a timestep embedding and per-block pair biases.
 
-    x: [B, N, c_s], bias: [no_blocks, H, N, N] (pair_bias(z, z_mask)), t: [B, 256] -> x: [B, N, c_s]
+    x: [B, N, c_s], bias: [no_blocks, H, N, N] (self.pair_bias(z, z_mask), computed once per structure), t: [B, 256] timestep embedding -> x: [B, N, c_s]
+    (the AdaLN modulations of all blocks come from one matmul of t, TimeModulation)
 
     checkpoint "attention" (selective checkpointing, DiTBlock.forward split in three): the attention inputs / outputs
     are kept and only the projections, norms and the transition around them are recomputed in the backward, so the
@@ -234,47 +233,16 @@ class DiT(Stack):
     """
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float, no_blocks: int = 12) -> None:
-        super().__init__(DiTBlock, no_blocks, c_s, c_z, inf, eps)
+        super().__init__(DiTBlock, no_blocks, c_s, eps)
+        self.pair_bias = LayerNormPairBias(c_z, c_s // HEAD_DIM, no_blocks, inf, eps)
+        self.time_mod = TimeModulation(c_s, no_blocks)
 
     def forward(self, x, bias, t):
-        for i, (block, b) in enumerate(zip(self.blocks, bias)):
+        for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t))):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
-                q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, t)
+                q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, mod)
                 o = block.attention.attend(q, k, v, b)
-                x = self.checkpointed(_dit_block_output, block, x, o, gate, t)
+                x = self.checkpointed(_dit_block_output, block, x, o, gate, mod)
             else:
-                x = self.run_block(block, x, b, t, index=i)
+                x = self.run_block(block, x, b, mod, index=i)
         return x
-
-    def pair_bias(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
-        """Attention logit biases of all blocks, linear_z(norm_z(z)) + mask; they depend on the conditioning only,
-        so the decoder computes them once per structure instead of in every block of every denoising step.
-
-        Every block normalises the same z, so its LayerNorm statistics are computed once and each block's LayerNorm
-        affine is folded into its projection: linear_z(norm_z(z)) = z_hat @ (W * gamma)^T + W @ beta, one matmul for
-        all blocks (the same function and gradients as the blockwise form, up to float rounding).
-
-        Args:
-            z: [N, N, c_z]
-            z_mask: [N, N]
-
-        Returns:
-            [no_blocks, H, N, N] contiguous; with the Triton attention backend a view of a padded buffer whose row stride
-            is a multiple of 16 (the layout the Triton kernels load fastest)
-        """
-        attn = [block.attention for block in self.blocks]
-        eps = attn[0].norm_z.eps
-        if any(a.norm_z.eps != eps for a in attn):
-            raise ValueError("pair_bias needs the same LayerNorm eps in all blocks")
-        if z.shape[-1] < 64:            # torch's LayerNorm kernel takes 18 ms for the 2407^2 x 16 atom pairs (90x its memory time)
-            zc = z - z.mean(-1, keepdim=True)
-            z_hat = zc * torch.rsqrt(zc.pow(2).mean(-1, keepdim=True) + eps)
-        else:
-            z_hat = F.layer_norm(z, z.shape[-1:], eps=eps)
-        weight = torch.cat([a.linear_z.weight * a.norm_z.weight for a in attn])             # [no_blocks * H, c_z]
-        bias = torch.cat([a.linear_z.weight @ a.norm_z.bias for a in attn])
-        logits = F.linear(z_hat, weight, bias).permute(2, 0, 1) + gen_attn_mask(z_mask, -attn[0].inf)
-        logits = logits.reshape(len(attn), -1, *z_mask.shape)
-        # the padded layout only pays off in the Triton kernels; sdpa keeps the contiguous bias (torch.compile handles its
-        # alignment itself and fails on the padded view)
-        return aligned_bias(logits) if attn[0].attend.backend == "triton" else logits.contiguous()

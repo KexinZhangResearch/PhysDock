@@ -9,7 +9,7 @@ Two older layouts are understood, and any mix of them:
 Optimizer states of old Lightning checkpoints do not fit the merged parameters (other number and shapes): start a fresh optimizer.
 
 Conversion is by owner module: an owner is a module prefix that has the parameter named in the rule (so the same layer name in two kinds of
-module is told apart by what its siblings are, e.g. the pair bias norm_z of an attention against the LayerNorm norm_z of a DiT attention).
+module is told apart by what its siblings are, e.g. the pair bias norm_z of an attention against the LayerNorm norm_z of a DiT attention (converted first)).
 """
 import re
 
@@ -47,6 +47,37 @@ def import_old_weights(state_dict: dict) -> dict:
     """Convert `state_dict` (keys without the "model." prefix) to the current parameter names, in place; returns it. Keys that are in the
     current layout are left alone (the conversion is idempotent)."""
     sd = state_dict
+    # 0. the pair biases of the DiT blocks: LayerNorm affine (gamma, beta) and linear_z of every block -> one projection per DiT,
+    #    rows of block i at [i * H, (i + 1) * H): weight = W * gamma, bias = W @ beta
+    stacks = {}
+    for key in list(sd):
+        m = re.fullmatch(r"(.*)blocks\.(\d+)\.attention\.norm_z\.bias", key)
+        if m and m.group(1) + f"blocks.{m.group(2)}.attention.linear_z.weight" in sd:
+            stacks.setdefault(m.group(1), []).append(int(m.group(2)))
+    for prefix, blocks in stacks.items():
+        weight, bias = [], []
+        for i in sorted(blocks):
+            base = f"{prefix}blocks.{i}.attention."
+            w, gamma, beta = sd.pop(base + "linear_z.weight"), sd.pop(base + "norm_z.weight"), sd.pop(base + "norm_z.bias")
+            weight.append(w * gamma)
+            bias.append(w @ beta)
+        sd[prefix + "pair_bias.linear.weight"] = torch.cat(weight)
+        sd[prefix + "pair_bias.linear.bias"] = torch.cat(bias)
+    # 0b. the AdaLN linear of every DiT block (attention.norm_s, transition.norm / ffn_norm) -> one TimeModulation per DiT, rows
+    #     ordered (block, attention | transition, shift | scale | gate)
+    stacks = {}
+    for key in list(sd):
+        m = re.fullmatch(r"(.*)blocks\.(\d+)\.attention\.norm_s\.linear\.weight", key)
+        if m:
+            stacks.setdefault(m.group(1), []).append(int(m.group(2)))
+    for prefix, blocks in stacks.items():
+        for kind in ("weight", "bias"):
+            keys = []
+            for i in sorted(blocks):
+                base = f"{prefix}blocks.{i}."
+                keys += [base + "attention.norm_s.linear." + kind,
+                         base + "transition." + ("norm" if base + "transition.norm.linear." + kind in sd else "ffn_norm") + ".linear." + kind]
+            sd[prefix + "time_mod.linear." + kind] = torch.cat([sd.pop(k) for k in keys])
     # 1. separate Linear layers -> merged matmuls
     for base in _owners(sd, "linear_qx.weight"):                                    # triangle multiplication: qx, q, kx, k, gate
         _stack(sd, base, ("linear_qx", "linear_q", "linear_kx", "linear_k", "linear_g"), "linear_in", ("weight", "bias"))
@@ -73,6 +104,11 @@ def import_old_weights(state_dict: dict) -> dict:
         if base + "norm_z.weight" in sd and base + "norm_z.bias" not in sd:         # pair bias from an RMSNorm-ed pair input
             _move(sd, base, {"norm_z.weight": "pair_bias.norm.weight", "linear_z.weight": "pair_bias.linear.weight"})
         norm = next(n for n in ("norm_s", "norm_m", "norm") if base + n + ".weight" in sd)          # the norm of the stream
+        if base + "linear_z.weight" in sd:                                          # triangle attention: its bias came from that same norm
+            sd[base + "pair_bias.norm.weight"] = sd[base + norm + ".weight"].clone()
+            _move(sd, base, {"linear_z.weight": "pair_bias.linear.weight"})
         _move(sd, base, {norm + ".weight": "qkvg.norm.weight", "linear_qkvg.weight": "qkvg.linear.weight",
                          "linear_qkvg.bias": "qkvg.bias", "linear_qkvg.gate_bias": "qkvg.bias"})
+    for base in _owners(sd, "qkvg.linear.weight") + _owners(sd, "linear_qkv.weight"):            # the output projection of every attention
+        _move(sd, base.removesuffix("qkvg."), {"linear_o.weight": "out.linear.weight", "linear_o.bias": "out.linear.bias"})
     return sd

@@ -8,14 +8,15 @@ whole model by set_backend. The Triton path is taken where it applies and is fas
 PhysDock.models.kernels); anywhere else the module runs its torch path.
   SwiGLUFFN            x + w2(silu(w1 x) * w3 x)                     (w1 and w3 merged: w13)
   RMSNormSwiGLUFFN     x + SwiGLUFFN-update(RMSNorm(x))              (the Transition of the pair, MSA, single and atom streams)
-  AdaLNSwiGLUFFN       x + gate * SwiGLUFFN-update(AdaLN(x, t))      (the transition of the DiT blocks; torch only, see its docstring)
+  AdaLNSwiGLUFFN       x + gate * SwiGLUFFN-update(AdaLN(x, mod))      (the transition of the DiT blocks; torch only, see its docstring)
   RMSNormLinear        RMSNorm + one linear layer (the merged q, k, v, g projection of the attentions; torch only so far)
   OuterProductMean     z + the pair update from the outer product of two MSA projections (torch only so far)
+  LinearGateResidual   x + linear(o) * gate: the output projection, gate and residual of every attention (torch only so far)
+  LayerNormPairBias    the logit biases of all blocks of a DiT from the pair representation, once per structure -> [blocks, H, N, N]
   RMSNormPairBias      linear(RMSNorm(z)) + attention mask -> [H, N, N]    (norm + linear + mask of a pair bias)
   SharedBiasAttention  softmax(q k^T / sqrt(32) + bias) v for a bias shared by the batch (no parameters)
   TriangleMultiplication  the gated triangular multiplicative update (outgoing / incoming edges)
-The SwiGLU feed-forwards return the residual-added x + update (the fused kernels add the residual in their epilogue); the attention-
-like modules return the update and the block adds it.
+Every module that has a residual stream returns it residual-added, x + update (the fused kernels add the residual in their epilogue).
 
 Blocks built from them: attentions.py (the attention layers), transformers.py (the blocks and stacks); timestep_embeddings.py.
 """
@@ -91,24 +92,39 @@ class RMSNorm(nn.Module):
 
 
 class AdaLayerNormZero(nn.Module):
-    """DiT adaptive LayerNorm: LN(x) * (1 + scale) + shift, plus a gate for the following residual branch."""
+    """DiT adaptive LayerNorm: LN(x) * (1 + scale) + shift, plus a gate for the following residual branch. The modulation
+    [shift | scale | gate] is an argument (TimeModulation computes it for all layers of a DiT at once)."""
 
-    def __init__(self, dim: int, eps: float, cond_dim: int = 256) -> None:
+    def __init__(self, dim: int, eps: float) -> None:
         super().__init__()
-        self.linear = Linear(cond_dim, 3 * dim)
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor):
+    def forward(self, x: torch.Tensor, mod: torch.Tensor):
         """
         Args:
             x: [B, N, dim]
-            t: [B, cond_dim] timestep embedding
+            mod: [B, 1, 3 * dim]
 
         Returns:
             x: [B, N, dim] modulated input, gate: [B, 1, dim]
         """
-        shift, scale, gate = self.linear(F.silu(t[..., None, :])).chunk(3, dim=-1)
+        shift, scale, gate = mod.chunk(3, dim=-1)
         return self.norm(x) * (1 + scale) + shift, gate
+
+
+class TimeModulation(nn.Module):
+    """The AdaLN modulations of all the blocks of a DiT from the timestep embedding in one matmul: forward(t)[i] is [B, 2, 3 * dim], the
+    [shift | scale | gate] of the attention (index 0) and of the transition (index 1) of block i. They depend on t only, so the DiT
+    computes them once per call instead of two small matmuls per block."""
+
+    def __init__(self, dim: int, num_blocks: int, cond_dim: int = 256) -> None:
+        super().__init__()
+        self.num_blocks, self.dim = num_blocks, dim
+        self.linear = Linear(cond_dim, num_blocks * 2 * 3 * dim)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t [B, cond_dim] -> [num_blocks, B, 2, 3 * dim]"""
+        return self.linear(F.silu(t)).view(t.shape[0], self.num_blocks, 2, 3 * self.dim).transpose(0, 1)
 
 
 # ---------------------------------------------------------------------------------------------------------- kernel-level modules
@@ -171,7 +187,7 @@ class RMSNormSwiGLUFFN(KernelModule):
 
 
 class AdaLNSwiGLUFFN(nn.Module):
-    """Gated residual SwiGLU feed-forward behind an adaptive LayerNorm: forward(x, t) = x + gate * SwiGLUFFN.update(AdaLN(x, t)) (the
+    """Gated residual SwiGLU feed-forward behind an adaptive LayerNorm: forward(x, mod) = x + gate * SwiGLUFFN.update(AdaLN(x, mod)) (the
     transition of the DiT blocks). Torch only: a fused kernel pair (norm, both stages, the gate and the gradients of scale, shift and
     gate in one) was written and measured on an H20 for the atom DiT transition (3072 atoms, TF32, the decoder's precision): the
     forward is 1.1x faster, the backward 2x slower than torch (the recomputation adds three TF32 matmuls, which are slower in Triton
@@ -183,16 +199,16 @@ class AdaLNSwiGLUFFN(nn.Module):
         self.norm = AdaLayerNormZero(dim, eps=eps)
         self.ffn = SwiGLUFFN(dim)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, N, dim]
-            t: [B, 256] timestep embedding
+            mod: [B, 1, 3 * dim] modulation (TimeModulation)
 
         Returns:
             [B, N, dim] x + update
         """
-        n, gate = self.norm(x, t)
+        n, gate = self.norm(x, mod)
         return x + self.ffn.update(n) * gate
 
 
@@ -263,6 +279,46 @@ class RMSNormPairBias(KernelModule):
         return self.linear(self.norm(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(like), -self.inf)[None]
 
 
+class LinearGateResidual(KernelModule):
+    """The end of every attention: forward(x, o, gate) = x + linear(o) * gate, for the stream x, the merged attention output o and the
+    output gate (g of the gated attentions, the AdaLN gate of the DiT). Torch only so far."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.linear = Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """x, o [..., dim], gate broadcastable to them -> [..., dim]"""
+        return x + self.linear(o) * gate
+
+
+class LayerNormPairBias(KernelModule):
+    """The attention logit biases of every block of a DiT stack from its conditioning pair representation, in one matmul:
+    forward(z, z_mask)[b] = linear_b(LayerNorm(z)) + mask, returned as [num_blocks, H, N, N] (the stack passes bias[b] to block b).
+    The biases depend on the conditioning alone, so the decoder computes them once per structure and every noisy sample and
+    denoising step reuses them. The LayerNorm has no affine of its own (the scale and shift of every block would be folded into its
+    projection anyway): `linear` has num_blocks * H rows, the rows of block b are [b * H, (b + 1) * H). With the Triton backend the
+    result is laid out with a row stride that is a multiple of 16 (the layout the attention kernels load fastest)."""
+
+    def __init__(self, c_z: int, heads: int, num_blocks: int, inf: float, eps: float) -> None:
+        super().__init__()
+        self.heads, self.inf, self.eps = heads, inf, eps
+        self.linear = Linear(c_z, num_blocks * heads)
+
+    def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
+        """z [N, N, c_z], z_mask [N, N] -> [num_blocks, H, N, N]"""
+        if z.shape[-1] < 64:            # torch's LayerNorm kernel takes 18 ms for the 2407^2 x 16 atom pairs (90x its memory time)
+            zc = z - z.mean(-1, keepdim=True)
+            z = zc * torch.rsqrt(zc.pow(2).mean(-1, keepdim=True) + self.eps)
+        else:
+            z = F.layer_norm(z, z.shape[-1:], eps=self.eps)
+        logits = self.linear(z).permute(2, 0, 1) + gen_attn_mask(z_mask, -self.inf)
+        logits = logits.reshape(-1, self.heads, *z_mask.shape)
+        # the padded layout only pays off in the Triton kernels; sdpa keeps the contiguous bias (torch.compile handles its alignment
+        # itself and fails on the padded view)
+        return kernels.shared_bias_attention.aligned_bias(logits) if self.backend == "triton" else logits.contiguous()
+
+
 class SharedBiasAttention(KernelModule):
     """softmax(q k^T / sqrt(D) + bias) v for q, k, v [..., H, N, D] and a logit bias [H, N, N] shared by all leading (batch) entries: the
     noisy samples of the DiT, the rows of the triangle and MSA row attention. No parameters. Torch: sdpa; Triton: the fused forward and
@@ -280,7 +336,7 @@ class SharedBiasAttention(KernelModule):
 
 class TriangleMultiplication(KernelModule):
     """Gated triangular multiplicative update out[i, k] = sum_j a[i, j] * b[k, j] of the pair representation (outgoing=False: the
-    incoming edges, the same on the transposed pair), returned as the update the block adds.
+    incoming edges, the same on the transposed pair), returned as z + update.
 
     All projections of the normalised input are one Linear (linear_in, C -> 4 * 32 + C): a = qx * sigmoid(q) and b = kx * sigmoid(k)
     (32 channels each, masked) feed the product, the last C rows are the output gate. Triton: norm, projection, products and
@@ -306,12 +362,13 @@ class TriangleMultiplication(KernelModule):
             z_mask: [N, N]
 
         Returns:
-            [N, N, c_z] update
+            [N, N, c_z] z + update
         """
         if self.backend == "triton":
-            return kernels.triangle_update.triangle_update(
+            return z + kernels.triangle_update.triangle_update(
                 z, z_mask, self.norm_in.weight, self.linear_in.weight, self.linear_in.bias, self.norm_out.weight,
                 self.linear_z.weight, self.linear_z.bias, self.norm_in.eps, self.outgoing)
+        z_in = z
         if not self.outgoing:
             z = z.transpose(-2, -3)
         z = self.norm_in(z)
@@ -321,7 +378,7 @@ class TriangleMultiplication(KernelModule):
         o = self.linear_z(self.norm_out(torch.einsum("...ijc,...Ijc->...iIc", q, k))) * torch.sigmoid(g)
         if not self.outgoing:
             o = o.transpose(-2, -3)
-        return o
+        return z_in + o
 
 
 # the blocks use the layers above, so they are imported last
