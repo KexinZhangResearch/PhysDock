@@ -21,6 +21,15 @@ class FeedForward(nn.Module):
         a, b = self.w13(x).chunk(2, dim=-1)
         return self.w2(F.silu(a) * b)
 
+    def residual(self, x: torch.Tensor, fused: bool = False) -> torch.Tensor:
+        """x + self(x). fused: the Triton kernel of PhysDock.models.kernels.pair_ffn when it applies (16 / 32 channels, hidden 128:
+        the atom-pair features), which does not keep the [..., hidden] activations of the three matmuls for the backward (7 GiB
+        for 3072 atoms), same matmul precision as the torch expression"""
+        from PhysDock.models.kernels import pair_ffn
+        if fused and pair_ffn.can_fuse(x, self.w2.in_features):
+            return pair_ffn.pair_ffn(x, self.w13.weight, self.w2.weight)
+        return x + self(x)
+
 
 class Transition(nn.Module):
     """Residual update FeedForward(RMSNorm(x))."""

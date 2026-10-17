@@ -7,6 +7,7 @@ from torch.utils.checkpoint import checkpoint
 from PhysDock.models.primitives import (AttentionWithPairBias, DiTAttention, DiTTransition, MSAColumnAttention,
                                         MSARowAttentionWithPairBias, OuterProductMean, Transition, TriangleAttention,
                                         TriangleUpdate)
+from PhysDock.models.kernels.shared_bias_attention import aligned_bias
 from PhysDock.utils.tensor_utils import gen_attn_mask
 
 
@@ -40,8 +41,8 @@ class Stack(nn.Module):
 
     def forward(self, *args):
         state, rest = args[:self.n_state], args[self.n_state:]
-        for block in self.blocks:
-            out = self.run_block(block, *state, *rest)
+        for i, block in enumerate(self.blocks):
+            out = self.run_block(block, *state, *rest, index=i)
             state = out if self.n_state > 1 else (out,)
         return state if self.n_state > 1 else state[0]
 
@@ -49,27 +50,42 @@ class Stack(nn.Module):
     checkpointed = staticmethod(checkpointed)       # both compiled by PhysDock.training.compile_training
     call = staticmethod(call)
 
-    def run_block(self, block, *args):
-        """block(*args), activation-checkpointed while grads are on (if self.checkpoint)"""
+    def checkpoints(self, index: int) -> bool:
+        """whether block `index` is activation-checkpointed: self.checkpoint is True / False, or a fraction in (0, 1) of the
+        blocks, spread evenly (round(fraction * no_blocks) blocks)"""
+        c = self.checkpoint
+        if isinstance(c, float):
+            n = len(self.blocks)
+            k = round(c * n)
+            return (index + 1) * k // n > index * k // n
+        return bool(c)
+
+    def run_block(self, block, *args, index: int = None):
+        """block(*args), activation-checkpointed while grads are on (if the block is checkpointed, see checkpoints)"""
         if torch.is_grad_enabled():
-            return (self.checkpointed if self.checkpoint else self.call)(block, *args)
+            ck = self.checkpoint if index is None else self.checkpoints(index)
+            return (self.checkpointed if ck else self.call)(block, *args)
         return block(*args)
 
 
 def set_checkpointing(model: nn.Module, modes: dict) -> None:
-    """Activation checkpointing per Stack class, e.g. {"Pairformer": "full", "DiT": "attention"}:
-    "full" (recompute every block in the backward), "none" (keep all activations: faster, more memory) or, for DiT,
-    "attention" (keep the attention inputs / outputs, recompute the rest)."""
+    """Activation checkpointing per Stack class, e.g. {"Pairformer": "full", "DiT": "attention", "Evoformer": 0.5}:
+    "full" (recompute every block in the backward), "none" (keep all activations: faster, more memory), a fraction between 0 and
+    1 (only that fraction of the blocks is recomputed, spread evenly: the time and the memory interpolate between none and
+    full) or, for DiT, "attention" (keep the attention inputs / outputs, recompute the rest)."""
     stacks = {cls.__name__: cls for cls in (AtomTransformer, Triangleformer, Evoformer, Pairformer, DiT)}
     for name, mode in modes.items():
         if name not in stacks:
             raise ValueError(f"unknown stack {name!r}, expected one of {sorted(stacks)}")
-        if mode not in ("full", "none") + (("attention",) if name == "DiT" else ()):
-            raise ValueError(f"checkpointing of {name} must be full, none{' or attention' * (name == 'DiT')}, got {mode!r}")
+        is_fraction = isinstance(mode, (int, float)) and not isinstance(mode, bool) and 0 <= mode <= 1
+        if not is_fraction and mode not in ("full", "none") + (("attention",) if name == "DiT" else ()):
+            raise ValueError(f"checkpointing of {name} must be full, none, a fraction in [0, 1]{' or attention' * (name == 'DiT')}, got {mode!r}")
     for module in model.modules():
         mode = modes.get(type(module).__name__) if isinstance(module, Stack) else None
         if mode is not None:
-            module.checkpoint = {"full": True, "none": False}.get(mode, mode)
+            module.checkpoint = {"full": True, "none": False}.get(mode, float(mode) if not isinstance(mode, str) else mode)
+            if module.checkpoint in (0.0, 1.0) and not isinstance(module.checkpoint, bool):
+                module.checkpoint = bool(module.checkpoint)
 
 
 
@@ -221,13 +237,13 @@ class DiT(Stack):
         super().__init__(DiTBlock, no_blocks, c_s, c_z, inf, eps)
 
     def forward(self, x, bias, t):
-        for block, b in zip(self.blocks, bias):
+        for i, (block, b) in enumerate(zip(self.blocks, bias)):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
                 q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, t)
                 o = block.attention.attend(q, k, v, b)
                 x = self.checkpointed(_dit_block_output, block, x, o, gate, t)
             else:
-                x = self.run_block(block, x, b, t)
+                x = self.run_block(block, x, b, t, index=i)
         return x
 
     def pair_bias(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
@@ -243,14 +259,22 @@ class DiT(Stack):
             z_mask: [N, N]
 
         Returns:
-            [no_blocks, H, N, N] contiguous (the layout the fused attention kernels need)
+            [no_blocks, H, N, N] contiguous; with the Triton attention backend a view of a padded buffer whose row stride
+            is a multiple of 16 (the layout the Triton kernels load fastest)
         """
         attn = [block.attention for block in self.blocks]
         eps = attn[0].norm_z.eps
         if any(a.norm_z.eps != eps for a in attn):
             raise ValueError("pair_bias needs the same LayerNorm eps in all blocks")
-        z_hat = F.layer_norm(z, z.shape[-1:], eps=eps)
+        if z.shape[-1] < 64:            # torch's LayerNorm kernel takes 18 ms for the 2407^2 x 16 atom pairs (90x its memory time)
+            zc = z - z.mean(-1, keepdim=True)
+            z_hat = zc * torch.rsqrt(zc.pow(2).mean(-1, keepdim=True) + eps)
+        else:
+            z_hat = F.layer_norm(z, z.shape[-1:], eps=eps)
         weight = torch.cat([a.linear_z.weight * a.norm_z.weight for a in attn])             # [no_blocks * H, c_z]
         bias = torch.cat([a.linear_z.weight @ a.norm_z.bias for a in attn])
         logits = F.linear(z_hat, weight, bias).permute(2, 0, 1) + gen_attn_mask(z_mask, -attn[0].inf)
-        return logits.reshape(len(attn), -1, *z_mask.shape).contiguous()
+        logits = logits.reshape(len(attn), -1, *z_mask.shape)
+        # the padded layout only pays off in the Triton kernels; sdpa keeps the contiguous bias (torch.compile handles its
+        # alignment itself and fails on the padded view)
+        return aligned_bias(logits) if attn[0].backend == "triton" else logits.contiguous()

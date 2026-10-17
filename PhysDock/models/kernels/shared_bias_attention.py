@@ -37,31 +37,91 @@ def _round_tf32(x):
     return ((x.to(tl.int32, bitcast=True) + 0x1000) & -8192).to(tl.float32, bitcast=True)
 
 
-def _configs(blocks, warps=(4, 8), stages=(1, 2, 3)):
-    """(BLOCK_M, BLOCK_N, num_warps, num_stages) combinations that compile on triton 3.2 / sm_90 (some crash the
-    compiler: 64x64 with 8 warps, 128x128 with 3 stages). The head dim is only 32, so the score tile dominates the
-    registers and the best tiles are small ones with few warps (32 x 16 with 2 warps beats 64 x 64 with 4 by 1.5x)."""
-    out = []
-    for m, n in blocks:
-        for w in warps:
-            for st in stages:
-                if (m == n == 128 and st == 3) or (m == n == 64 and w == 8) or (m <= 32 and w > 2 * m // 16) or (m == 16 and w > 1):
-                    continue
-                out.append(triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=w, num_stages=st))
-    return out
+def _programs(B: int, H: int, N: int) -> int:
+    """number of 64-row query tiles of the forward: the tile size that is best depends on how full the GPU is"""
+    return B * triton.cdiv(N, 64) * H
 
 
-_FWD_BLOCKS = ((16, 64), (32, 16), (32, 32), (64, 16), (64, 32), (64, 64), (128, 32), (128, 64))
-_BWD_BLOCKS = ((64, 64), (64, 32), (32, 64), (128, 32), (32, 128), (128, 64), (64, 128), (32, 32), (64, 16), (16, 64), (32, 16))
+def _fwd_config(B: int, H: int, N: int, bf16: bool):
+    """(BLOCK_M, BLOCK_N, num_warps, num_stages) of the forward, fixed (no autotuning pass: it costs minutes of compilation
+    per shape). Found by sweeping all configurations on an H20 (sm_90) at the shapes of the model (DiT atoms / tokens,
+    triangle attention): with a head dim of 32 the score tile dominates the registers, so small tiles with few warps win
+    when there are few programs (32 x 16 with 2 warps is 1.5x faster than 64 x 64 with 4), bigger ones when the GPU is
+    full anyway."""
+    full = _programs(B, H, N) >= 3000
+    if bf16:
+        if full:
+            return (64, 64, 4, 3) if N > 1024 else (64, 32, 4, 3)
+        return (64, 32, 4, 3) if N > 1024 else (32, 32, 1, 2)
+    if full:
+        return (64, 32, 4, 3)
+    if N > 1024:        # the atoms of the decoder (inputs rounded outside the kernel, see prepare_tf32)
+        return (64, 32, 4, 3)
+    return (32, 16, 2, 3)
+
+
+def _bwd_config(N: int, bf16: bool):
+    """(BLOCK_M, BLOCK_N, num_warps, num_stages) of the fused backward, fixed (see _fwd_config)"""
+    if N <= 512:
+        return (64, 64, 4, 2) if bf16 else (32, 32, 2, 1)
+    return (64, 64, 4, 3)
+
+
+# ----------------------------------------------------------------------------------------------- TF32 preparation
+PRE_MIN_N = 1024            # from this sequence length rounding the matmul inputs outside the kernels pays off: the pass costs
+                            # ~B * H * N, the in-kernel rounding it saves ~B * H * N * (N / BLOCK_M) (K, V tiles are re-read per query block)
+
+
+@triton.jit
+def _prep_one(X, Y, scale, N, H, bh, pid_n, sxb, sxh, sxn, D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, SCALE: tl.constexpr,
+              BLOCK_N: tl.constexpr):
+    b, h = bh // H, bh % H
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask = (offs_n < N)[:, None] & (offs_d < D_HEAD)[None, :]
+    x = tl.load(X + b * sxb + h * sxh + offs_n[:, None] * sxn + offs_d[None, :], mask=mask, other=0.0)
+    if SCALE:
+        x = x * scale
+    tl.store(Y + (bh * N + offs_n[:, None]) * D_HEAD + offs_d[None, :], _round_tf32(x), mask=mask)
+
+
+@triton.jit
+def _prep_kernel(X0, X1, X2, Y, scale, N, H, BH, s0b, s0h, s0n, s1b, s1h, s1n, s2b, s2h, s2n,
+                 NT: tl.constexpr, D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, SCALE0: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Y[t] = round_tf32(X_t * scale if t == 0 and SCALE0 else X_t), contiguous [NT, B, H, N, D]; one launch for all NT tensors"""
+    pid_n, bh, t = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+    if t == 0:
+        _prep_one(X0, Y, scale, N, H, bh, pid_n, s0b, s0h, s0n, D_HEAD, BLOCK_D, SCALE0, BLOCK_N)
+    elif t == 1:
+        _prep_one(X1, Y + BH * N * D_HEAD, scale, N, H, bh, pid_n, s1b, s1h, s1n, D_HEAD, BLOCK_D, False, BLOCK_N)
+    else:
+        _prep_one(X2, Y + 2 * BH * N * D_HEAD, scale, N, H, bh, pid_n, s2b, s2h, s2n, D_HEAD, BLOCK_D, False, BLOCK_N)
+
+
+def prepare_tf32(tensors, scale: float = None):
+    """tensors: 1-3 float32 [B, H, N, D] (any strides) -> list of contiguous tensors, rounded to the nearest TF32 value (the
+    rounding the kernels apply to their matmul inputs, here done once instead of once per tile); the first is multiplied by
+    `scale` before the rounding. One kernel launch."""
+    x0 = tensors[0]
+    B, H, N, D = x0.shape
+    xs = list(tensors) + [x0] * (3 - len(tensors))
+    y = torch.empty(len(tensors), B, H, N, D, device=x0.device, dtype=torch.float32)
+    strides = [v for x in xs for v in x.stride()[:3]]
+    _prep_kernel[(triton.cdiv(N, 128), B * H, len(tensors))](*xs, y, 1.0 if scale is None else scale, N, H, B * H, *strides, NT=len(tensors),
+                                                           D_HEAD=D, BLOCK_D=max(16, triton.next_power_of_2(D)), SCALE0=scale is not None,
+                                                           BLOCK_N=128)
+    return list(y.unbind(0))
 
 
 # ----------------------------------------------------------------------------------------------- forward
-@triton.autotune(_configs(_FWD_BLOCKS, (1, 2, 4, 8), (1, 2, 3, 4)), key=["N", "D_HEAD", "PREC", "RN"])
 @triton.jit
 def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sob, soh, son, sbh, sbm,
-         D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr,
+         D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, PRE: tl.constexpr,
          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """PRE: q (already multiplied by scale * log2(e)), k and v are TF32-rounded by the caller (prepare_tf32), so the kernel
+    loads them straight into the matmuls (the in-kernel rounding forced plain register loads instead of asynchronous,
+    pipelined copies)."""
     b = tl.program_id(0)                       # fastest axis: the programs sharing a bias tile run together (L2)
     pid_m = tl.program_id(1)
     h = tl.program_id(2)
@@ -71,9 +131,10 @@ def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
     b64, h64 = b.to(tl.int64), h.to(tl.int64)
     q = tl.load(Q + b64 * sqb + h64 * sqh + offs_m[:, None] * sqn + offs_d[None, :],
                 mask=m_in[:, None] & d_in[None, :], other=0.0)
-    q = (q * scale_log2e).to(q.dtype)                       # keep the input dtype for the dot
-    if RN:
-        q = _round_tf32(q)
+    if not PRE:
+        q = (q * scale_log2e).to(q.dtype)                   # keep the input dtype for the dot
+        if RN:
+            q = _round_tf32(q)
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
@@ -83,8 +144,11 @@ def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
         offs_n = start_n + tl.arange(0, BLOCK_N)
         n_in = offs_n < N
         kt = tl.load(k_base + offs_n[None, :] * skn + offs_d[:, None], mask=n_in[None, :] & d_in[:, None], other=0.0)
-        bias = tl.load(bias_base + offs_n[None, :], mask=m_in[:, None] & n_in[None, :], other=0.0).to(tl.float32)
-        if RN:
+        # the mask of the bias load uses the row stride (a multiple of 16: the padded layout of aligned_bias), not N: a mask
+        # that is constant over 4 neighbouring columns lets Triton issue 16-byte loads (the columns N .. stride are padding,
+        # their scores are discarded below)
+        bias = tl.load(bias_base + offs_n[None, :], mask=m_in[:, None] & (offs_n < sbm)[None, :], other=0.0).to(tl.float32)
+        if RN and not PRE:
             kt = _round_tf32(kt)
         s = tl.dot(q, kt, input_precision=PREC) + bias * 1.4426950408889634
         s = tl.where(n_in[None, :], s, -float("inf"))
@@ -97,7 +161,8 @@ def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
         pp = p.to(v.dtype)
         if RN:
             pp = _round_tf32(pp)
-            v = _round_tf32(v)
+            if not PRE:
+                v = _round_tf32(v)
         acc += tl.dot(pp, v, input_precision=PREC)
         m_i = m_new
     acc = acc / l_i[:, None]
@@ -124,14 +189,12 @@ def _delta(O, DO, Delta, N, sob, soh, son, sdb, sdh, sdn, H,
 
 
 # ----------------------------------------------------------------------------------------------- backward
-@triton.autotune(_configs(_BWD_BLOCKS, (2, 4, 8)), key=["N", "D_HEAD", "PREC", "RN", "SPLIT"],
-                 reset_to_zero=["DQ", "DK", "DV"])          # the tuning runs repeat the kernel: clear the atomic sums
 @triton.jit
 def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sdob, sdoh, sdon, sdqb, sdqh, sdqn, sdkb, sdkh, sdkn, sdvb, sdvh, sdvn,
-         sbh, sbm, sbs,
+         sbh, sbm, sdbs, sdbh, sdbm,
          D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, SPLIT: tl.constexpr,
-         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+         PRE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     """One pass over the score tiles: recomputes p once and produces dq, dk, dv and dbias (see the module docstring).
     program_id(2) enumerates (head, batch chunk); chunk c sums the batch entries [c * ceil(B / SPLIT), ...)."""
     pid_m, pid_n, pid_hs = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -145,18 +208,19 @@ def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B
     md, nd = m_in[:, None] & d_in[None, :], n_in[:, None] & d_in[None, :]
     h64 = h.to(tl.int64)
     tile = offs_m[:, None] * sbm + offs_n[None, :]
-    bias = tl.load(Bias + h64 * sbh + tile, mask=m_in[:, None] & n_in[None, :], other=0.0).to(tl.float32) * 1.4426950408889634
+    bias = tl.load(Bias + h64 * sbh + tile, mask=m_in[:, None] & (offs_n < sbm)[None, :], other=0.0).to(tl.float32) * 1.4426950408889634
     dbias = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
     for b in tl.range(b_lo, b_hi):
         b64 = b.to(tl.int64)
         qo, ko, vo, doo = b64 * sqb + h64 * sqh, b64 * skb + h64 * skh, b64 * svb + h64 * svh, b64 * sdob + h64 * sdoh
         dqo, dko, dvo = b64 * sdqb + h64 * sdqh, b64 * sdkb + h64 * sdkh, b64 * sdvb + h64 * sdvh
         q = tl.load(Q + qo + offs_m[:, None] * sqn + offs_d[None, :], mask=md, other=0.0)
-        q = (q * scale_log2e).to(q.dtype)
+        if not PRE:
+            q = (q * scale_log2e).to(q.dtype)
         kt = tl.load(K + ko + offs_n[None, :] * skn + offs_d[:, None], mask=n_in[None, :] & d_in[:, None], other=0.0)
         vt = tl.load(V + vo + offs_n[None, :] * svn + offs_d[:, None], mask=n_in[None, :] & d_in[:, None], other=0.0)
         do = tl.load(DO + doo + offs_m[:, None] * sdon + offs_d[None, :], mask=md, other=0.0)
-        if RN:
+        if RN and not PRE:
             q, kt, vt, do = _round_tf32(q), _round_tf32(kt), _round_tf32(vt), _round_tf32(do)
         lse = tl.load(LSE + (b64 * H + h64) * N + offs_m, mask=m_in, other=0.0)
         delta = tl.load(Delta + (b64 * H + h64) * N + offs_m, mask=m_in, other=0.0)
@@ -176,7 +240,8 @@ def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B
         tl.atomic_add(DQ + dqo + offs_m[:, None] * sdqn + offs_d[None, :], dq, mask=md, sem="relaxed")
         tl.atomic_add(DK + dko + offs_n[:, None] * sdkn + offs_d[None, :], dk, mask=nd, sem="relaxed")
         tl.atomic_add(DV + dvo + offs_n[:, None] * sdvn + offs_d[None, :], dv, mask=nd, sem="relaxed")
-    tl.store(DBias + sid.to(tl.int64) * sbs + h64 * sbh + tile, dbias, mask=m_in[:, None] & n_in[None, :])
+    tl.store(DBias + sid.to(tl.int64) * sdbs + h64 * sdbh + offs_m[:, None] * sdbm + offs_n[None, :], dbias,
+             mask=m_in[:, None] & (offs_n < sdbm)[None, :])      # vectorised stores: the padding columns are written too
 
 
 # ----------------------------------------------------------------------------------------------- torch ops
@@ -189,6 +254,23 @@ def _split(B, H, N):
     sms = _NUM_SMS.setdefault(dev, torch.cuda.get_device_properties(dev).multi_processor_count)
     programs = triton.cdiv(N, 64) ** 2 * H
     return max(1, min(B, _MAX_SPLIT, triton.cdiv(4 * sms, programs)))
+
+
+def _pad16(n: int) -> int:
+    return (n + 15) // 16 * 16
+
+
+def aligned_bias(bias: torch.Tensor) -> torch.Tensor:
+    """bias [..., N, N] with a row stride that is a multiple of 16 elements: Triton only vectorises (16-byte) loads of a
+    tile whose row stride it knows to be divisible by 16, and the kernels are ~10% faster with them for N that is not a
+    multiple of 16 (N = 2407 atoms). Returns bias itself if it is aligned already; DiT.pair_bias emits the aligned
+    layout once per structure, so the attention calls of the denoising steps do not copy."""
+    N = bias.shape[-1]
+    if bias.stride(-1) == 1 and all(s % 16 == 0 for s in bias.stride()[:-1]):
+        return bias
+    out = torch.empty(*bias.shape[:-1], _pad16(N), device=bias.device, dtype=bias.dtype)
+    out[..., :N] = bias
+    return out[..., :N]
 
 
 def _prep(dtype, precision):
@@ -204,16 +286,20 @@ def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torc
     """-> o [B, N, H, D] contiguous (the caller transposes to [B, H, N, D]), lse [B, H, N] (log2 units)"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
-    if bias.stride(-1) != 1:
-        bias = bias.contiguous()
+    bias = aligned_bias(bias)
     prec, rn = _prep(q.dtype, precision)
     o = torch.empty(B, N, H, D, device=q.device, dtype=q.dtype)
     ov = o.transpose(1, 2)
     lse = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
-    _fwd[lambda c: (B, triton.cdiv(N, c["BLOCK_M"]), H)](
+    bm, bn, warps, stages = _fwd_config(B, H, N, q.dtype == torch.bfloat16)
+    pre = rn and N >= PRE_MIN_N
+    if pre:
+        q, k, v = prepare_tf32([q, k, v], D ** -0.5 * 1.4426950408889634)
+    _fwd[(B, triton.cdiv(N, bm), H)](
         q, k, v, bias, ov, lse, D ** -0.5 * 1.4426950408889634, H, N,
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *ov.stride()[:3], bias.stride(0), bias.stride(1),
-        D_HEAD=D, BLOCK_D=max(16, triton.next_power_of_2(D)), PREC=prec, RN=rn)
+        D_HEAD=D, BLOCK_D=max(16, triton.next_power_of_2(D)), PREC=prec, RN=rn, PRE=pre,
+        BLOCK_M=bm, BLOCK_N=bn, num_warps=warps, num_stages=stages)
     return o, lse
 
 
@@ -230,8 +316,7 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
     """do, o: [B, N, H, D] -> dq, dk, dv [B, N, H, D], dbias [H, N, N]"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
-    if bias.stride(-1) != 1:
-        bias = bias.contiguous()
+    bias = aligned_bias(bias)
     if do.stride(-1) != 1:
         do = do.contiguous()
     prec, rn = _prep(q.dtype, precision)
@@ -242,15 +327,21 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
                                                    D_HEAD=D, BLOCK_D=block_d, RN=rn, BLOCK_M=128)
     dq, dk, dv = (torch.zeros(B, N, H, D, device=q.device, dtype=torch.float32) for _ in range(3))
     split = _split(B, H, N)
-    dbias = torch.empty(split, H, N, N, device=q.device, dtype=torch.float32)
+    dbias = torch.empty(split, H, N, _pad16(N), device=q.device, dtype=torch.float32)[..., :N]
     dqv, dkv, dvv = dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2)
     scale = D ** -0.5
-    _bwd[lambda c: (triton.cdiv(N, c["BLOCK_M"]), triton.cdiv(N, c["BLOCK_N"]), H * split)](
+    bm, bn, warps, stages = _bwd_config(N, q.dtype == torch.bfloat16)
+    dtype = q.dtype
+    pre = rn and N >= PRE_MIN_N
+    if pre:                                         # TF32 rounding of the matmul inputs once, not once per tile
+        q, k, v = prepare_tf32([q, k, v], scale * 1.4426950408889634)
+        dov = prepare_tf32([dov])[0]
+    _bwd[(triton.cdiv(N, bm), triton.cdiv(N, bn), H * split)](
         q, k, v, bias, dov, lse, delta, dqv, dkv, dvv, dbias, scale, scale * 1.4426950408889634, B, H, N,
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *dov.stride()[:3], *dqv.stride()[:3], *dkv.stride()[:3],
-        *dvv.stride()[:3], bias.stride(0), bias.stride(1), dbias.stride(0), D_HEAD=D, BLOCK_D=block_d, PREC=prec, RN=rn,
-        SPLIT=split)
-    return dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype), dbias[0] if split == 1 else dbias.sum(0)
+        *dvv.stride()[:3], bias.stride(0), bias.stride(1), dbias.stride(0), dbias.stride(1), dbias.stride(2), D_HEAD=D, BLOCK_D=block_d, PREC=prec, RN=rn,
+        SPLIT=split, PRE=pre, BLOCK_M=bm, BLOCK_N=bn, num_warps=warps, num_stages=stages)
+    return dq.to(dtype), dk.to(dtype), dv.to(dtype), dbias[0] if split == 1 else dbias.sum(0)
 
 
 @_attention_bwd.register_fake

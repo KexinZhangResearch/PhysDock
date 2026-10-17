@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from PhysDock.models.primitives import AdaLayerNormZero, Linear, RMSNorm
+from PhysDock.models.kernels.pair_bias import can_fuse, matmul_mode, pair_bias
 from PhysDock.utils.tensor_utils import gen_attn_mask
 
 
@@ -32,6 +33,24 @@ def _shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bi
     return F.scaled_dot_product_attention(q, k, v, bias[None])
 
 
+def _use_triton_attention(backend: str, q: torch.Tensor, bias: torch.Tensor) -> bool:
+    """Whether the pair-bias attentions with a few long sequences (single attention: B = 1, MSA rows, atoms: [B, H, N, 32]) run
+    the Triton kernel instead of sdpa. With the fixed configurations of PhysDock.models.kernels.shared_bias_attention it is
+    1.7-2x faster than sdpa in forward + backward in bfloat16 (B = 1, N = 384: 0.067 vs 0.114 ms; 64 MSA rows: 0.80 vs 1.64
+    ms) and 2-5x in the TF32 forward."""
+    return backend == "triton"
+
+
+def _pair_attention_bias(module, z: torch.Tensor, z_mask: torch.Tensor, like: torch.Tensor, pad: bool) -> torch.Tensor:
+    """linear_z(norm_z(z)) + attention mask, [H, N, N], in the dtype of `like` (the queries). With the Triton backend one
+    fused kernel pair (forward and backward) with the matmul precision of the torch expression it replaces (bf16 under
+    autocast, TF32 / float32 otherwise; see PhysDock.models.kernels.pair_bias); the torch expression otherwise."""
+    if module.backend == "triton" and can_fuse(z, module.linear_z.out_features):
+        return pair_bias(z, z_mask, module.norm_z.weight, module.linear_z.weight, module.norm_z.eps, module.inf,
+                         out_dtype=like.dtype, pad=pad, precision=matmul_mode(like))
+    return module.linear_z(module.norm_z(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(like), -module.inf)[None]
+
+
 def set_triangle_update_backend(model: nn.Module, backend: str) -> None:
     """Implementation of the triangle multiplicative updates of model: "torch" or "triton"
     (PhysDock.models.kernels.triangle_update; TF32 for float32, bf16 matmuls under autocast)."""
@@ -43,11 +62,15 @@ def set_triangle_update_backend(model: nn.Module, backend: str) -> None:
 
 
 def set_attention_backend(model: nn.Module, backend: str) -> None:
-    """Attention implementation of the triangle attention and DiT attention layers of model ("sdpa" or "triton")."""
+    """Attention implementation of the layers of model with a pair bias: triangle attention, DiT attention, MSA row
+    attention and the single attention (atoms, tokens) ("sdpa" or "triton"; the last two only for large problems and
+    where it is faster, see _use_triton_attention). "triton" also fuses the feed-forward of the atom-pair features
+    (AtomEmbedder, PhysDock.models.kernels.pair_ffn)."""
     if backend not in ATTENTION_BACKENDS:
         raise ValueError(f"attention backend must be one of {ATTENTION_BACKENDS}, got {backend!r}")
     for module in model.modules():
-        if isinstance(module, (TriangleAttention, DiTAttention)):
+        if isinstance(module, (TriangleAttention, DiTAttention, AttentionWithPairBias, MSARowAttentionWithPairBias)) \
+                or hasattr(module, "backend") and type(module).__name__ == "AtomEmbedder":
             module.backend = backend
 
 
@@ -62,6 +85,7 @@ class AttentionWithPairBias(nn.Module):
         self.linear_z = Linear(c_z, c_s // 32, bias=False)
         self.linear_qkvg = QKVG(c_s)
         self.linear_o = Linear(c_s, c_s)
+        self.backend = "sdpa"                           # see set_attention_backend
 
     def forward(self, s: torch.Tensor, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -76,8 +100,11 @@ class AttentionWithPairBias(nn.Module):
         s = self.norm_s(s)
         q, k, v, g = self.linear_qkvg(s)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(q), -self.inf)[None]
-        o = F.scaled_dot_product_attention(q, k, v, bias)
+        bias = _pair_attention_bias(self, z, z_mask, q, pad=z.shape[0] >= 1024)
+        if _use_triton_attention(self.backend, q[None], bias):
+            o = _shared_bias_attention(q[None], k[None], v[None], bias, "triton")[0]
+        else:
+            o = F.scaled_dot_product_attention(q, k, v, bias)
         return self.linear_o(_merge(o)) * g
 
 
@@ -92,6 +119,7 @@ class MSARowAttentionWithPairBias(nn.Module):
         self.linear_z = Linear(c_z, c_m // 32, bias=False)
         self.linear_qkvg = QKVG(c_m)
         self.linear_o = Linear(c_m, c_m)
+        self.backend = "sdpa"                           # see set_attention_backend
 
     def forward(self, m: torch.Tensor, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -106,8 +134,11 @@ class MSARowAttentionWithPairBias(nn.Module):
         m = self.norm_m(m)
         q, k, v, g = self.linear_qkvg(m)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        bias = self.linear_z(self.norm_z(z)).permute(2, 0, 1)[None] + gen_attn_mask(z_mask.type_as(q), -self.inf)[None, None]
-        o = F.scaled_dot_product_attention(q, k, v, bias)
+        bias = _pair_attention_bias(self, z, z_mask, q, pad=z.shape[0] >= 1024)
+        if _use_triton_attention(self.backend, q, bias):
+            o = _shared_bias_attention(q, k, v, bias, "triton")
+        else:
+            o = F.scaled_dot_product_attention(q, k, v, bias[None])
         return self.linear_o(_merge(o)) * g
 
 

@@ -22,9 +22,13 @@ init_from: null                   # start from these weights (params.pt, Lightni
 ckpt_path: null                   # resume this Lightning checkpoint (weights, optimiser, EMA, step)
 compile: false                    # torch.compile the training step region by region (faster, less memory)
 checkpointing:                    # activation checkpointing per stack: full (recompute in the backward), none (keep
-                                  # all activations: faster, more memory); DiT also attention (keep only the attention)
+                                  # all activations: faster, more memory), or a fraction between 0 and 1 (only that fraction
+                                  # of the blocks is recomputed, spread evenly: time and memory in between); DiT also
+                                  # attention (keep only the attention)
                                   # medium, bf16-mixed, compile, crop 256: all full 0.94 s / 12 GiB per step, default
                                   # 0.83 s / 15 GiB, DiT + Evoformer + AtomTransformer none 0.80 s / 30 GiB
+                                  # crop 384 / 3072 atoms, Pairformer 48 + token DiT 24 blocks, triton, compile: default
+                                  # 1.43 s / 32 GiB, Pairformer none 1.25 s / 97 GiB, all none 1.20 s / 125 GiB
   AtomTransformer: full
   Triangleformer: full
   Evoformer: full
