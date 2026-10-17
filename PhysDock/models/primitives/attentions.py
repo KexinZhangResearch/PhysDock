@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from PhysDock.models.primitives import (AdaLayerNormZero, Linear, LinearGateResidual, RMSNorm, RMSNormLinear, RMSNormPairBias, SharedBiasAttention)
+from PhysDock.models.primitives import (
+    AdaLayerNormZero, Linear, LinearGateResidual, RMSNorm, RMSNormLinear, RMSNormPairBias, SharedBiasAttention)
 
 HEAD_DIM = 32
 
@@ -12,12 +13,6 @@ HEAD_DIM = 32
 def _heads(x: torch.Tensor) -> torch.Tensor:
     """[..., N, H * 32] -> [..., H, N, 32]"""
     return x.reshape(*x.shape[:-1], -1, HEAD_DIM).transpose(-2, -3)
-
-
-def _merge(x: torch.Tensor) -> torch.Tensor:
-    """[..., H, N, 32] -> [..., N, H * 32]"""
-    x = x.transpose(-2, -3)
-    return x.reshape(*x.shape[:-2], -1)
 
 
 class AttentionWithBias(nn.Module):
@@ -43,7 +38,8 @@ class AttentionWithBias(nn.Module):
         """
         q, k, v, g = self.qkvg(s).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        return self.out(s, _merge(self.attend(q, k, v, self.pair_bias(z, z_mask, q))), g)
+        o = self.attend(q, k, v, self.pair_bias(z, z_mask, q))
+        return self.out(s, o, g)
 
 
 class MSARowAttentionWithBias(nn.Module):
@@ -68,7 +64,7 @@ class MSARowAttentionWithBias(nn.Module):
         """
         q, k, v, g = self.qkvg(m).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        return self.out(m, _merge(self.attend(q, k, v, self.pair_bias(z, z_mask, q))), g)
+        return self.out(m, self.attend(q, k, v, self.pair_bias(z, z_mask, q)), g)
 
 
 class MSAColumnAttention(nn.Module):
@@ -84,7 +80,7 @@ class MSAColumnAttention(nn.Module):
         m = m.transpose(-2, -3)
         q, k, v, g = self.qkvg(m).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        return self.out(m, _merge(F.scaled_dot_product_attention(q, k, v)), g).transpose(-2, -3)
+        return self.out(m, F.scaled_dot_product_attention(q, k, v), g).transpose(-2, -3)
 
 
 class TriangleAttention(nn.Module):
@@ -113,7 +109,8 @@ class TriangleAttention(nn.Module):
             z = z.transpose(-2, -3)
         q, k, v, g = self.qkvg(z).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        z = self.out(z, _merge(self.attend(q, k, v, self.pair_bias(z, z_mask, q))), g)
+        z = self.out(z, self.attend(
+            q, k, v, self.pair_bias(z, z_mask, q)), g)
         return z if self.starting_node else z.transpose(-2, -3)
 
 
@@ -124,7 +121,8 @@ class DiTAttention(nn.Module):
     def __init__(self, c_s: int, eps: float) -> None:
         super().__init__()
         self.norm_s = AdaLayerNormZero(c_s, eps)
-        self.linear_qkv = Linear(c_s, 3 * c_s, bias=False)              # rows q, k, v
+        self.linear_qkv = Linear(
+            c_s, 3 * c_s, bias=False)              # rows q, k, v
         self.norm_q = RMSNorm(HEAD_DIM, eps)
         self.norm_k = RMSNorm(HEAD_DIM, eps)
         self.attend = SharedBiasAttention()
@@ -151,4 +149,4 @@ class DiTAttention(nn.Module):
 
     def output(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Attention output o [B, H, N, 32] -> x + gated update [B, N, c_s]"""
-        return self.out(x, _merge(o), gate)
+        return self.out(x, o, gate)

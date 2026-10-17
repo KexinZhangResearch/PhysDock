@@ -9,9 +9,9 @@ PhysDock.models.kernels); anywhere else the module runs its torch path.
   SwiGLUFFN            x + w2(silu(w1 x) * w3 x)                     (w1 and w3 merged: w13)
   RMSNormSwiGLUFFN     x + SwiGLUFFN-update(RMSNorm(x))              (the Transition of the pair, MSA, single and atom streams)
   AdaLNSwiGLUFFN       x + gate * SwiGLUFFN-update(AdaLN(x, mod))      (the transition of the DiT blocks; torch only, see its docstring)
-  RMSNormLinear        RMSNorm + one linear layer (the merged q, k, v, g projection of the attentions; torch only so far)
+  RMSNormLinear        RMSNorm + one linear layer (the merged q, k, v, g projection of the attentions, the q, k of the outer product mean)
   OuterProductMean     z + the pair update from the outer product of two MSA projections (torch only so far)
-  LinearGateResidual   x + linear(o) * gate: the output projection, gate and residual of every attention (torch only so far)
+  LinearGateResidual   x + linear(o) * gate: the output projection, gate and residual of every attention
   LayerNormPairBias    the logit biases of all blocks of a DiT from the pair representation, once per structure -> [blocks, H, N, N]
   RMSNormPairBias      linear(RMSNorm(z)) + attention mask -> [H, N, N]    (norm + linear + mask of a pair bias)
   SharedBiasAttention  softmax(q k^T / sqrt(32) + bias) v for a bias shared by the batch (no parameters)
@@ -183,6 +183,8 @@ class RMSNormSwiGLUFFN(KernelModule):
         """x: [..., dim] -> x + update"""
         if self.backend == "triton" and kernels.rmsnorm_swiglu_ffn.can_fuse(x, self.ffn.w2.in_features):
             return kernels.rmsnorm_swiglu_ffn.rmsnorm_swiglu_ffn(x, self.norm.weight, self.ffn.w13.weight, self.ffn.w2.weight, self.norm.eps)
+        if self.backend == "triton" and kernels.rmsnorm_swiglu_ffn.can_split(x, self.ffn.w2.in_features):
+            return kernels.rmsnorm_swiglu_ffn.rmsnorm_swiglu_ffn_split(x, self.norm.weight, self.ffn.w13.weight, self.ffn.w2.weight, self.norm.eps)
         return x + self.ffn.update(self.norm(x))
 
 
@@ -215,8 +217,9 @@ class AdaLNSwiGLUFFN(nn.Module):
 class RMSNormLinear(KernelModule):
     """RMSNorm of the input and one linear layer: forward(x) = linear(RMSNorm(x)) with a bias on the last `bias_dim` output columns only
     (bias_dim=0: none; the q, k, v, g projection of the attentions has the bias of g alone, the q, k projection of the outer product mean
-    a bias on all columns). The projections merged into one matmul are split by the caller. Torch only so far (backend is accepted for
-    the day a fused kernel exists)."""
+    a bias on all columns). The projections merged into one matmul are split by the caller. Triton (kernels.rmsnorm_linear): the norm is
+    done in registers on the way into the matmul and the backward recomputes it, so no normalised copy of the [..., in_dim] input is
+    kept or written."""
 
     def __init__(self, in_dim: int, out_dim: int, eps: float, bias_dim: int = 0) -> None:
         super().__init__()
@@ -225,12 +228,14 @@ class RMSNormLinear(KernelModule):
         if bias_dim:
             self.bias = nn.Parameter(torch.zeros(bias_dim))
 
-    def forward(self, x: torch.Tensor, return_normed: bool = False):
-        """x [..., in_dim] -> [..., out_dim]; with return_normed also the normalised x (for a bias computed from it)"""
-        x = self.norm(x)
-        bias = F.pad(self.bias, (self.linear.out_features - self.bias.numel(), 0)) if hasattr(self, "bias") else None
-        out = F.linear(x, self.linear.weight, bias)
-        return (out, x) if return_normed else out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x [..., in_dim] -> [..., out_dim]"""
+        bias = getattr(self, "bias", None)
+        if self.backend == "triton" and kernels.rmsnorm_linear.can_fuse(x, self.linear.out_features):
+            return kernels.rmsnorm_linear.rmsnorm_linear(x, self.norm.weight, self.linear.weight, bias, self.norm.eps)
+        if bias is not None:
+            bias = F.pad(bias, (self.linear.out_features - bias.numel(), 0))
+        return F.linear(self.norm(x), self.linear.weight, bias)
 
 
 class OuterProductMean(KernelModule):
@@ -279,17 +284,27 @@ class RMSNormPairBias(KernelModule):
         return self.linear(self.norm(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(like), -self.inf)[None]
 
 
+def merge_heads(o: torch.Tensor) -> torch.Tensor:
+    """[..., H, N, D] -> [..., N, H * D]"""
+    o = o.transpose(-2, -3)
+    return o.reshape(*o.shape[:-2], -1)
+
+
 class LinearGateResidual(KernelModule):
-    """The end of every attention: forward(x, o, gate) = x + linear(o) * gate, for the stream x, the merged attention output o and the
-    output gate (g of the gated attentions, the AdaLN gate of the DiT). Torch only so far."""
+    """The end of every attention: forward(x, o, gate) = x + linear(merge_heads(o)) * gate, for the stream x [..., N, dim], the attention
+    output o [..., H, N, 32] in the head layout and the output gate (g of the gated attentions, the AdaLN gate of the DiT). Triton
+    (kernels.linear_gate_residual): reads o in the head layout (no merged copy), and the matmul, gate and residual are one pass; the
+    backward is two kernels without the elementwise passes and the bias reduction of torch."""
 
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.linear = Linear(dim, dim)
 
     def forward(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """x, o [..., dim], gate broadcastable to them -> [..., dim]"""
-        return x + self.linear(o) * gate
+        """x [..., N, dim], o [..., H, N, 32], gate broadcastable to x -> [..., N, dim]"""
+        if self.backend == "triton" and kernels.linear_gate_residual.can_fuse(x, o):
+            return kernels.linear_gate_residual.linear_gate_residual(x, o, gate, self.linear.weight, self.linear.bias)
+        return x + self.linear(merge_heads(o)) * gate
 
 
 class LayerNormPairBias(KernelModule):
@@ -297,8 +312,10 @@ class LayerNormPairBias(KernelModule):
     forward(z, z_mask)[b] = linear_b(LayerNorm(z)) + mask, returned as [num_blocks, H, N, N] (the stack passes bias[b] to block b).
     The biases depend on the conditioning alone, so the decoder computes them once per structure and every noisy sample and
     denoising step reuses them. The LayerNorm has no affine of its own (the scale and shift of every block would be folded into its
-    projection anyway): `linear` has num_blocks * H rows, the rows of block b are [b * H, (b + 1) * H). With the Triton backend the
-    result is laid out with a row stride that is a multiple of 16 (the layout the attention kernels load fastest)."""
+    projection anyway): `linear` has num_blocks * H rows, the rows of block b are [b * H, (b + 1) * H). Triton (kernels.pair_bias, up to
+    16 rows: the atom pairs): LayerNorm, projection, mask and the layout with a row stride that is a multiple of 16 (the layout the
+    attention kernels load fastest) in one pass over z, without the normalised [N, N, c_z] copy and the [N, N, rows] logits of torch
+    (3.9 GiB for the 3072 atoms of a crop)."""
 
     def __init__(self, c_z: int, heads: int, num_blocks: int, inf: float, eps: float) -> None:
         super().__init__()
@@ -307,6 +324,10 @@ class LayerNormPairBias(KernelModule):
 
     def forward(self, z: torch.Tensor, z_mask: torch.Tensor) -> torch.Tensor:
         """z [N, N, c_z], z_mask [N, N] -> [num_blocks, H, N, N]"""
+        if self.backend == "triton" and kernels.pair_bias.can_fuse(z, self.linear.out_features):
+            logits = kernels.pair_bias.pair_bias(z, z_mask, z.new_ones(z.shape[-1]), self.linear.weight, self.eps, self.inf,
+                                                 out_dtype=z.dtype, pad=True, lin_bias=self.linear.bias, center=True)
+            return logits.reshape(-1, self.heads, *z_mask.shape)
         if z.shape[-1] < 64:            # torch's LayerNorm kernel takes 18 ms for the 2407^2 x 16 atom pairs (90x its memory time)
             zc = z - z.mean(-1, keepdim=True)
             z = zc * torch.rsqrt(zc.pow(2).mean(-1, keepdim=True) + self.eps)
