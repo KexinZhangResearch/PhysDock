@@ -67,13 +67,13 @@ def _load_w(ptr, rows, cols, stride_r, stride_c, BF16: tl.constexpr):
 # neighbouring configurations are within ~3% of each other, and the persistent kernels do not depend on N at all). Fixed
 # configurations: no autotuning pass (minutes of compilation per shape) and no autotuner on the launch path.
 _CONFIGS = {                    # float32 / TF32
-    "_fwd_in": ({"BLOCK_P": 64}, 4, 2), "_fwd_out": ({"BLOCK_P": 32}, 4, 2),
+    "_fwd_in": ({"BLOCK_P": 64}, 4, 2), "_fwd_in_k": ({"BLOCK_P": 64}, 8, 3), "_fwd_out": ({"BLOCK_P": 32}, 4, 2),
     "_bwd_out": ({"BLOCK_P": 64}, 4, 1), "_bwd_du": ({"BLOCK_P": 64}, 8, 2), "_bwd_norm": ({"BLOCK_P": 32}, 4, 1),
     "_bmm": ({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, 4, 3),
 }
 _CONFIGS_BF16 = {               # bfloat16
-    "_fwd_in": ({"BLOCK_P": 64}, 4, 1), "_fwd_out": ({"BLOCK_P": 64}, 4, 1),
-    "_bwd_out": ({"BLOCK_P": 64}, 4, 2), "_bwd_du": ({"BLOCK_P": 64}, 8, 2), "_bwd_norm": ({"BLOCK_P": 64}, 4, 2),
+    "_fwd_in": ({"BLOCK_P": 64}, 4, 1), "_fwd_in_k": ({"BLOCK_P": 64}, 8, 3), "_fwd_out": ({"BLOCK_P": 64}, 4, 1),
+    "_bwd_out": ({"BLOCK_P": 64}, 4, 2), "_bwd_out_k": ({"BLOCK_P": 64}, 4, 2), "_bwd_du": ({"BLOCK_P": 64}, 8, 2), "_bwd_norm": ({"BLOCK_P": 64}, 4, 2),
     "_bmm": ({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, 4, 3),
 }
 
@@ -157,6 +157,104 @@ def _fwd_in(Z, MASK, W_IN, W, BIAS, AB, US, G, R, NN, eps,
         tl.store(us + 3 * H, s_k.to(sdt), mask=pm[:, None])
         tl.store(R + pos, r, mask=pm)
     tl.store(G + pos[:, None] * C + oc[None, :], g.to(sdt), mask=pm[:, None])
+
+
+@triton.jit
+def _fwd_in_k(Z, MASK, W_IN, W, BIAS, AB, US, G, R, NN, eps,
+              C: tl.constexpr, H: tl.constexpr, BF16: tl.constexpr, SAVE: tl.constexpr, BLOCK_P: tl.constexpr):
+    """_fwd_in with the whole contraction axis at once: three dots (K = C) whose outputs are [u_qx | u_kx], [u_q | u_k] and the
+    gate, so the epilogue is elementwise and needs no column slicing (the chunked version issues 20 small dots per tile and runs
+    at 41 TFLOPS in bfloat16, this one at 65). The same results up to the accumulation order."""
+    pos = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
+    pm = pos < NN
+    oc = tl.arange(0, C)
+    o2 = tl.arange(0, 2 * H)
+    z = tl.load(Z + pos[:, None] * C + oc[None, :], mask=pm[:, None], other=0.0).to(tl.float32)
+    r = tl.math.rsqrt(tl.sum(z * z, 1) / C + eps)
+    zn = _cast_in(z * r[:, None] * tl.load(W_IN + oc).to(tl.float32)[None, :], BF16)
+    row1 = (o2 // H) * (2 * H) + o2 % H                  # rows of qx (0 .. H - 1) and kx (2H .. 3H - 1) in W
+    row2 = row1 + H                                      # rows of q (H .. 2H - 1) and k (3H .. 4H - 1)
+    w1 = _cast_in(tl.load(W + row1[None, :] * C + oc[:, None]).to(tl.float32), BF16)               # [C, 2H]
+    w2 = _cast_in(tl.load(W + row2[None, :] * C + oc[:, None]).to(tl.float32), BF16)
+    wg = _cast_in(tl.load(W + (4 * H + oc)[None, :] * C + oc[:, None]).to(tl.float32), BF16)       # [C, C]
+    p1 = tl.dot(zn, w1, input_precision="tf32") + tl.load(BIAS + row1)[None, :]                    # [u_qx | u_kx]
+    p2 = tl.dot(zn, w2, input_precision="tf32") + tl.load(BIAS + row2)[None, :]                    # [u_q | u_k]
+    s = tl.sigmoid(p2)
+    g = tl.sigmoid(tl.dot(zn, wg, input_precision="tf32") + tl.load(BIAS + 4 * H + oc)[None, :])
+    m = tl.load(MASK + pos, mask=pm, other=0.0).to(tl.float32)
+    ab = _cast_in(p1 * s * m[:, None], BF16)
+    tl.store(AB + (o2 // H)[None, :] * (H * NN) + (o2 % H)[None, :] * NN + pos[:, None], ab, mask=pm[:, None])
+    sdt = G.dtype.element_ty
+    if SAVE:
+        us = US + pos[:, None] * (4 * H) + row1[None, :]
+        tl.store(us, p1.to(sdt), mask=pm[:, None])
+        tl.store(us + H, s.to(sdt), mask=pm[:, None])
+        tl.store(R + pos, r, mask=pm)
+    tl.store(G + pos[:, None] * C + oc[None, :], g.to(sdt), mask=pm[:, None])
+
+
+@triton.jit
+def _bwd_out_k(DO, T, G, W_OUT, W_Z, B_Z, DT, DU, PART, NN, eps,
+             C: tl.constexpr, H: tl.constexpr, BF16: tl.constexpr, NPROG: tl.constexpr,
+             PWZ: tl.constexpr, PBZ: tl.constexpr, PWO: tl.constexpr, PBG: tl.constexpr, PSTRIDE: tl.constexpr,
+             BLOCK_P: tl.constexpr):
+    """_bwd_out with the whole C output channels at once (contiguous 256 B stores of the gate gradient, one dot per product)
+    and, in bfloat16, the column sums of dy and dgate as ones-dots instead of cross-thread reductions (they cost a third of the
+    chunked kernel). The sums are over the bfloat16-rounded gradients, as torch's autocast bias gradients are; in float32 the
+    sums are over the float32 values. 0.158 ms instead of 0.256 ms at 384 tokens."""
+    pid = tl.program_id(0)
+    ntiles = tl.cdiv(NN, BLOCK_P)
+    oh, oc = tl.arange(0, H), tl.arange(0, C)
+    o16 = tl.arange(0, 16)
+    w_out = tl.load(W_OUT + oh).to(tl.float32)
+    wz_t = _cast_in(tl.load(W_Z + oc[None, :] * H + oh[:, None]).to(tl.float32), BF16)        # [H, C] = Wz^T
+    wz = _cast_in(tl.load(W_Z + oc[:, None] * H + oh[None, :]).to(tl.float32), BF16)          # [C, H]
+    bz_w = tl.load(B_Z + oc).to(tl.float32)
+    acc_wo = tl.zeros([H], tl.float32)
+    acc_wz = tl.zeros([C, H], tl.float32)
+    if BF16:
+        acc_bz = tl.zeros([16, C], tl.float32)
+        acc_bg = tl.zeros([16, C], tl.float32)
+        ones = tl.full([16, BLOCK_P], 1.0, tl.bfloat16)
+    else:
+        acc_bz1 = tl.zeros([C], tl.float32)
+        acc_bg1 = tl.zeros([C], tl.float32)
+    for tile in range(pid, ntiles, NPROG):
+        pos = tile * BLOCK_P + tl.arange(0, BLOCK_P)
+        pm = pos < NN
+        t = tl.load(T + oh[None, :] * NN + pos[:, None], mask=pm[:, None], other=0.0).to(tl.float32)
+        rs = tl.math.rsqrt(tl.sum(t * t, 1) / H + eps)
+        xhat = t * rs[:, None]
+        tnc = _cast_in(xhat * w_out[None, :], BF16)
+        y = tl.dot(tnc, wz_t, input_precision="tf32") + bz_w[None, :]                            # [BLOCK_P, C]
+        g = tl.load(G + pos[:, None] * C + oc[None, :], mask=pm[:, None], other=0.0).to(tl.float32)
+        do = tl.load(DO + pos[:, None] * C + oc[None, :], mask=pm[:, None], other=0.0).to(tl.float32)
+        dgate = do * y * g * (1.0 - g)
+        tl.store(DU + pos[:, None] * (4 * H + C) + 4 * H + oc[None, :], dgate.to(DU.dtype.element_ty), mask=pm[:, None])
+        dy = do * g
+        dyc = _cast_in(dy, BF16)
+        dtn = tl.dot(dyc, wz, input_precision="tf32")                                            # [BLOCK_P, H]
+        acc_wz += tl.dot(tl.trans(dyc), tnc, input_precision="tf32")                              # [C, H]
+        if BF16:
+            acc_bz = tl.dot(ones, dyc, acc_bz)
+            acc_bg = tl.dot(ones, dgate.to(tl.bfloat16), acc_bg)
+        else:
+            acc_bz1 += tl.sum(dy, 0)
+            acc_bg1 += tl.sum(dgate, 0)
+        gw = dtn * w_out[None, :]
+        dt = rs[:, None] * (gw - xhat * (tl.sum(gw * xhat, 1) / H)[:, None])
+        tl.store(DT + oh[None, :] * NN + pos[:, None], dt.to(DT.dtype.element_ty), mask=pm[:, None])
+        acc_wo += tl.sum(dtn * xhat, 0)
+    row = PART + pid * PSTRIDE
+    tl.store(row + PWZ + oc[:, None] * H + oh[None, :], acc_wz)
+    if BF16:
+        sel = (o16 == 0)[:, None]
+        tl.store(row + PBZ + oc, tl.sum(tl.where(sel, acc_bz, 0.0), 0))
+        tl.store(row + PBG + oc, tl.sum(tl.where(sel, acc_bg, 0.0), 0))
+    else:
+        tl.store(row + PBZ + oc, acc_bz1)
+        tl.store(row + PBG + oc, acc_bg1)
+    tl.store(row + PWO + oh, acc_wo)
 
 
 @triton.jit
@@ -390,8 +488,12 @@ def _fwd_core(z, mask, w_in, w_all, b_all, w_out, w_z, b_z, eps, outgoing, preci
     g = torch.empty(NN, C, device=dev, dtype=cdt)
     t = torch.empty(H, NN, device=dev, dtype=cdt)
     out = torch.empty(N, N, C, device=dev, dtype=cdt)
-    _launch(_fwd_in, _grid_pos, (NN,), (z, mask, w_in, w_all, b_all, ab, us, g, r, NN, eps), dict(C=C, H=H, KC=KC, BF16=bf16, SAVE=save),
-            (z.dtype, cdt), dev.index)
+    if bf16:
+        _launch(_fwd_in_k, _grid_pos, (NN,), (z, mask, w_in, w_all, b_all, ab, us, g, r, NN, eps), dict(C=C, H=H, BF16=bf16, SAVE=save),
+                (z.dtype, cdt), dev.index)
+    else:
+        _launch(_fwd_in, _grid_pos, (NN,), (z, mask, w_in, w_all, b_all, ab, us, g, r, NN, eps), dict(C=C, H=H, KC=KC, BF16=bf16, SAVE=save),
+                (z.dtype, cdt), dev.index)
     # outgoing: t[i, I] = sum_j a[i, j] b[I, j];  incoming: t[p, q] = sum_j b[j, p] a[j, q]
     if outgoing:
         _bmm_launch(ab[0], ab[1], t, N, H, False, False, bf16)
@@ -422,9 +524,14 @@ def _bwd_impl(do: torch.Tensor, z: torch.Tensor, mask: torch.Tensor, w_in: torch
     part = torch.empty(nprog, pstride, device=dev, dtype=torch.float32)
     dt = torch.empty(H, NN, device=dev, dtype=cdt)
     du = torch.empty(NN, 4 * H + C, device=dev, dtype=cdt)           # [du of the four projections | gate gradient]
-    _launch(_bwd_out, _grid_fixed, (nprog, NN), (do, t, g, w_out, w_z, b_z, dt, du, part, NN, eps),
-            dict(C=C, H=H, KC=KC, BF16=bf16, NPROG=nprog, PWZ=lay["wz"][0], PBZ=lay["bz"][0], PWO=lay["wo"][0],
-                 PBG=lay["bi"][0] + 4 * H, PSTRIDE=pstride), (z.dtype, cdt), dev.index)
+    if bf16:
+        _launch(_bwd_out_k, _grid_fixed, (nprog, NN), (do, t, g, w_out, w_z, b_z, dt, du, part, NN, eps),
+                dict(C=C, H=H, BF16=bf16, NPROG=nprog, PWZ=lay["wz"][0], PBZ=lay["bz"][0], PWO=lay["wo"][0],
+                     PBG=lay["bi"][0] + 4 * H, PSTRIDE=pstride), (z.dtype, cdt), dev.index)
+    else:
+        _launch(_bwd_out, _grid_fixed, (nprog, NN), (do, t, g, w_out, w_z, b_z, dt, du, part, NN, eps),
+                dict(C=C, H=H, KC=KC, BF16=bf16, NPROG=nprog, PWZ=lay["wz"][0], PBZ=lay["bz"][0], PWO=lay["wo"][0],
+                     PBG=lay["bi"][0] + 4 * H, PSTRIDE=pstride), (z.dtype, cdt), dev.index)
     dab = torch.empty(2, H, NN, device=dev, dtype=cdt)
     a, b = ab[0], ab[1]
     if outgoing:        # da[i, j] = sum_I dt[i, I] b[I, j];  db[I, j] = sum_i dt[i, I] a[i, j]

@@ -102,7 +102,7 @@ class AtomEmbedder(nn.Module):
         self.ffn = FeedForward(c_ap)
         self.atom_transformer = AtomTransformer(
             c_a, c_ap, inf, eps, no_blocks_atom)
-        self.backend = "sdpa"                           # see set_attention_backend (triton: fused atom-pair feed-forward)
+        self.ffn_backend = "torch"                      # see set_ffn_backend (triton: fused atom-pair feed-forward)
 
     def forward(self, batch):
         """
@@ -128,7 +128,7 @@ class AtomEmbedder(nn.Module):
             self.linear_c_m(F.relu(a))[None, :]
         ap = ap + (self.linear_p(d) * v + self.linear_d(1 / (1 + torch.norm(d, dim=-1)[..., None])) * v
                    + self.linear_v(v) * v)
-        return a, self.ffn.residual(ap, fused=self.backend == "triton")
+        return a, self.ffn.residual(ap, fused=self.ffn_backend == "triton")
 
 
 class TokenEmbedder(nn.Module):

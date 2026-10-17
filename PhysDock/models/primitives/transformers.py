@@ -124,7 +124,7 @@ class TriangleBlock(nn.Module):
         z = z + self.triangle_col_update(z, z_mask)
         z = z + self.triangle_row_attention(z, z_mask)
         z = z + self.triangle_col_attention(z, z_mask)
-        return z + self.pair_transition(z)
+        return self.pair_transition.residual(z)
 
 
 class Triangleformer(Stack):
@@ -159,7 +159,7 @@ class EvoformerBlock(nn.Module):
         z = z + self.triangle_col_update(z, z_mask)
         z = z + self.triangle_row_attention(z, z_mask)
         z = z + self.triangle_col_attention(z, z_mask)
-        return m, z + self.pair_transition(z)
+        return m, self.pair_transition.residual(z)
 
 
 class Evoformer(Stack):
@@ -188,7 +188,7 @@ class PairFormerBlock(nn.Module):
         z = z + self.triangle_col_update(z, z_mask)
         z = z + self.triangle_row_attention(z, z_mask)
         z = z + self.triangle_col_attention(z, z_mask)
-        z = z + self.pair_transition(z)
+        z = self.pair_transition.residual(z)
         s = s + self.attention(s, z, z_mask)
         return s + self.transition(s), z
 
@@ -211,7 +211,7 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, bias, t):
         x = x + self.attention(x, bias, t)
-        return x + self.transition(x, t)
+        return self.transition.residual(x, t)
 
 
 def _dit_attention_inputs(block: DiTBlock, x, t):
@@ -220,7 +220,7 @@ def _dit_attention_inputs(block: DiTBlock, x, t):
 
 def _dit_block_output(block: DiTBlock, x, o, gate, t):
     x = x + block.attention.output(o, gate)
-    return x + block.transition(x, t)
+    return block.transition.residual(x, t)
 
 
 class DiT(Stack):

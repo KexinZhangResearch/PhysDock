@@ -1,4 +1,5 @@
-"""Triton kernels of the SwiGLU feed-forward on the atom-pair features, forward and backward, with the residual:
+"""Triton kernels of the plain SwiGLU feed-forward (no norm) on narrow features, forward and backward, with the residual. Used for the
+atom-pair features of the AtomEmbedder (the other two fused feed-forwards are rmsnorm_swiglu_ffn and adaln_swiglu_ffn):
 
     out = x + w2(silu(w1 x) * (w3 x))        x [M, C] with C = 16 channels (M = N_atom^2 = 9.4 million pairs), hidden 128
 
@@ -126,8 +127,8 @@ def _split_weights(w13: torch.Tensor):
     return w13[:h].contiguous(), w13[h:].contiguous()
 
 
-@torch.library.custom_op("physdock::pair_ffn_fwd", mutates_args=())
-def _pair_ffn_fwd(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: int) -> torch.Tensor:
+@torch.library.custom_op("physdock::swiglu_ffn_fwd", mutates_args=())
+def _swiglu_ffn_fwd(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: int) -> torch.Tensor:
     C, hid = x.shape[-1], w2.shape[1]
     x = x.contiguous()
     M = x.numel() // C
@@ -138,13 +139,13 @@ def _pair_ffn_fwd(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: in
     return out
 
 
-@_pair_ffn_fwd.register_fake
+@_swiglu_ffn_fwd.register_fake
 def _(x, w13, w2, mode):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("physdock::pair_ffn_bwd", mutates_args=())
-def _pair_ffn_bwd(dy: torch.Tensor, x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@torch.library.custom_op("physdock::swiglu_ffn_bwd", mutates_args=())
+def _swiglu_ffn_bwd(dy: torch.Tensor, x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     C, hid = x.shape[-1], w2.shape[1]
     x, dy = x.contiguous(), dy.contiguous()
     M = x.numel() // C
@@ -161,7 +162,7 @@ def _pair_ffn_bwd(dy: torch.Tensor, x: torch.Tensor, w13: torch.Tensor, w2: torc
     return dx, dw13, tot[2 * hid * C:].view(C, hid).clone()
 
 
-@_pair_ffn_bwd.register_fake
+@_swiglu_ffn_bwd.register_fake
 def _(dy, x, w13, w2, mode):
     return torch.empty_like(x), x.new_empty(w13.shape, dtype=torch.float32), x.new_empty(w2.shape, dtype=torch.float32)
 
@@ -174,14 +175,14 @@ def _setup_context(ctx, inputs, output):
 
 def _backward(ctx, dy):
     x, w13, w2 = ctx.saved_tensors
-    dx, dw13, dw2 = _pair_ffn_bwd(dy, x, w13, w2, ctx.mode)
+    dx, dw13, dw2 = _swiglu_ffn_bwd(dy, x, w13, w2, ctx.mode)
     return dx, dw13.to(w13.dtype), dw2.to(w2.dtype), None
 
 
-_pair_ffn_fwd.register_autograd(_backward, setup_context=_setup_context)
+_swiglu_ffn_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
-def pair_ffn(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+def swiglu_ffn(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
     """x + w2(silu(w1 x) * (w3 x)) with w13 = [w1; w3] [2 * hidden, C], w2 [C, hidden]; differentiable w.r.t. x, w13 and w2.
 
     The residual is added to x itself, in the dtype of x (the float32 pair features under autocast: the residual stream is not
@@ -191,4 +192,4 @@ def pair_ffn(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor) -> torch.Tens
         mode = "bf16"
     else:
         mode = "tf32" if torch.get_float32_matmul_precision() != "highest" else "fp32"
-    return _pair_ffn_fwd(x, w13, w2, MODES[mode])
+    return _swiglu_ffn_fwd(x, w13, w2, MODES[mode])

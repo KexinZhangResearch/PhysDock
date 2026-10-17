@@ -86,7 +86,7 @@ class AdaLayerNormZero(nn.Module):
 
 
 # the submodules use the layers above, so they are imported last
-from .transitions import FeedForward, Transition, DiTTransition  # noqa: E402
+from .transitions import FeedForward, Transition, DiTTransition, set_ffn_backend  # noqa: E402
 from .opm import OuterProductMean  # noqa: E402
 from .attentions import (AttentionWithPairBias, MSARowAttentionWithPairBias, MSAColumnAttention,  # noqa: E402
                          TriangleUpdate, TriangleAttention, DiTAttention, set_attention_backend,

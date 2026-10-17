@@ -64,13 +64,11 @@ def set_triangle_update_backend(model: nn.Module, backend: str) -> None:
 def set_attention_backend(model: nn.Module, backend: str) -> None:
     """Attention implementation of the layers of model with a pair bias: triangle attention, DiT attention, MSA row
     attention and the single attention (atoms, tokens) ("sdpa" or "triton"; the last two only for large problems and
-    where it is faster, see _use_triton_attention). "triton" also fuses the feed-forward of the atom-pair features
-    (AtomEmbedder, PhysDock.models.kernels.pair_ffn)."""
+    where it is faster, see _use_triton_attention)."""
     if backend not in ATTENTION_BACKENDS:
         raise ValueError(f"attention backend must be one of {ATTENTION_BACKENDS}, got {backend!r}")
     for module in model.modules():
-        if isinstance(module, (TriangleAttention, DiTAttention, AttentionWithPairBias, MSARowAttentionWithPairBias)) \
-                or hasattr(module, "backend") and type(module).__name__ == "AtomEmbedder":
+        if isinstance(module, (TriangleAttention, DiTAttention, AttentionWithPairBias, MSARowAttentionWithPairBias)):
             module.backend = backend
 
 
