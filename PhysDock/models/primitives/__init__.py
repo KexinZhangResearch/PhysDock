@@ -369,15 +369,23 @@ class SharedBiasAttention(KernelModule):
     0.49 at 10 A, 0.25 at 12 A, 0.09 at 14 A). `learnable` makes lambda a parameter per head (softplus-parameterised, so it stays positive);
     otherwise it is a buffer. No parameters at all when the decay is off."""
 
-    decay_width = 0.2                # width of the switch, in units of the radius
+    decay_width = 0.2                # width of the softplus switch, in units of the radius
+    decay_flat = False               # flat-bottom switch (nothing inside the radius, cheaper) instead of the softplus one
 
-    def set_distance_decay(self, heads: int, strength: float, learnable: bool) -> None:
+    def set_distance_decay(self, heads: int, strength: float, learnable: bool, flat: bool = True) -> None:
         """Add the per-head strength of the distance decay (lambda = softplus(raw), raw chosen so that lambda = strength)."""
-        raw = torch.full((heads,), math.log(math.expm1(max(strength, 1e-4))))
+        self.decay_flat = flat
+        self._decay_raw_value = math.log(math.expm1(max(strength, 1e-4)))
+        raw = torch.full((heads,), self._decay_raw_value)
         if learnable:
             self.decay_raw = nn.Parameter(raw)
         else:
-            self.register_buffer("decay_raw", raw)
+            self.register_buffer("decay_raw", raw, persistent=False)      # a setting, not a learned value: stays out of the state dict
+
+    def reset_settings(self, device=None) -> None:
+        """Rebuild the non-persistent buffers (the fixed strength is a setting, not a learned value, so it is not in a checkpoint)."""
+        if "decay_raw" in self._buffers and not isinstance(self.decay_raw, nn.Parameter):
+            self.register_buffer("decay_raw", torch.full_like(self.decay_raw, self._decay_raw_value, device=device), persistent=False)
 
     @property
     def decay_strength(self):
@@ -404,12 +412,13 @@ class SharedBiasAttention(KernelModule):
         if self.backend == "triton":
             sba = kernels.shared_bias_attention.shared_bias_attention
             if q.dim() == 3:
-                return sba(q[None], k[None], v[None], bias, n_valid, pos, radius, lam, self.decay_width)[0]
-            return sba(q, k, v, bias, n_valid, pos, radius, lam, self.decay_width)
+                return sba(q[None], k[None], v[None], bias, n_valid, pos, radius, lam, self.decay_width, self.decay_flat)[0]
+            return sba(q, k, v, bias, n_valid, pos, radius, lam, self.decay_width, self.decay_flat)
         if lam is not None:                                              # torch backend: the same function from a dense decay
             d = torch.cdist(pos.detach().float(), pos.detach().float()) / radius.detach().float().reshape(-1, 1, 1)
             w = self.decay_width
-            bias = bias[None] - lam.reshape(1, -1, 1, 1) * (w * F.softplus((d - 1.0) / w))[:, None]
+            sw = torch.relu(d - 1.0) ** 2 if self.decay_flat else w * F.softplus((d - 1.0) / w)
+            bias = bias[None] - lam.reshape(1, -1, 1, 1) * sw[:, None]
         return F.scaled_dot_product_attention(q, k, v, bias)
 
 

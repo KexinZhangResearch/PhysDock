@@ -245,10 +245,10 @@ class DiT(Stack):
         self.pair_bias = LayerNormPairBias(c_z, self.heads, no_blocks, inf, eps)
         self.time_mod = TimeModulation(c_s, no_blocks)
 
-    def set_distance_decay(self, strength: float, learnable: bool) -> None:
+    def set_distance_decay(self, strength: float, learnable: bool, flat: bool = True) -> None:
         """Distance decay of the attention of every block (see SharedBiasAttention); forward then needs pos and radius."""
         for block in self.blocks:
-            block.attention.attend.set_distance_decay(self.heads, strength, learnable)
+            block.attention.attend.set_distance_decay(self.heads, strength, learnable, flat)
 
     def forward(self, x, bias, t, n_valid=None, pos=None, radius=None):
         for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t))):

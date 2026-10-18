@@ -43,6 +43,10 @@ decoder:                        # AllAtomDecoder (DiffusionModule)
   eps: ${global.eps}
   no_blocks_atom: 3             # atom DiT encoder and decoder
   no_blocks_dit: 12             # token DiT
+  sigma_data: ${global.sigma_data}
+  atom_decay: null              # distance decay of the two atom DiTs (see PhysDock.models.decoders.AllAtomDecoder); changes the function, train
+                                # from scratch. {radius: 12.0, strength: 10.0, learnable: false}: the attention of a pair is multiplied by
+                                # 0.49 at 10 A, 0.25 at 12 A, 0.09 at 14 A; learnable: true makes the strength a parameter per head
 
 diffusion:
   # EDM variance exploding: z = x + t * e on normalised coordinates; lengths and noise levels in units of sigma_data

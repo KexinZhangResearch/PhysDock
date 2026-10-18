@@ -31,7 +31,8 @@ def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = Tru
 
     Args:
         ckpt_path: params.pt, a Lightning or a Uni-Core checkpoint
-        config: model config (configs/model/*.yaml; default: "medium")
+        config: model config (configs/model/*.yaml; default: "medium"); every parameter of the model must be in the checkpoint, but its
+            non-persistent buffers (settings such as a fixed distance-decay strength) are rebuilt from the config
         device: target device
         eval_mode: return the model in eval mode
     """
@@ -54,6 +55,9 @@ def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = Tru
             raise RuntimeError(f"{name}: checkpoint shape {tuple(value.shape)}, model shape {tuple(expected[name].shape)}")
         on_device[name] = value.to(device=device, dtype=expected[name].dtype, non_blocking=True)
     model.load_state_dict(on_device, strict=True, assign=True)
+    for module in model.modules():                              # settings that are not in the checkpoint (a fixed decay strength)
+        if hasattr(module, "reset_settings"):
+            module.reset_settings(device)
     if any(t.is_meta for t in list(model.parameters()) + list(model.buffers())):
         raise RuntimeError("some tensors are not in the checkpoint and stay uninitialised")
     if device.type == "cuda":
