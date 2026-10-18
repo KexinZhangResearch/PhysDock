@@ -359,9 +359,31 @@ class LayerNormPairBias(KernelModule):
 
 class SharedBiasAttention(KernelModule):
     """softmax(q k^T / sqrt(D) + bias) v for q, k, v [..., H, N, D] and a logit bias [H, N, N] shared by all leading (batch) entries: the
-    noisy samples of the DiT, the rows of the triangle and MSA row attention. No parameters. Torch: sdpa; Triton: the fused forward and
+    noisy samples of the DiT, the rows of the triangle and MSA row attention. Torch: sdpa; Triton: the fused forward and
     backward of kernels.shared_bias_attention (the bias tile is loaded once for the whole batch, dbias accumulated in registers; the
-    TF32 inputs are rounded as cuBLAS does), 1.7-2x faster than sdpa in forward + backward in bfloat16 and 2-5x in the TF32 forward."""
+    TF32 inputs are rounded as cuBLAS does), 1.7-2x faster than sdpa in forward + backward in bfloat16 and 2-5x in the TF32 forward.
+
+    decay (set by the DiT it belongs to, see set_distance_decay) multiplies the attention of distant atoms by a switching factor, the way a
+    force field cuts off an interaction: the score of a pair loses lambda[h] * w * softplus((d / r - 1) / w), with d the distance of the two
+    atoms in the coordinates the caller passes and r the radius of kernels.shared_bias_attention.radius_for_noise (12 A, lambda 10: factor
+    0.49 at 10 A, 0.25 at 12 A, 0.09 at 14 A). `learnable` makes lambda a parameter per head (softplus-parameterised, so it stays positive);
+    otherwise it is a buffer. No parameters at all when the decay is off."""
+
+    decay_width = 0.2                # width of the switch, in units of the radius
+
+    def set_distance_decay(self, heads: int, strength: float, learnable: bool) -> None:
+        """Add the per-head strength of the distance decay (lambda = softplus(raw), raw chosen so that lambda = strength)."""
+        raw = torch.full((heads,), math.log(math.expm1(max(strength, 1e-4))))
+        if learnable:
+            self.decay_raw = nn.Parameter(raw)
+        else:
+            self.register_buffer("decay_raw", raw)
+
+    @property
+    def decay_strength(self):
+        """lambda [H] >= 0, or None if the decay is off"""
+        raw = getattr(self, "decay_raw", None)
+        return None if raw is None else F.softplus(raw)
 
     skip_padding = False            # set by PhysDock(skip_padding=True): the Triton kernels skip the padding at the end of the sequence
 
@@ -372,18 +394,22 @@ class SharedBiasAttention(KernelModule):
         return valid_length(pair_mask) if self.backend == "triton" and self.skip_padding else None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: torch.Tensor = None,
-                layout=None) -> torch.Tensor:
+                pos: torch.Tensor = None, radius: torch.Tensor = None) -> torch.Tensor:
         """q, k, v: [H, N, D] or [B, H, N, D]; bias [H, N, N]; n_valid: valid_length of the mask, the Triton kernels skip the padding
-        behind it (the keys there must be masked by the bias; the rows there get 0); layout: kernels.block_neighbor_attention.BlockLayout:
-        q, k, v are [B, H, Np, D] in its sorted order and every atom attends only to the atoms of the neighbour blocks of its block
-        (Triton: only those blocks are computed; torch: the same function from gathered blocks) -> o of the shape of q"""
-        if layout is not None:
-            attend = kernels.block_neighbor_attention
-            return (attend.block_neighbor_attention if self.backend == "triton" else attend.torch_block_attention)(q, k, v, bias, layout)
+        behind it (the keys there must be masked by the bias; the rows there get 0); pos [B, N, 3] and radius [B] of the distance decay
+        (only used when set_distance_decay was called) -> o of the shape of q"""
+        lam = self.decay_strength if pos is not None else None
+        if lam is None:
+            pos = radius = None
         if self.backend == "triton":
+            sba = kernels.shared_bias_attention.shared_bias_attention
             if q.dim() == 3:
-                return kernels.shared_bias_attention.shared_bias_attention(q[None], k[None], v[None], bias, n_valid)[0]
-            return kernels.shared_bias_attention.shared_bias_attention(q, k, v, bias, n_valid)
+                return sba(q[None], k[None], v[None], bias, n_valid, pos, radius, lam, self.decay_width)[0]
+            return sba(q, k, v, bias, n_valid, pos, radius, lam, self.decay_width)
+        if lam is not None:                                              # torch backend: the same function from a dense decay
+            d = torch.cdist(pos.detach().float(), pos.detach().float()) / radius.detach().float().reshape(-1, 1, 1)
+            w = self.decay_width
+            bias = bias[None] - lam.reshape(1, -1, 1, 1) * (w * F.softplus((d - 1.0) / w))[:, None]
         return F.scaled_dot_product_attention(q, k, v, bias)
 
 

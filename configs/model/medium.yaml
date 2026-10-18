@@ -43,8 +43,6 @@ decoder:                        # AllAtomDecoder (DiffusionModule)
   eps: ${global.eps}
   no_blocks_atom: 3             # atom DiT encoder and decoder
   no_blocks_dit: 12             # token DiT
-  atom_neighbors: null          # {leaf: 32, blocks: 8}: the atoms of the two atom DiTs attend only to the 8 nearest blocks of 32 atoms (k-d tree blocks
-                                # of the noisy coordinates, per sample and step: ~5x faster atom attention); changes the function, train from scratch
 
 diffusion:
   # EDM variance exploding: z = x + t * e on normalised coordinates; lengths and noise levels in units of sigma_data

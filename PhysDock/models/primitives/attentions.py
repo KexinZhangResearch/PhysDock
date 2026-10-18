@@ -127,20 +127,21 @@ class DiTAttention(nn.Module):
         self.attend = SharedBiasAttention()
         self.out = LinearGateResidual(c_s)
 
-    def forward(self, x: torch.Tensor, bias: torch.Tensor, mod: torch.Tensor, n_valid: torch.Tensor = None, layout=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, bias: torch.Tensor, mod: torch.Tensor, n_valid: torch.Tensor = None,
+                pos: torch.Tensor = None, radius: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: [B, N, c_s]
             bias: [H, N, N] logit bias (pair bias + mask)
             mod: [B, 1, 3 * c_s] AdaLN modulation (TimeModulation)
             n_valid: valid_length of the mask of `bias` (the padding behind it is skipped by the Triton backend), or None
-            layout: BlockLayout of the block-neighbour attention (x is then in its sorted order), or None: all atoms attend to all
+            pos: [B, N, 3] and radius: [B] of the distance decay of `attend` (None: no decay)
 
         Returns:
             [B, N, c_s] x + update
         """
         q, k, v, gate = self.project(x, mod)
-        return self.output(x, self.attend(q, k, v, bias, n_valid, layout), gate)
+        return self.output(x, self.attend(q, k, v, bias, n_valid, pos, radius), gate)
 
     def project(self, x: torch.Tensor, mod: torch.Tensor):
         """Attention inputs: q, k, v [B, H, N, 32] and the output gate [B, 1, c_s]"""

@@ -6,7 +6,6 @@ from torch.utils.checkpoint import checkpoint
 from PhysDock.models.primitives import (AdaLNSwiGLUFFN, AttentionWithBias, DiTAttention, LayerNormPairBias, MSAColumnAttention,
                                         MSARowAttentionWithBias, OuterProductMean, RMSNormSwiGLUFFN, TimeModulation,
                                         TriangleAttention, TriangleMultiplication)
-from PhysDock.models.kernels.block_neighbor_attention import sort_atoms, unsort_atoms
 from PhysDock.models.primitives.attentions import HEAD_DIM
 
 
@@ -213,8 +212,8 @@ class DiTBlock(nn.Module):
         self.attention = DiTAttention(c_s, eps)
         self.transition = AdaLNSwiGLUFFN(c_s, eps)
 
-    def forward(self, x, bias, mod, n_valid=None, layout=None):
-        x = self.attention(x, bias, mod[:, :1], n_valid, layout)
+    def forward(self, x, bias, mod, n_valid=None, pos=None, radius=None):
+        x = self.attention(x, bias, mod[:, :1], n_valid, pos, radius)
         return self.transition(x, mod[:, 1:])
 
 
@@ -231,8 +230,8 @@ class DiT(Stack):
     """Diffusion transformer conditioned on a timestep embedding and per-block pair biases.
 
     x: [B, N, c_s], bias: [no_blocks, H, N, N] (self.pair_bias(z, z_mask), computed once per structure), t: [B, 256] timestep embedding,
-    n_valid: valid_length(z_mask) or None (the Triton attention skips the padding behind it); layout: BlockLayout (block-neighbour attention of
-    the atoms: the stack sorts x by it and restores the order at the end) -> x: [B, N, c_s]
+    n_valid: valid_length(z_mask) or None (the Triton attention skips the padding behind it); pos [B, N, 3] and radius [B] of the distance
+    decay, when set_distance_decay was called -> x: [B, N, c_s]
     (the AdaLN modulations of all blocks come from one matmul of t, TimeModulation)
 
     checkpoint "attention" (selective checkpointing, DiTBlock.forward split in three): the attention inputs / outputs
@@ -242,18 +241,21 @@ class DiT(Stack):
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float, no_blocks: int = 12) -> None:
         super().__init__(DiTBlock, no_blocks, c_s, eps)
-        self.pair_bias = LayerNormPairBias(c_z, c_s // HEAD_DIM, no_blocks, inf, eps)
+        self.heads = c_s // HEAD_DIM
+        self.pair_bias = LayerNormPairBias(c_z, self.heads, no_blocks, inf, eps)
         self.time_mod = TimeModulation(c_s, no_blocks)
 
-    def forward(self, x, bias, t, n_valid=None, layout=None):
-        n = x.shape[1]
-        if layout is not None:                          # block-neighbour attention: the atoms in the sorted order of the layout
-            x = sort_atoms(x, layout)
+    def set_distance_decay(self, strength: float, learnable: bool) -> None:
+        """Distance decay of the attention of every block (see SharedBiasAttention); forward then needs pos and radius."""
+        for block in self.blocks:
+            block.attention.attend.set_distance_decay(self.heads, strength, learnable)
+
+    def forward(self, x, bias, t, n_valid=None, pos=None, radius=None):
         for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t))):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
                 q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, mod)
-                o = block.attention.attend(q, k, v, b, n_valid, layout)
+                o = block.attention.attend(q, k, v, b, n_valid, pos, radius)
                 x = self.checkpointed(_dit_block_output, block, x, o, gate, mod)
             else:
-                x = self.run_block(block, x, b, mod, n_valid, layout, index=i)
-        return x if layout is None else unsort_atoms(x, layout, n)
+                x = self.run_block(block, x, b, mod, n_valid, pos, radius, index=i)
+        return x
