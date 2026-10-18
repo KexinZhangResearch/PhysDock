@@ -1,5 +1,5 @@
 """Decoder (the paper's DiffusionModule): atom DiT -> pool to tokens -> token DiT -> broadcast to atoms -> atom DiT."""
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -12,12 +12,15 @@ from PhysDock.utils.tensor_utils import pair_mask, segment_mean_pool
 class DecoderConditions(NamedTuple):
     """Decoder inputs that depend on the structure only: a [N_atom, c_a], s [N_token, c_s] and the attention logit
     biases (pair bias + mask) of every DiT block, atom_bias_* [no_blocks_atom, H_atom, N_atom, N_atom] and
-    token_bias [no_blocks_dit, H_token, N_token, N_token]."""
+    token_bias [no_blocks_dit, H_token, N_token, N_token]; atom_valid and token_valid: the lengths of the real part of the padded atoms and
+    tokens (valid_length, only with the Triton backend, which skips the padding in the attentions; else None)."""
     a: torch.Tensor
     s: torch.Tensor
     atom_bias_encoder: torch.Tensor
     token_bias: torch.Tensor
     atom_bias_decoder: torch.Tensor
+    atom_valid: Optional[torch.Tensor] = None
+    token_valid: Optional[torch.Tensor] = None
 
 
 class AllAtomDecoder(nn.Module):
@@ -52,8 +55,10 @@ class AllAtomDecoder(nn.Module):
         with torch.autocast(batch["atom_mask"].device.type, enabled=False):
             a, ap, s, z = (c.float() for c in conds)
             ap_mask, z_mask = pair_mask(batch["atom_mask"].float()), pair_mask(batch["token_mask"].float())
+            attend = self.token_dit.blocks[0].attention.attend
             return DecoderConditions(a, s, self.atom_dit_encoder.pair_bias(ap, ap_mask),
-                                     self.token_dit.pair_bias(z, z_mask), self.atom_dit_decoder.pair_bias(ap, ap_mask))
+                                     self.token_dit.pair_bias(z, z_mask), self.atom_dit_decoder.pair_bias(ap, ap_mask),
+                                     attend.valid_length(ap_mask), attend.valid_length(z_mask))
 
     def forward(self, batch, x_in: torch.Tensor, t_in: torch.Tensor, cond: DecoderConditions) -> torch.Tensor:
         """
@@ -69,9 +74,9 @@ class AllAtomDecoder(nn.Module):
         with torch.autocast(x_in.device.type, enabled=False):
             t = self.time_embedder(t_in.float())
             x = self.linear_x(x_in.float()) + cond.a[None]
-            x = self.atom_dit_encoder(x, cond.atom_bias_encoder, t)
+            x = self.atom_dit_encoder(x, cond.atom_bias_encoder, t, cond.atom_valid)
             xs = segment_mean_pool(F.silu(self.linear_downscale(x)), batch["split_sizes"]) + cond.s[None]   # to tokens
-            xs = self.token_dit(xs, cond.token_bias, t)
+            xs = self.token_dit(xs, cond.token_bias, t, cond.token_valid)
             x = x + self.linear_upscale(xs)[:, batch["atom_to_token"]]                                     # to atoms
-            x = self.atom_dit_decoder(x, cond.atom_bias_decoder, t)
+            x = self.atom_dit_decoder(x, cond.atom_bias_decoder, t, cond.atom_valid)
             return self.linear_r(self.norm_r(x))

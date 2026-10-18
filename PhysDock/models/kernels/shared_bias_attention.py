@@ -18,9 +18,15 @@ accumulated in registers (no atomics). dq, dk and dv are accumulated across bloc
 grid is too small to fill the GPU (triangle attention, few heads and rows) the batch is split over extra programs and
 the partial dbias are summed.
 
+Padding: n_valid (an int32 device scalar, no host synchronisation) is the length of the leading part of the sequence that holds real
+positions; the keys from n_valid on must be masked by the bias (they are skipped, which is the same as masking them), and the query
+rows from n_valid on are not computed (output 0, no gradient). The training crops are padded at the end to a fixed size (a mean of
+60% real atom pairs and 74% real token pairs at crop 384 / 3072 atoms), and the score tiles of the padding are skipped in the forward
+and the backward.
+
 The kernels run behind torch.library custom ops (opaque for torch.compile, with fake implementations).
 """
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -109,10 +115,10 @@ def prepare_tf32(tensors, scale: float = None):
 
 # ----------------------------------------------------------------------------------------------- forward
 @triton.jit
-def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
+def _fwd(Q, K, V, Bias, NV, O, LSE, scale_log2e, H, N,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sob, soh, son, sbh, sbm,
          D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, PRE: tl.constexpr,
-         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_NV: tl.constexpr):
     """PRE: q (already multiplied by scale * log2(e)), k and v are TF32-rounded by the caller (prepare_tf32), so the kernel
     loads them straight into the matmuls (the in-kernel rounding forced plain register loads instead of asynchronous,
     pipelined copies)."""
@@ -134,7 +140,13 @@ def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
     acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
     k_base, v_base = K + b64 * skb + h64 * skh, V + b64 * svb + h64 * svh
     bias_base = Bias + h64 * sbh + offs_m[:, None] * sbm
-    for start_n in tl.range(0, N, BLOCK_N):
+    if HAS_NV:
+        nv = tl.load(NV)
+        hi = tl.where(pid_m * BLOCK_M < nv, tl.minimum(N, (nv + BLOCK_N - 1) // BLOCK_N * BLOCK_N), 0)   # a query tile of padding attends to nothing
+    else:
+        nv = N
+        hi = N
+    for start_n in tl.range(0, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         n_in = offs_n < N
         kt = tl.load(k_base + offs_n[None, :] * skn + offs_d[:, None], mask=n_in[None, :] & d_in[:, None], other=0.0)
@@ -159,10 +171,11 @@ def _fwd(Q, K, V, Bias, O, LSE, scale_log2e, H, N,
                 v = _round_tf32(v)
         acc += tl.dot(pp, v, input_precision=PREC)
         m_i = m_new
-    acc = acc / l_i[:, None]
+    live = (l_i > 0.0) & (offs_m < nv)                          # the rows of the padding: output 0, lse 0 (nothing reads them)
+    acc = tl.where(live[:, None], acc / tl.where(live, l_i, 1.0)[:, None], 0.0)
     tl.store(O + b64 * sob + h64 * soh + offs_m[:, None] * son + offs_d[None, :], acc,
              mask=m_in[:, None] & d_in[None, :])
-    tl.store(LSE + (b64 * H + h64) * N + offs_m, m_i + tl.math.log2(l_i), mask=m_in)
+    tl.store(LSE + (b64 * H + h64) * N + offs_m, tl.where(live, m_i + tl.math.log2(tl.where(live, l_i, 1.0)), 0.0), mask=m_in)
 
 
 @triton.jit
@@ -184,17 +197,23 @@ def _delta(O, DO, Delta, N, sob, soh, son, sdb, sdh, sdn, H,
 
 # ----------------------------------------------------------------------------------------------- backward
 @triton.jit
-def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N,
+def _bwd(Q, K, V, Bias, NV, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sdob, sdoh, sdon, sdqb, sdqh, sdqn, sdkb, sdkh, sdkn, sdvb, sdvh, sdvn,
          sbh, sbm, sdbs, sdbh, sdbm,
          D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, SPLIT: tl.constexpr,
-         PRE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+         PRE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_NV: tl.constexpr):
     """One pass over the score tiles: recomputes p once and produces dq, dk, dv and dbias (see the module docstring).
     program_id(2) enumerates (head, batch chunk); chunk c sums the batch entries [c * ceil(B / SPLIT), ...)."""
     pid_m, pid_n, pid_hs = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     h, sid = pid_hs // SPLIT, pid_hs % SPLIT
     chunk = (B + SPLIT - 1) // SPLIT
     b_lo, b_hi = sid * chunk, tl.minimum(B, sid * chunk + chunk)
+    if HAS_NV:
+        nv = tl.load(NV)
+        active = (pid_m * BLOCK_M < nv) & (pid_n * BLOCK_N < nv)      # a tile that touches padding only: dbias = 0, nothing else
+        b_hi = tl.where(active, b_hi, b_lo)
+    else:
+        nv = N
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
@@ -219,7 +238,7 @@ def _bwd(Q, K, V, Bias, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B
         lse = tl.load(LSE + (b64 * H + h64) * N + offs_m, mask=m_in, other=0.0)
         delta = tl.load(Delta + (b64 * H + h64) * N + offs_m, mask=m_in, other=0.0)
         s = tl.dot(q, kt, input_precision=PREC) + bias
-        p = tl.where(m_in[:, None] & n_in[None, :], tl.math.exp2(s - lse[:, None]), 0.0)
+        p = tl.where((m_in & (offs_m < nv))[:, None] & (n_in & (offs_n < nv))[None, :], tl.math.exp2(s - lse[:, None]), 0.0)
         dp = tl.dot(do, vt, input_precision=PREC).to(tl.float32)
         ds = p * (dp - delta[:, None])
         dbias += ds
@@ -270,7 +289,8 @@ def _prep(dtype):
 
 
 @torch.library.custom_op("physdock::shared_bias_attention_fwd", mutates_args=())
-def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
+                   n_valid: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
     """-> o [B, N, H, D] contiguous (the caller transposes to [B, H, N, D]), lse [B, H, N] (log2 units)"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
@@ -284,21 +304,21 @@ def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torc
     if pre:
         q, k, v = prepare_tf32([q, k, v], D ** -0.5 * 1.4426950408889634)
     _fwd[(B, triton.cdiv(N, bm), H)](
-        q, k, v, bias, ov, lse, D ** -0.5 * 1.4426950408889634, H, N,
+        q, k, v, bias, n_valid, ov, lse, D ** -0.5 * 1.4426950408889634, H, N,
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *ov.stride()[:3], bias.stride(0), bias.stride(1),
         D_HEAD=D, BLOCK_D=max(16, triton.next_power_of_2(D)), PREC=prec, RN=rn, PRE=pre,
-        BLOCK_M=bm, BLOCK_N=bn, num_warps=warps, num_stages=stages)
+        BLOCK_M=bm, BLOCK_N=bn, HAS_NV=n_valid is not None, num_warps=warps, num_stages=stages)
     return o, lse
 
 
 @_attention_fwd.register_fake
-def _(q, k, v, bias):
+def _(q, k, v, bias, n_valid):
     B, H, N, D = q.shape
     return q.new_empty(B, N, H, D), q.new_empty(B, H, N, dtype=torch.float32)
 
 
 @torch.library.custom_op("physdock::shared_bias_attention_bwd", mutates_args=())
-def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
+def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor],
                    o: torch.Tensor, lse: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """do, o: [B, N, H, D] -> dq, dk, dv [B, N, H, D], dbias [H, N, N]"""
     B, H, N, D = q.shape
@@ -324,40 +344,44 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
         q, k, v = prepare_tf32([q, k, v], scale * 1.4426950408889634)
         dov = prepare_tf32([dov])[0]
     _bwd[(triton.cdiv(N, bm), triton.cdiv(N, bn), H * split)](
-        q, k, v, bias, dov, lse, delta, dqv, dkv, dvv, dbias, scale, scale * 1.4426950408889634, B, H, N,
+        q, k, v, bias, n_valid, dov, lse, delta, dqv, dkv, dvv, dbias, scale, scale * 1.4426950408889634, B, H, N,
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *dov.stride()[:3], *dqv.stride()[:3], *dkv.stride()[:3],
         *dvv.stride()[:3], bias.stride(0), bias.stride(1), dbias.stride(0), dbias.stride(1), dbias.stride(2), D_HEAD=D, BLOCK_D=block_d, PREC=prec, RN=rn,
-        SPLIT=split, PRE=pre, BLOCK_M=bm, BLOCK_N=bn, num_warps=warps, num_stages=stages)
+        SPLIT=split, PRE=pre, BLOCK_M=bm, BLOCK_N=bn, HAS_NV=n_valid is not None, num_warps=warps, num_stages=stages)
     return dq.to(dtype), dk.to(dtype), dv.to(dtype), dbias[0] if split == 1 else dbias.sum(0)
 
 
 @_attention_bwd.register_fake
-def _(do, q, k, v, bias, o, lse):
+def _(do, q, k, v, bias, n_valid, o, lse):
     B, H, N, D = q.shape
     return (q.new_empty(B, N, H, D), q.new_empty(B, N, H, D), q.new_empty(B, N, H, D),
             bias.new_empty(H, N, N, dtype=torch.float32))
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, bias = inputs
+    q, k, v, bias, n_valid = inputs
     ctx.save_for_backward(q, k, v, bias, output[0], output[1])
+    ctx.n_valid = n_valid
 
 
 def _backward(ctx, do, dlse):
     q, k, v, bias, o, lse = ctx.saved_tensors
-    dq, dk, dv, dbias = _attention_bwd(do, q, k, v, bias, o, lse)
-    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype)
+    dq, dk, dv, dbias = _attention_bwd(do, q, k, v, bias, ctx.n_valid, o, lse)
+    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype), None
 
 
 _attention_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
-def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor,
+                          n_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
     """softmax(q k^T / sqrt(D) + bias) v with a bias shared by the batch.
 
     Args:
         q, k, v: [B, H, N, D] float32 or bfloat16
         bias: [H, N, N] attention logit bias (pair features + key mask), shared by the B batch entries
+        n_valid: int32 tensor of one element on the device, the number of leading positions that are real (the rest is padding, see the
+            module docstring); None: all N
 
     Returns:
         [B, H, N, D]
@@ -371,4 +395,4 @@ def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bia
         raise ValueError(f"q, k, v must be float32 or bfloat16 of the same dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
     if D > 128:
         raise ValueError(f"head dim must be <= 128, got {D}")
-    return _attention_fwd(q, k, v, bias)[0].transpose(1, 2)
+    return _attention_fwd(q, k, v, bias, n_valid)[0].transpose(1, 2)

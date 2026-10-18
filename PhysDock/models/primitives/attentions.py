@@ -38,7 +38,7 @@ class AttentionWithBias(nn.Module):
         """
         q, k, v, g = self.qkvg(s).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        o = self.attend(q, k, v, self.pair_bias(z, z_mask, q))
+        o = self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask))
         return self.out(s, o, g)
 
 
@@ -64,7 +64,7 @@ class MSARowAttentionWithBias(nn.Module):
         """
         q, k, v, g = self.qkvg(m).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        return self.out(m, self.attend(q, k, v, self.pair_bias(z, z_mask, q)), g)
+        return self.out(m, self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask)), g)
 
 
 class MSAColumnAttention(nn.Module):
@@ -109,8 +109,7 @@ class TriangleAttention(nn.Module):
             z = z.transpose(-2, -3)
         q, k, v, g = self.qkvg(z).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        z = self.out(z, self.attend(
-            q, k, v, self.pair_bias(z, z_mask, q)), g)
+        z = self.out(z, self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask)), g)
         return z if self.starting_node else z.transpose(-2, -3)
 
 
@@ -128,18 +127,19 @@ class DiTAttention(nn.Module):
         self.attend = SharedBiasAttention()
         self.out = LinearGateResidual(c_s)
 
-    def forward(self, x: torch.Tensor, bias: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, bias: torch.Tensor, mod: torch.Tensor, n_valid: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: [B, N, c_s]
             bias: [H, N, N] logit bias (pair bias + mask)
             mod: [B, 1, 3 * c_s] AdaLN modulation (TimeModulation)
+            n_valid: valid_length of the mask of `bias` (the padding behind it is skipped by the Triton backend), or None
 
         Returns:
             [B, N, c_s] x + update
         """
         q, k, v, gate = self.project(x, mod)
-        return self.output(x, self.attend(q, k, v, bias), gate)
+        return self.output(x, self.attend(q, k, v, bias, n_valid), gate)
 
     def project(self, x: torch.Tensor, mod: torch.Tensor):
         """Attention inputs: q, k, v [B, H, N, 32] and the output gate [B, 1, c_s]"""

@@ -10,7 +10,7 @@ PhysDock.models.kernels); anywhere else the module runs its torch path.
   RMSNormSwiGLUFFN     x + SwiGLUFFN-update(RMSNorm(x))              (the Transition of the pair, MSA, single and atom streams)
   AdaLNSwiGLUFFN       x + gate * SwiGLUFFN-update(AdaLN(x, mod))      (the transition of the DiT blocks; torch only, see its docstring)
   RMSNormLinear        RMSNorm + one linear layer (the merged q, k, v, g projection of the attentions, the q, k of the outer product mean)
-  OuterProductMean     z + the pair update from the outer product of two MSA projections (torch only so far)
+  OuterProductMean     z + the pair update from the outer product of two MSA projections
   LinearGateResidual   x + linear(o) * gate: the output projection, gate and residual of every attention
   LayerNormPairBias    the logit biases of all blocks of a DiT from the pair representation, once per structure -> [blocks, H, N, N]
   RMSNormPairBias      linear(RMSNorm(z)) + attention mask -> [H, N, N]    (norm + linear + mask of a pair bias)
@@ -30,9 +30,15 @@ import torch.nn.functional as F
 from scipy.stats import truncnorm
 
 from PhysDock.models import kernels
-from PhysDock.utils.tensor_utils import gen_attn_mask
 
 BACKENDS = ("torch", "triton")
+
+
+def valid_length(pair_mask: torch.Tensor) -> torch.Tensor:
+    """[1] int32 on the device: 1 + the last position whose diagonal entry of the [N, N] pair mask is set (0 if none) = the length of the
+    part of the sequence that holds real positions when the padding is at the end, as in the training crops; no host synchronisation"""
+    diag = pair_mask.diagonal() != 0
+    return ((torch.arange(diag.numel(), device=diag.device, dtype=torch.int32) + 1) * diag).amax().reshape(1)
 _SKIP_INIT = False
 
 
@@ -240,18 +246,25 @@ class RMSNormLinear(KernelModule):
 
 class OuterProductMean(KernelModule):
     """Pair update from the outer product q_i x k_j of two MSA projections, summed (not averaged) over rows; forward(m, z) = z + update.
-    q and k are one RMSNormLinear (c_m -> 2 * 32, split here). Torch only so far."""
+    q and k are one RMSNormLinear (c_m -> 2 * 32). Triton (kernels.outer_product_mean): the outer product exists only as a register tile; the
+    projection, RMSNorm and residual are fused with it, and the [N, N, 32, 32] tensor (and the copies of it) of torch is never formed."""
 
     def __init__(self, c_m: int, c_z: int, eps: float) -> None:
         super().__init__()
         self.qk = RMSNormLinear(c_m, 2 * 32, eps, bias_dim=2 * 32)
-        self.linear_o = Linear(32 * 32, c_z, init="final")
+        # LeCun init, not zeros: the output is RMS-normalised, so a zero projection has a backward gain of 1 / sqrt(eps) at initialisation
+        # (gradient norm of 1e7 and non-finite steps in the first hundreds of steps); with it the initial norm is 60
+        self.linear_o = Linear(32 * 32, c_z)
         self.norm_out = RMSNorm(c_z, eps)
 
     def forward(self, m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """m: [N_msa, N_token, c_m], z: [N_token, N_token, c_z] -> z + update"""
         n = m.shape[1]
-        q, k = self.qk(m).chunk(2, dim=-1)
+        qk = self.qk(m)
+        if self.backend == "triton" and kernels.outer_product_mean.can_fuse(qk, z):
+            return kernels.outer_product_mean.outer_product_mean(qk, z, self.linear_o.weight, self.linear_o.bias, self.norm_out.weight,
+                                                                 self.norm_out.eps)
+        q, k = qk.chunk(2, dim=-1)
         outer = torch.einsum("bic,bjd->ijcd", q, k).reshape(n, n, -1)
         return z + self.norm_out(self.linear_o(outer))
 
@@ -281,7 +294,11 @@ class RMSNormPairBias(KernelModule):
         if self.backend == "triton" and kernels.pair_bias.can_fuse(z, self.linear.out_features):
             return kernels.pair_bias.pair_bias(z, z_mask, self.norm.weight, self.linear.weight, self.norm.eps, self.inf,
                                                out_dtype=like.dtype, pad=z.shape[0] >= 1024)
-        return self.linear(self.norm(z)).permute(2, 0, 1) + gen_attn_mask(z_mask.type_as(like), -self.inf)[None]
+        # masked entries are overwritten, not shifted by -inf: the logits there get no gradient (with an additive mask a fully masked row has
+        # a uniform softmax and passes gradient to every masked logit, which the RMSNorm of the zero padding pairs amplifies by 1 / sqrt(eps));
+        # contiguous: sdpa gives wrong gradients for a permuted bias view
+        logits = self.linear(self.norm(z)).permute(2, 0, 1).to(like.dtype)
+        return logits.masked_fill(z_mask[None] == 0, -self.inf).contiguous()
 
 
 def merge_heads(o: torch.Tensor) -> torch.Tensor:
@@ -333,7 +350,7 @@ class LayerNormPairBias(KernelModule):
             z = zc * torch.rsqrt(zc.pow(2).mean(-1, keepdim=True) + self.eps)
         else:
             z = F.layer_norm(z, z.shape[-1:], eps=self.eps)
-        logits = self.linear(z).permute(2, 0, 1) + gen_attn_mask(z_mask, -self.inf)
+        logits = self.linear(z).permute(2, 0, 1).masked_fill(z_mask == 0, -self.inf)       # no gradient at the masked entries (see RMSNormPairBias)
         logits = logits.reshape(-1, self.heads, *z_mask.shape)
         # the padded layout only pays off in the Triton kernels; sdpa keeps the contiguous bias (torch.compile handles its alignment
         # itself and fails on the padded view)
@@ -346,12 +363,21 @@ class SharedBiasAttention(KernelModule):
     backward of kernels.shared_bias_attention (the bias tile is loaded once for the whole batch, dbias accumulated in registers; the
     TF32 inputs are rounded as cuBLAS does), 1.7-2x faster than sdpa in forward + backward in bfloat16 and 2-5x in the TF32 forward."""
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        """q, k, v: [H, N, D] or [B, H, N, D]; bias [H, N, N] -> o of the shape of q"""
+    skip_padding = False            # set by PhysDock(skip_padding=True): the Triton kernels skip the padding at the end of the sequence
+
+    def valid_length(self, pair_mask: torch.Tensor):
+        """n_valid of a pair mask for forward; None (nothing computed, the kernels compiled without the feature) unless the Triton backend
+        and skip_padding are on. Worth it only when the padding is a sizeable part and a rank does not wait for a fuller one (single GPU,
+        batched inference with padding); in data-parallel training the fullest crop of the ranks sets the speed."""
+        return valid_length(pair_mask) if self.backend == "triton" and self.skip_padding else None
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: torch.Tensor = None) -> torch.Tensor:
+        """q, k, v: [H, N, D] or [B, H, N, D]; bias [H, N, N]; n_valid: valid_length of the mask, the Triton kernels skip the padding
+        behind it (the keys there must be masked by the bias; the rows there get 0) -> o of the shape of q"""
         if self.backend == "triton":
             if q.dim() == 3:
-                return kernels.shared_bias_attention.shared_bias_attention(q[None], k[None], v[None], bias)[0]
-            return kernels.shared_bias_attention.shared_bias_attention(q, k, v, bias)
+                return kernels.shared_bias_attention.shared_bias_attention(q[None], k[None], v[None], bias, n_valid)[0]
+            return kernels.shared_bias_attention.shared_bias_attention(q, k, v, bias, n_valid)
         return F.scaled_dot_product_attention(q, k, v, bias)
 
 

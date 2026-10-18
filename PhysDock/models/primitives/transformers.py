@@ -122,7 +122,12 @@ class TriangleBlock(nn.Module):
         z = self.triangle_col_update(z, z_mask)
         z = self.triangle_row_attention(z, z_mask)
         z = self.triangle_col_attention(z, z_mask)
-        return self.pair_transition(z)
+        z = self.pair_transition(z)
+        # The pairs the mask excludes are still read downstream, so the forward keeps them, but no gradient flows into them: the template
+        # mask leaves most rows without a valid key (186 of 384 at crop 384), their softmax is over -inf logits only, and the gradient that
+        # arrives there is amplified by every block (1e3 per block, 1e35 after the stack) until the global gradient norm is inf or 1e7
+        # in a third of the steps, which clipping turns into steps in a random direction.
+        return torch.where(z_mask[..., None] != 0, z, z.detach())
 
 
 class Triangleformer(Stack):
@@ -207,8 +212,8 @@ class DiTBlock(nn.Module):
         self.attention = DiTAttention(c_s, eps)
         self.transition = AdaLNSwiGLUFFN(c_s, eps)
 
-    def forward(self, x, bias, mod):
-        x = self.attention(x, bias, mod[:, :1])
+    def forward(self, x, bias, mod, n_valid=None):
+        x = self.attention(x, bias, mod[:, :1], n_valid)
         return self.transition(x, mod[:, 1:])
 
 
@@ -224,7 +229,8 @@ def _dit_block_output(block: DiTBlock, x, o, gate, mod):
 class DiT(Stack):
     """Diffusion transformer conditioned on a timestep embedding and per-block pair biases.
 
-    x: [B, N, c_s], bias: [no_blocks, H, N, N] (self.pair_bias(z, z_mask), computed once per structure), t: [B, 256] timestep embedding -> x: [B, N, c_s]
+    x: [B, N, c_s], bias: [no_blocks, H, N, N] (self.pair_bias(z, z_mask), computed once per structure), t: [B, 256] timestep embedding,
+    n_valid: valid_length(z_mask) or None (the Triton attention skips the padding behind it) -> x: [B, N, c_s]
     (the AdaLN modulations of all blocks come from one matmul of t, TimeModulation)
 
     checkpoint "attention" (selective checkpointing, DiTBlock.forward split in three): the attention inputs / outputs
@@ -237,12 +243,12 @@ class DiT(Stack):
         self.pair_bias = LayerNormPairBias(c_z, c_s // HEAD_DIM, no_blocks, inf, eps)
         self.time_mod = TimeModulation(c_s, no_blocks)
 
-    def forward(self, x, bias, t):
+    def forward(self, x, bias, t, n_valid=None):
         for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t))):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
                 q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, mod)
-                o = block.attention.attend(q, k, v, b)
+                o = block.attention.attend(q, k, v, b, n_valid)
                 x = self.checkpointed(_dit_block_output, block, x, o, gate, mod)
             else:
-                x = self.run_block(block, x, b, mod, index=i)
+                x = self.run_block(block, x, b, mod, n_valid, index=i)
         return x

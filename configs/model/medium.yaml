@@ -10,6 +10,8 @@ num_augmentation_sample: 48     # noisy samples per structure in training
 distogram_bins: ${global.distogram_bins}
 backend: torch                  # attention, triangle update, SwiGLU feed-forwards, pair bias: torch | triton (PhysDock.models.kernels;
                                 # same matmul precision as torch: bfloat16 under autocast, TF32 for float32)
+skip_padding: false             # triton attentions skip the padding of padded crops: ~12% faster on one GPU (mean crop 80% full), nothing in
+                                # data-parallel training (the fullest crop of the ranks sets the speed)
 
 encoder:                        # MSATemplEncoder (DiffusionConditioning)
   ref_dim: 167                  # per-atom reference features (see PhysDock.data.FEATURES)

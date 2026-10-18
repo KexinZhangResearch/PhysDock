@@ -81,10 +81,11 @@ def _fwd_kernel(Z, MASK, NW, W, LB, OUT, NN, N, stride_oh, stride_oi, eps, neg,
 
 
 @triton.jit
-def _bwd_kernel(Z, NW, W, DB, DZ, PART, NN, N, sdh, sdi, sdj, eps, ntiles,
+def _bwd_kernel(Z, MASK, NW, W, DB, DZ, PART, NN, N, sdh, sdi, sdj, eps, ntiles,
                 C: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, NPROG: tl.constexpr, FMA: tl.constexpr,
                 MODE: tl.constexpr, BLOCK_P: tl.constexpr, CENTER: tl.constexpr):
-    """persistent programs over tiles of BLOCK_P positions; PART[pid] = [dW (HP x C, row-major) | dnorm_w (C) | db (HP)]"""
+    """persistent programs over tiles of BLOCK_P positions; PART[pid] = [dW (HP x C, row-major) | dnorm_w (C) | db (HP)]. The masked entries are
+    constants (-inf) and pass no gradient: db is zeroed there."""
     pid = tl.program_id(0)
     oc, oh = tl.arange(0, C), tl.arange(0, HP)
     nw = tl.load(NW + oc).to(tl.float32)
@@ -97,6 +98,7 @@ def _bwd_kernel(Z, NW, W, DB, DZ, PART, NN, N, sdh, sdi, sdj, eps, ntiles,
         pm = pos < NN
         row = pos // N
         col = pos - row * N
+        keep = (tl.load(MASK + tl.minimum(pos, NN - 1)).to(tl.float32) != 0.0).to(tl.float32)        # (clamped index: no masked load, whose select fails to compile here)
         z = tl.load(Z + pos[:, None] * C + oc[None, :], mask=pm[:, None], other=0.0).to(tl.float32)
         if CENTER:
             z = z - (tl.sum(z, 1) / C)[:, None]
@@ -106,13 +108,14 @@ def _bwd_kernel(Z, NW, W, DB, DZ, PART, NN, N, sdh, sdi, sdj, eps, ntiles,
         if FMA:
             dzn = tl.zeros([BLOCK_P, C], tl.float32)
             for h in tl.static_range(H):
-                db = tl.load(DB + h * sdh + row * sdi + col * sdj, mask=pm, other=0.0).to(tl.float32)
+                db = tl.load(DB + h * sdh + row * sdi + col * sdj, mask=pm, other=0.0).to(tl.float32) * keep
                 dzn += db[:, None] * tl.load(W + h * C + oc)[None, :]
                 acc_w += tl.where(oh == h, 1.0, 0.0)[:, None] * tl.sum(db[:, None] * zn, 0)[None, :]
                 acc_b += tl.where(oh == h, 1.0, 0.0) * tl.sum(db, 0)
         else:
             dbt = tl.load(DB + oh[:, None] * sdh + (row * sdi + col * sdj)[None, :], mask=(oh < H)[:, None] & pm[None, :],
                           other=0.0).to(tl.float32)                                                    # [HP, BLOCK_P]
+            dbt = dbt * keep[None, :]
             acc_w += mm_act(dbt, zn, MODE)                                                             # dW += db^T zn
             acc_b += tl.sum(dbt, 1)
             dzn = mm(tl.trans(dbt), w, MODE)                                                           # [BLOCK_P, C]
@@ -168,7 +171,7 @@ def _(z, mask, norm_w, lin_w, lin_b, eps, neg_inf, bf16, pad, center):
 
 
 @torch.library.custom_op("physdock::pair_bias_bwd", mutates_args=())
-def _pair_bias_bwd(db: torch.Tensor, z: torch.Tensor, norm_w: torch.Tensor, lin_w: torch.Tensor, eps: float, bf16: bool,
+def _pair_bias_bwd(db: torch.Tensor, z: torch.Tensor, mask: torch.Tensor, norm_w: torch.Tensor, lin_w: torch.Tensor, eps: float, bf16: bool,
                    center: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """db [H, N, N] (any strides) -> dz [N, N, C] (dtype of z), d norm_w [C], d lin_w [H, C], d lin_b [H] (float32)"""
     N, H, C = z.shape[0], lin_w.shape[0], z.shape[-1]
@@ -179,7 +182,7 @@ def _pair_bias_bwd(db: torch.Tensor, z: torch.Tensor, norm_w: torch.Tensor, lin_
     nprog = min(mult * num_sms(), ntiles)
     dz = torch.empty_like(z)
     part = torch.empty(nprog, hp * C + C + hp, device=z.device, dtype=torch.float32)
-    _bwd_kernel[(nprog,)](z, norm_w.contiguous(), _weight(lin_w, fma, bf16), db, dz, part, NN, N, db.stride(0), db.stride(1),
+    _bwd_kernel[(nprog,)](z, _mask_flat(mask), norm_w.contiguous(), _weight(lin_w, fma, bf16), db, dz, part, NN, N, db.stride(0), db.stride(1),
                           db.stride(2), eps, ntiles, C=C, H=H, HP=hp, NPROG=nprog, FMA=fma, MODE=MODES["bf16" if bf16 else "fp32"],
                           BLOCK_P=bp, num_warps=warps, num_stages=stages, CENTER=center)
     tot = part.sum(0)
@@ -187,20 +190,20 @@ def _pair_bias_bwd(db: torch.Tensor, z: torch.Tensor, norm_w: torch.Tensor, lin_
 
 
 @_pair_bias_bwd.register_fake
-def _(db, z, norm_w, lin_w, eps, bf16, center):
+def _(db, z, mask, norm_w, lin_w, eps, bf16, center):
     return (z.new_empty(z.shape), z.new_empty(z.shape[-1], dtype=torch.float32), z.new_empty(lin_w.shape, dtype=torch.float32),
             z.new_empty(lin_w.shape[0], dtype=torch.float32))
 
 
 def _setup_context(ctx, inputs, output):
     z, mask, norm_w, lin_w, lin_b, eps, neg_inf, bf16, pad, center = inputs
-    ctx.save_for_backward(z, norm_w, lin_w)
+    ctx.save_for_backward(z, mask, norm_w, lin_w)
     ctx.eps, ctx.bf16, ctx.center, ctx.has_b = eps, bf16, center, lin_b is not None
 
 
 def _backward(ctx, dout):
-    z, norm_w, lin_w = ctx.saved_tensors
-    dz, dnw, dw, db = _pair_bias_bwd(dout, z, norm_w, lin_w, ctx.eps, ctx.bf16, ctx.center)
+    z, mask, norm_w, lin_w = ctx.saved_tensors
+    dz, dnw, dw, db = _pair_bias_bwd(dout, z, mask, norm_w, lin_w, ctx.eps, ctx.bf16, ctx.center)
     return dz, None, dnw, dw.to(lin_w.dtype), (db.to(lin_w.dtype) if ctx.has_b else None), None, None, None, None, None
 
 
