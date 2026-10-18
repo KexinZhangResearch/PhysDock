@@ -27,13 +27,10 @@ import triton.language as tl
 from ._common import MODES, compute_dtype, matmul_mode, mm, prep_weight
 
 HEAD_DIM = 32
-# (C, mode) -> (forward: rows, output columns, warps, stages; backward kernel: the same; unused: 0)
-_CONFIGS = {}
 
 
-def _config(c: int, mode: int):
-    if (c, mode) in _CONFIGS:
-        return _CONFIGS[(c, mode)]
+def _config(c: int):
+    """(forward: rows, output columns, warps, stages; backward kernel: the same) of the width C, swept on an H20"""
     if c <= 128:
         return (128, 64, 8, 2), (64, 64, 4, 2)
     if c <= 256:
@@ -112,7 +109,7 @@ def _bwd_kernel(DY, O, G, W, B, DT, DG, DBP, DO, M, N, sdb, sdn, sob, soh, son, 
 @torch.library.custom_op("physdock::linear_gate_residual_fwd", mutates_args=())
 def _fwd(x: torch.Tensor, o: torch.Tensor, g: torch.Tensor, w: torch.Tensor, b: torch.Tensor, mode: int) -> torch.Tensor:
     B, N, C = x.shape
-    bp, bn, warps, stages = _config(C, mode)[0]
+    bp, bn, warps, stages = _config(C)[0]
     y = torch.empty_like(x)
     M = B * N
     _fwd_kernel[(triton.cdiv(M, bp),)](x, o, g, prep_weight(w, mode), b.contiguous(), y, M, N, x.stride(0), x.stride(1), o.stride(0),
@@ -132,9 +129,9 @@ def _bwd(dy: torch.Tensor, o: torch.Tensor, g: torch.Tensor, w: torch.Tensor, b:
     """dy [B, N, C] -> dg [B, N, C], do [B, H, N, 32], dW [C, C], db [C] (the last two float32)"""
     B, N, C = dy.shape
     dy = dy if dy.stride(-1) == 1 else dy.contiguous()
-    bp, bn, warps, stages = _config(C, mode)[1]
+    bp, bn, warps, stages = _config(C)[1]
     M = B * N
-    cdt = compute_dtype(mode) if mode == MODES["bf16"] else torch.float32
+    cdt = compute_dtype(mode)
     dg = torch.empty(B, N, C, device=dy.device, dtype=g.dtype)
     dt = torch.empty(B, N, C, device=dy.device, dtype=cdt)
     do = torch.empty(o.shape, device=o.device, dtype=o.dtype if mode == MODES["bf16"] else torch.float32)
@@ -156,7 +153,7 @@ def _(dy, o, g, w, b, mode):
 def _setup_context(ctx, inputs, output):
     x, o, g, w, b, mode = inputs
     ctx.save_for_backward(o, g, w, b)
-    ctx.mode, ctx.o_dtype, ctx.g_dtype = mode, o.dtype, g.dtype
+    ctx.mode, ctx.o_dtype = mode, o.dtype
 
 
 def _backward(ctx, dy):

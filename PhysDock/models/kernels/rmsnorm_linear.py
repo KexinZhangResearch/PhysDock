@@ -133,7 +133,7 @@ def _bwd(dy: torch.Tensor, x: torch.Tensor, norm_w: torch.Tensor, w: torch.Tenso
     dy = dy.reshape(M, nout)
     dy = dy if dy.stride(-1) == 1 and dy.stride(0) == nout else dy.contiguous()
     dx = torch.empty_like(x)
-    cdt = compute_dtype(mode) if mode == MODES["bf16"] else torch.float32
+    cdt = compute_dtype(mode)
     n = torch.empty(M, K, device=x.device, dtype=cdt)
     ntiles = triton.cdiv(M, bp)
     part = torch.empty(ntiles, K, device=x.device, dtype=torch.float32)

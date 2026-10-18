@@ -81,10 +81,14 @@ def set_checkpointing(model: nn.Module, modes: dict) -> None:
     for module in model.modules():
         mode = modes.get(type(module).__name__) if isinstance(module, Stack) else None
         if mode is not None:
-            module.checkpoint = {"full": True, "none": False}.get(mode, float(mode) if not isinstance(mode, str) else mode)
-            if module.checkpoint in (0.0, 1.0) and not isinstance(module.checkpoint, bool):
-                module.checkpoint = bool(module.checkpoint)
+            module.checkpoint = _checkpoint_value(mode)
 
+
+def _checkpoint_value(mode):
+    """Stack.checkpoint of a checkpointing mode: True, False, a fraction in (0, 1) or "attention" """
+    if isinstance(mode, str):
+        return {"full": True, "none": False}.get(mode, mode)
+    return bool(mode) if mode in (0, 1) else float(mode)
 
 
 class AtomBlock(nn.Module):
@@ -108,21 +112,32 @@ class AtomTransformer(Stack):
         super().__init__(AtomBlock, no_blocks, c_a, c_ap, inf, eps)
 
 
-class TriangleBlock(nn.Module):
-    def __init__(self, c_z: int, inf: float, eps: float) -> None:
-        super().__init__()
+class PairUpdate:
+    """Mixin of the blocks with the pair half of the Pairformer: two triangle multiplications, two triangle attentions and the pair
+    transition. The modules are registered on the block itself (build_pair, called where the block wants them in its parameter order)."""
+
+    def build_pair(self, c_z: int, inf: float, eps: float) -> None:
         self.triangle_row_update = TriangleMultiplication(c_z, eps, outgoing=True)
         self.triangle_col_update = TriangleMultiplication(c_z, eps, outgoing=False)
         self.triangle_row_attention = TriangleAttention(c_z, inf, eps, starting_node=True)
         self.triangle_col_attention = TriangleAttention(c_z, inf, eps, starting_node=False)
         self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
 
-    def forward(self, z, z_mask):
+    def update_pair(self, z, z_mask):
         z = self.triangle_row_update(z, z_mask)
         z = self.triangle_col_update(z, z_mask)
         z = self.triangle_row_attention(z, z_mask)
         z = self.triangle_col_attention(z, z_mask)
-        z = self.pair_transition(z)
+        return self.pair_transition(z)
+
+
+class TriangleBlock(PairUpdate, nn.Module):
+    def __init__(self, c_z: int, inf: float, eps: float) -> None:
+        super().__init__()
+        self.build_pair(c_z, inf, eps)
+
+    def forward(self, z, z_mask):
+        z = self.update_pair(z, z_mask)
         # The pairs the mask excludes are still read downstream, so the forward keeps them, but no gradient flows into them: the template
         # mask leaves most rows without a valid key (186 of 384 at crop 384), their softmax is over -inf logits only, and the gradient that
         # arrives there is amplified by every block (1e3 per block, 1e35 after the stack) until the global gradient norm is inf or 1e7
@@ -140,29 +155,20 @@ class Triangleformer(Stack):
         super().__init__(TriangleBlock, no_blocks, c_z, inf, eps)
 
 
-class EvoformerBlock(nn.Module):
+class EvoformerBlock(PairUpdate, nn.Module):
     def __init__(self, c_m: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
         self.msa_row_attention = MSARowAttentionWithBias(c_m, c_z, inf, eps)
         self.msa_col_attention = MSAColumnAttention(c_m, eps)
         self.msa_transition = RMSNormSwiGLUFFN(c_m, eps)
         self.opm = OuterProductMean(c_m, c_z, eps)
-        self.triangle_row_update = TriangleMultiplication(c_z, eps, outgoing=True)
-        self.triangle_col_update = TriangleMultiplication(c_z, eps, outgoing=False)
-        self.triangle_row_attention = TriangleAttention(c_z, inf, eps, starting_node=True)
-        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, starting_node=False)
-        self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
+        self.build_pair(c_z, inf, eps)
 
     def forward(self, m, z, z_mask):
         m = self.msa_row_attention(m, z, z_mask)
         m = self.msa_col_attention(m)
         m = self.msa_transition(m)
-        z = self.opm(m, z)
-        z = self.triangle_row_update(z, z_mask)
-        z = self.triangle_col_update(z, z_mask)
-        z = self.triangle_row_attention(z, z_mask)
-        z = self.triangle_col_attention(z, z_mask)
-        return m, self.pair_transition(z)
+        return m, self.update_pair(self.opm(m, z), z_mask)
 
 
 class Evoformer(Stack):
@@ -175,23 +181,15 @@ class Evoformer(Stack):
         super().__init__(EvoformerBlock, no_blocks, c_m, c_z, inf, eps, n_state=2)
 
 
-class PairFormerBlock(nn.Module):
+class PairFormerBlock(PairUpdate, nn.Module):
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
         super().__init__()
-        self.triangle_row_update = TriangleMultiplication(c_z, eps, outgoing=True)
-        self.triangle_col_update = TriangleMultiplication(c_z, eps, outgoing=False)
-        self.triangle_row_attention = TriangleAttention(c_z, inf, eps, starting_node=True)
-        self.triangle_col_attention = TriangleAttention(c_z, inf, eps, starting_node=False)
-        self.pair_transition = RMSNormSwiGLUFFN(c_z, eps)
+        self.build_pair(c_z, inf, eps)
         self.attention = AttentionWithBias(c_s, c_z, inf, eps)
         self.transition = RMSNormSwiGLUFFN(c_s, eps)
 
     def forward(self, s, z, z_mask):
-        z = self.triangle_row_update(z, z_mask)
-        z = self.triangle_col_update(z, z_mask)
-        z = self.triangle_row_attention(z, z_mask)
-        z = self.triangle_col_attention(z, z_mask)
-        z = self.pair_transition(z)
+        z = self.update_pair(z, z_mask)
         s = self.attention(s, z, z_mask)
         return self.transition(s), z
 
@@ -245,13 +243,13 @@ class DiT(Stack):
         self.pair_bias = LayerNormPairBias(c_z, self.heads, no_blocks, inf, eps)
         self.time_mod = TimeModulation(c_s, no_blocks)
 
-    def set_distance_decay(self, strength: float, learnable: bool, flat: bool = True) -> None:
+    def set_distance_decay(self, strength: float, learnable: bool) -> None:
         """Distance decay of the attention of every block (see SharedBiasAttention); forward then needs pos and radius."""
         for block in self.blocks:
-            block.attention.attend.set_distance_decay(self.heads, strength, learnable, flat)
+            block.attention.attend.set_distance_decay(self.heads, strength, learnable)
 
     def forward(self, x, bias, t, n_valid=None, pos=None, radius=None):
-        for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t))):
+        for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t), strict=True)):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
                 q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, mod)
                 o = block.attention.attend(q, k, v, b, n_valid, pos, radius)

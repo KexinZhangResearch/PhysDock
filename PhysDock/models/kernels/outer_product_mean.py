@@ -31,8 +31,8 @@ import triton.language as tl
 
 from ._common import MODES, compute_dtype, matmul_mode, mm, mm_act, prep_weight
 
-HEAD = tl.constexpr(32)
-_H = 32                # the same, for the Python side
+_H = 32                # channels of q and k
+HEAD = tl.constexpr(_H)
 # (forward: BI, warps, stages), (dW: BI, warps, stages, slices), (dq: BI, warps, stages), (dk: BI, warps, stages, slices), swept on an H20
 _CONFIGS = {
     MODES["bf16"]: ((64, 4, 2), (128, 8, 3, 16), (64, 4, 2), (64, 4, 2, 4)),
@@ -190,7 +190,7 @@ def _fwd(qk: torch.Tensor, z: torch.Tensor, w: torch.Tensor, b: torch.Tensor, nw
     k = qk[..., _H:]
     z = z.contiguous()
     y = torch.empty_like(z)
-    u = torch.empty(N, N, cz, device=z.device, dtype=compute_dtype(mode) if mode == MODES["bf16"] else torch.float32)
+    u = torch.empty(N, N, cz, device=z.device, dtype=compute_dtype(mode))
     _fwd_kernel[(triton.cdiv(N, bi), N)](qt, k, prep_weight(w, mode), b.contiguous(), nw.contiguous(), z, y, u, S, N, qt.stride(0), qt.stride(1),
                                          k.stride(0), k.stride(1), eps, CZ=cz, BI=bi, BS=bs, NSC=nsc, MODE=mode, num_warps=warps, num_stages=stages)
     return y, u
@@ -198,7 +198,7 @@ def _fwd(qk: torch.Tensor, z: torch.Tensor, w: torch.Tensor, b: torch.Tensor, nw
 
 @_fwd.register_fake
 def _(qk, z, w, b, nw, eps, mode):
-    return z.new_empty(z.shape), z.new_empty(z.shape, dtype=torch.bfloat16 if mode == MODES["bf16"] else torch.float32)
+    return z.new_empty(z.shape), z.new_empty(z.shape, dtype=compute_dtype(mode))
 
 
 @torch.library.custom_op("physdock::outer_product_mean_bwd", mutates_args=())
@@ -248,7 +248,7 @@ def _setup_context(ctx, inputs, output):
     ctx.eps, ctx.mode = eps, mode
 
 
-def _backward(ctx, dy, du_unused):
+def _backward(ctx, dy, _du):
     qk, u, w, nw = ctx.saved_tensors
     dqk, dnw, dw, db = _bwd(dy, qk, u, w, nw, ctx.eps, ctx.mode)
     return dqk, dy, dw.to(w.dtype), db.to(w.dtype), dnw.to(nw.dtype), None, None

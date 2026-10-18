@@ -107,9 +107,8 @@ def _launch(kernel, grid_fn, gdata, args, consts, dtypes, device):
 @triton.jit
 def _fwd_in(Z, MASK, W_IN, W, BIAS, AB, US, G, R, NN, eps,
               C: tl.constexpr, H: tl.constexpr, BF16: tl.constexpr, SAVE: tl.constexpr, BLOCK_P: tl.constexpr):
-    """_fwd_in with the whole contraction axis at once: three dots (K = C) whose outputs are [u_qx | u_kx], [u_q | u_k] and the
-    gate, so the epilogue is elementwise and needs no column slicing (the chunked version issues 20 small dots per tile and runs
-    at 41 TFLOPS in bfloat16, this one at 65). The same results up to the accumulation order."""
+    """norm + merged projection with the whole contraction axis at once: three dots (K = C) whose outputs are [u_qx | u_kx], [u_q | u_k]
+    and the gate, so the epilogue is elementwise and needs no column slicing (65 TFLOPS in bfloat16, 41 with chunked dots)."""
     pos = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     pm = pos < NN
     oc = tl.arange(0, C)
@@ -143,10 +142,9 @@ def _bwd_out(DO, T, G, W_OUT, W_Z, B_Z, DT, DU, PART, NN, eps,
              C: tl.constexpr, H: tl.constexpr, BF16: tl.constexpr, NPROG: tl.constexpr,
              PWZ: tl.constexpr, PBZ: tl.constexpr, PWO: tl.constexpr, PBG: tl.constexpr, PSTRIDE: tl.constexpr,
              BLOCK_P: tl.constexpr):
-    """_bwd_out with the whole C output channels at once (contiguous 256 B stores of the gate gradient, one dot per product)
-    and, in bfloat16, the column sums of dy and dgate as ones-dots instead of cross-thread reductions (they cost a third of the
-    chunked kernel). The sums are over the bfloat16-rounded gradients, as torch's autocast bias gradients are; in float32 the
-    sums are over the float32 values. 0.158 ms instead of 0.256 ms at 384 tokens."""
+    """Output side of the backward with the whole C output channels at once (contiguous 256 B stores of the gate gradient, one dot per
+    product) and, in bfloat16, the column sums of dy and dgate as ones-dots instead of cross-thread reductions. The sums are over the
+    bfloat16-rounded gradients, as torch's autocast bias gradients are; in float32 over the float32 values."""
     pid = tl.program_id(0)
     ntiles = tl.cdiv(NN, BLOCK_P)
     oh, oc = tl.arange(0, H), tl.arange(0, C)
@@ -297,8 +295,7 @@ def _bwd_du(MASK, DAB, US, DU, PART, NN,
 
 @triton.jit
 def _bwd_norm(DZ, Z, R, DZN, W_IN, ZN, PART, NN,
-              C: tl.constexpr, BF16: tl.constexpr, NPROG: tl.constexpr, PWI: tl.constexpr, PSTRIDE: tl.constexpr,
-              H: tl.constexpr, BLOCK_P: tl.constexpr):
+              C: tl.constexpr, BF16: tl.constexpr, NPROG: tl.constexpr, PWI: tl.constexpr, PSTRIDE: tl.constexpr, BLOCK_P: tl.constexpr):
     """RMSNorm backward of the input norm: dz from dzn [NN, C] (the product of the gradient du with linear_in's weight),
     the normalised input -> ZN for the weight-gradient GEMM, partial sums of dw_in."""
     pid = tl.program_id(0)
@@ -408,7 +405,7 @@ def _bwd_impl(do: torch.Tensor, z: torch.Tensor, mask: torch.Tensor, w_in: torch
     dz = torch.empty_like(z)
     zn = torch.empty(NN, C, device=dev, dtype=cdt)
     _launch(_bwd_norm, _grid_fixed, (nprog, NN), (dz, z, r, dzn, w_in, zn, part, NN),
-            dict(C=C, BF16=bf16, NPROG=nprog, PWI=lay["wi"][0], PSTRIDE=pstride, H=H), (z.dtype, cdt), dev.index)
+            dict(C=C, BF16=bf16, NPROG=nprog, PWI=lay["wi"][0], PSTRIDE=pstride), (z.dtype, cdt), dev.index)
     return dz, part.sum(0), (du.t() @ zn).float()
 
 
@@ -462,7 +459,7 @@ def _setup_context(ctx, inputs, output):
     ctx.save_for_backward(*inputs[:8], *output[1:])
 
 
-def _backward(ctx, do, *unused):
+def _backward(ctx, do, *_):
     saved = ctx.saved_tensors                   # unpack once: a non-reentrant checkpoint forbids unpacking twice
     dz, small, mats = _tu_bwd(do, *saved, ctx.eps, ctx.outgoing, ctx.precision)
     return (dz, *_unpack_grads(saved, small, mats), None, None, None)

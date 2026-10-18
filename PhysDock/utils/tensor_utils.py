@@ -18,12 +18,10 @@ def pair_mask(mask: torch.Tensor) -> torch.Tensor:
     return mask[..., None, :] * mask[..., :, None]
 
 
-def segment_mean_pool(x: torch.Tensor, segment_sizes: torch.Tensor, eps: float = 1e-3,
-                      method: str = "segment_reduce") -> torch.Tensor:
+def segment_mean_pool(x: torch.Tensor, segment_sizes: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
     """Mean of consecutive rows per segment: sum(rows) / (size + eps); rows after the last segment are ignored.
 
-    The eps is part of the trained model. method "segment_reduce" sums every segment on its own (exact, default);
-    "cumsum" is the original running-sum version (cancellation error grows with N), kept to reproduce old results.
+    The eps is part of the trained model. Every segment is summed on its own (exact: a running sum has a cancellation error that grows with N).
 
     Args:
         x: [..., N, C]
@@ -36,11 +34,6 @@ def segment_mean_pool(x: torch.Tensor, segment_sizes: torch.Tensor, eps: float =
         raise ValueError(f"need x [..., N, C] and segment_sizes [S], got {tuple(x.shape)} and {tuple(segment_sizes.shape)}")
     sizes = segment_sizes.to(device=x.device, dtype=torch.long)
     denom = (sizes[:, None] + eps).to(x.dtype if x.dtype.is_floating_point else torch.float32)
-    if method == "cumsum":
-        value = torch.cumsum(x, dim=-2)[..., torch.cumsum(sizes, dim=-1) - 1, :]
-        return torch.cat([value[..., 0:1, :], torch.diff(value, dim=-2)], dim=-2) / denom
-    if method != "segment_reduce":
-        raise ValueError(f"unknown method {method!r}, expected 'segment_reduce' or 'cumsum'")
     n_rows, n_seg = x.shape[-2], sizes.shape[0]
     # segment_reduce needs lengths that add up to N: the padding rows form a last segment that is dropped
     lengths = torch.cat([sizes, (n_rows - sizes.sum()).reshape(1)])
@@ -135,14 +128,6 @@ def centre_random_augmentation(x: torch.Tensor, atom_mask: torch.Tensor, s: floa
 # ======================================================================================
 # masks, distograms, alignment
 # ======================================================================================
-def gen_attn_mask(mask: torch.Tensor, neg_inf: float) -> torch.Tensor:
-    """0 where mask is 1, neg_inf where mask is 0 (additive attention bias)."""
-    assert neg_inf < -1e4
-    attn_mask = torch.zeros_like(mask)
-    attn_mask[mask == 0] = neg_inf
-    return attn_mask
-
-
 def dgram_from_positions(pos: torch.Tensor, min_bin: float = 3.25, max_bin: float = 50.75, no_bins: int = 39,
                          inf: float = 1e8) -> torch.Tensor:
     """pos: [..., N, 3] -> one-hot distance bins [..., N, N, no_bins]"""

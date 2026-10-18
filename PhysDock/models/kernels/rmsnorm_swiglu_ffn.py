@@ -58,7 +58,7 @@ def can_fuse(x: torch.Tensor, hidden: int) -> bool:
 
 @triton.jit
 def _fwd_kernel(X, NW, W13, W2, Y, M, eps,
-                C: tl.constexpr, HID: tl.constexpr, HC: tl.constexpr, RES: tl.constexpr, MODE: tl.constexpr, BLOCK_P: tl.constexpr):
+                C: tl.constexpr, HID: tl.constexpr, HC: tl.constexpr, MODE: tl.constexpr, BLOCK_P: tl.constexpr):
     pos = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     pm = pos < M
     oc, ohc = tl.arange(0, C), tl.arange(0, HC)
@@ -72,15 +72,12 @@ def _fwd_kernel(X, NW, W13, W2, Y, M, eps,
         h1 = mm(n, w1, MODE)
         h3 = mm(n, w3, MODE)
         acc = acc + mm(h1 * tl.sigmoid(h1) * h3, w2, MODE)
-    if RES:
-        acc = acc + x
-    tl.store(Y + pos[:, None] * C + oc[None, :], acc.to(Y.dtype.element_ty), mask=pm[:, None])
+    tl.store(Y + pos[:, None] * C + oc[None, :], (acc + x).to(Y.dtype.element_ty), mask=pm[:, None])
 
 
 @triton.jit
 def _bwd_kernel(X, DY, NW, W13, W2, DX, DH, S, NO, DYC, DNW, M, eps,
-                C: tl.constexpr, HID: tl.constexpr, HC: tl.constexpr, RES: tl.constexpr, MODE: tl.constexpr, STORE_DY: tl.constexpr,
-                BLOCK_P: tl.constexpr):
+                C: tl.constexpr, HID: tl.constexpr, HC: tl.constexpr, MODE: tl.constexpr, STORE_DY: tl.constexpr, BLOCK_P: tl.constexpr):
     """one program per tile of rows; writes dX, the hidden gradients DH [M, 2 HID] = [dh1 | dh3], S [M, HID] = silu(h1) * h3, the
     normalised input NO [M, C] and dy in the matmul dtype DYC (STORE_DY, if dy is not in it already): the operands of the
     weight-gradient matmuls; and the tile's partial gradient of the norm weight"""
@@ -115,32 +112,30 @@ def _bwd_kernel(X, DY, NW, W13, W2, DX, DH, S, NO, DYC, DNW, M, eps,
     if STORE_DY:
         tl.store(DYC + pos[:, None] * C + oc[None, :], dy.to(cdt), mask=pm[:, None])
     gw = dn * nw[None, :]
-    dx = r[:, None] * (gw - nhat * (tl.sum(gw * nhat, 1) / C)[:, None])
-    if RES:
-        dx = dx + dy
+    dx = r[:, None] * (gw - nhat * (tl.sum(gw * nhat, 1) / C)[:, None]) + dy
     tl.store(DX + pos[:, None] * C + oc[None, :], dx.to(DX.dtype.element_ty), mask=pm[:, None])
     tl.store(DNW + tile * C + oc, tl.sum(tl.where(pm[:, None], dn * nhat, 0.0), 0))
 
 
 @torch.library.custom_op("physdock::rmsnorm_swiglu_ffn_fwd", mutates_args=())
-def _ffn_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float, residual: bool, mode: int) -> torch.Tensor:
+def _ffn_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float, mode: int) -> torch.Tensor:
     C, hid = x.shape[-1], w2.shape[1]
     bp, hc, warps, stages = _CONFIGS[(C, hid, mode)][0]
     x = x.contiguous()
     M = x.numel() // C
     y = torch.empty_like(x)
     _fwd_kernel[(triton.cdiv(M, bp),)](x, norm_w.contiguous(), prep_weight(w13, mode), prep_weight(w2, mode), y, M, eps, C=C, HID=hid, HC=hc,
-                                       RES=residual, MODE=mode, BLOCK_P=bp, num_warps=warps, num_stages=stages)
+                                       MODE=mode, BLOCK_P=bp, num_warps=warps, num_stages=stages)
     return y
 
 
 @_ffn_fwd.register_fake
-def _(x, norm_w, w13, w2, eps, residual, mode):
+def _(x, norm_w, w13, w2, eps, mode):
     return x.new_empty(x.shape)
 
 
 @torch.library.custom_op("physdock::rmsnorm_swiglu_ffn_bwd", mutates_args=())
-def _ffn_bwd(dy: torch.Tensor, x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float, residual: bool,
+def _ffn_bwd(dy: torch.Tensor, x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float,
              mode: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     C, hid = x.shape[-1], w2.shape[1]
     bp, hc, warps, stages = _CONFIGS[(C, hid, mode)][1]
@@ -156,36 +151,35 @@ def _ffn_bwd(dy: torch.Tensor, x: torch.Tensor, norm_w: torch.Tensor, w13: torch
     ntiles = triton.cdiv(M, bp)
     dnw = torch.empty(ntiles, C, device=x.device, dtype=torch.float32)
     _bwd_kernel[(ntiles,)](x, dy, norm_w.contiguous(), prep_weight(w13, mode), prep_weight(w2, mode), dx, dh, s, n, dyc, dnw, M, eps,
-                           C=C, HID=hid, HC=hc, RES=residual, MODE=mode, STORE_DY=store_dy, BLOCK_P=bp, num_warps=warps, num_stages=stages)
+                           C=C, HID=hid, HC=hc, MODE=mode, STORE_DY=store_dy, BLOCK_P=bp, num_warps=warps, num_stages=stages)
     dw13 = (dh.t() @ n).float()                 # [2 HID, C]: contraction over the M rows (cuBLAS)
     dw2 = (dyc.t() @ s).float()
     return dx, dnw.sum(0), dw13, dw2
 
 
 @_ffn_bwd.register_fake
-def _(dy, x, norm_w, w13, w2, eps, residual, mode):
+def _(dy, x, norm_w, w13, w2, eps, mode):
     return x.new_empty(x.shape), x.new_empty(norm_w.shape, dtype=torch.float32), x.new_empty(w13.shape, dtype=torch.float32), \
         x.new_empty(w2.shape, dtype=torch.float32)
 
 
 def _setup_context(ctx, inputs, output):
-    x, norm_w, w13, w2, eps, residual, mode = inputs
+    x, norm_w, w13, w2, eps, mode = inputs
     ctx.save_for_backward(x, norm_w, w13, w2)
-    ctx.conf = (eps, residual, mode)
+    ctx.conf = (eps, mode)
 
 
 def _backward(ctx, dy):
     x, norm_w, w13, w2 = ctx.saved_tensors
     dx, dnw, dw13, dw2 = _ffn_bwd(dy, x, norm_w, w13, w2, *ctx.conf)
-    return dx, dnw.to(norm_w.dtype), dw13.to(w13.dtype), dw2.to(w2.dtype), None, None, None
+    return dx, dnw.to(norm_w.dtype), dw13.to(w13.dtype), dw2.to(w2.dtype), None, None
 
 
 _ffn_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
-def rmsnorm_swiglu_ffn(x: torch.Tensor, norm_weight: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float,
-                       residual: bool = True) -> torch.Tensor:
-    """x + w2(silu(w1 n) * (w3 n)) with n = RMSNorm(x) (without the leading x if residual is False); differentiable with respect to
+def rmsnorm_swiglu_ffn(x: torch.Tensor, norm_weight: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float) -> torch.Tensor:
+    """x + w2(silu(w1 n) * (w3 n)) with n = RMSNorm(x); differentiable with respect to
     x, norm_weight, w13 and w2. The matmul precision follows torch's (see kernels/_common.py).
 
     Args:
@@ -196,7 +190,7 @@ def rmsnorm_swiglu_ffn(x: torch.Tensor, norm_weight: torch.Tensor, w13: torch.Te
     Returns:
         [..., C] in the dtype of x
     """
-    return _ffn_fwd(x, norm_weight, w13, w2, eps, residual, matmul_mode())
+    return _ffn_fwd(x, norm_weight, w13, w2, eps, matmul_mode())
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -243,7 +237,7 @@ def _act_bwd_kernel(H, DS, S, DH, M, HID: tl.constexpr, BLOCK_M: tl.constexpr, B
 
 
 @triton.jit
-def _norm_bwd_kernel(X, DN, DY, NW, DX, DNW, M, eps, C: tl.constexpr, RES: tl.constexpr, BLOCK_M: tl.constexpr):
+def _norm_bwd_kernel(X, DN, DY, NW, DX, DNW, M, eps, C: tl.constexpr, BLOCK_M: tl.constexpr):
     tile = tl.program_id(0)
     pos = tile * BLOCK_M + tl.arange(0, BLOCK_M)
     pm = pos < M
@@ -255,9 +249,7 @@ def _norm_bwd_kernel(X, DN, DY, NW, DX, DNW, M, eps, C: tl.constexpr, RES: tl.co
     r = tl.math.rsqrt(tl.sum(x * x, 1) / C + eps)
     nhat = x * r[:, None]
     gw = dn * nw[None, :]
-    dx = r[:, None] * (gw - nhat * (tl.sum(gw * nhat, 1) / C)[:, None])
-    if RES:
-        dx = dx + tl.load(DY + off, mask=pm[:, None], other=0.0).to(tl.float32)
+    dx = r[:, None] * (gw - nhat * (tl.sum(gw * nhat, 1) / C)[:, None]) + tl.load(DY + off, mask=pm[:, None], other=0.0).to(tl.float32)
     tl.store(DX + off, dx.to(DX.dtype.element_ty), mask=pm[:, None])
     tl.store(DNW + tile * C + oc, tl.sum(tl.where(pm[:, None], dn * nhat, 0.0), 0))
 
@@ -274,8 +266,8 @@ def can_split(x: torch.Tensor, hidden: int) -> bool:
 
 
 @torch.library.custom_op("physdock::rmsnorm_swiglu_ffn_split_fwd", mutates_args=())
-def _split_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float,
-               residual: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _split_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float
+               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """-> y [..., C] (dtype of x), n [M, C] and h [M, 2 HID] (bfloat16, kept for the backward)"""
     C, hid = x.shape[-1], w2.shape[1]
     x = x.contiguous()
@@ -286,19 +278,18 @@ def _split_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: tor
     s = torch.empty(M, hid, device=x.device, dtype=torch.bfloat16)
     _act_fwd_kernel[(triton.cdiv(M, 16), triton.cdiv(hid, 128))](h, s, M, HID=hid, BLOCK_M=16, BLOCK_H=128, num_warps=4)
     o = torch.mm(s, w2.to(torch.bfloat16).t())
-    y = (x.view(M, C) + o) if residual else o.float()
-    return y.view(x.shape), n, h
+    return (x.view(M, C) + o).view(x.shape), n, h
 
 
 @_split_fwd.register_fake
-def _(x, norm_w, w13, w2, eps, residual):
+def _(x, norm_w, w13, w2, eps):
     M = x.numel() // x.shape[-1]
     return x.new_empty(x.shape), x.new_empty(M, x.shape[-1], dtype=torch.bfloat16), x.new_empty(M, w13.shape[0], dtype=torch.bfloat16)
 
 
 @torch.library.custom_op("physdock::rmsnorm_swiglu_ffn_split_bwd", mutates_args=())
 def _split_bwd(dy: torch.Tensor, x: torch.Tensor, n: torch.Tensor, h: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
-               eps: float, residual: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+               eps: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     C, hid = x.shape[-1], w2.shape[1]
     x = x.contiguous()
     M = x.numel() // C
@@ -314,33 +305,32 @@ def _split_bwd(dy: torch.Tensor, x: torch.Tensor, n: torch.Tensor, h: torch.Tens
     ntiles = triton.cdiv(M, SPLIT_BLOCK_M)
     dx = torch.empty_like(x)
     dnw = torch.empty(ntiles, C, device=x.device, dtype=torch.float32)
-    _norm_bwd_kernel[(ntiles,)](x, dn, dy, norm_w.contiguous(), dx, dnw, M, eps, C=C, RES=residual, BLOCK_M=SPLIT_BLOCK_M, num_warps=4)
+    _norm_bwd_kernel[(ntiles,)](x, dn, dy, norm_w.contiguous(), dx, dnw, M, eps, C=C, BLOCK_M=SPLIT_BLOCK_M, num_warps=4)
     return dx, dnw.sum(0), dw13, dw2
 
 
 @_split_bwd.register_fake
-def _(dy, x, n, h, norm_w, w13, w2, eps, residual):
+def _(dy, x, n, h, norm_w, w13, w2, eps):
     return x.new_empty(x.shape), x.new_empty(norm_w.shape, dtype=torch.float32), x.new_empty(w13.shape, dtype=torch.float32), \
         x.new_empty(w2.shape, dtype=torch.float32)
 
 
 def _split_setup_context(ctx, inputs, output):
-    x, norm_w, w13, w2, eps, residual = inputs
-    y, n, h = output
+    x, norm_w, w13, w2, eps = inputs
+    _, n, h = output
     ctx.save_for_backward(x, n, h, norm_w, w13, w2)
-    ctx.conf = (eps, residual)
+    ctx.eps = eps
 
 
-def _split_backward(ctx, dy, dn, dh):
+def _split_backward(ctx, dy, _dn, _dh):
     x, n, h, norm_w, w13, w2 = ctx.saved_tensors
-    dx, dnw, dw13, dw2 = _split_bwd(dy, x, n, h, norm_w, w13, w2, *ctx.conf)
-    return dx, dnw.to(norm_w.dtype), dw13.to(w13.dtype), dw2.to(w2.dtype), None, None
+    dx, dnw, dw13, dw2 = _split_bwd(dy, x, n, h, norm_w, w13, w2, ctx.eps)
+    return dx, dnw.to(norm_w.dtype), dw13.to(w13.dtype), dw2.to(w2.dtype), None
 
 
 _split_fwd.register_autograd(_split_backward, setup_context=_split_setup_context)
 
 
-def rmsnorm_swiglu_ffn_split(x: torch.Tensor, norm_weight: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float,
-                             residual: bool = True) -> torch.Tensor:
+def rmsnorm_swiglu_ffn_split(x: torch.Tensor, norm_weight: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, eps: float) -> torch.Tensor:
     """The same function as rmsnorm_swiglu_ffn (bfloat16 matmuls only), with cuBLAS matmuls and Triton elementwise passes; see above."""
-    return _split_fwd(x, norm_weight, w13, w2, eps, residual)[0]
+    return _split_fwd(x, norm_weight, w13, w2, eps)[0]

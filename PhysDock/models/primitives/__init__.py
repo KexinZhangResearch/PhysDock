@@ -32,13 +32,6 @@ from scipy.stats import truncnorm
 from PhysDock.models import kernels
 
 BACKENDS = ("torch", "triton")
-
-
-def valid_length(pair_mask: torch.Tensor) -> torch.Tensor:
-    """[1] int32 on the device: 1 + the last position whose diagonal entry of the [N, N] pair mask is set (0 if none) = the length of the
-    part of the sequence that holds real positions when the padding is at the end, as in the training crops; no host synchronisation"""
-    diag = pair_mask.diagonal() != 0
-    return ((torch.arange(diag.numel(), device=diag.device, dtype=torch.int32) + 1) * diag).amax().reshape(1)
 _SKIP_INIT = False
 
 
@@ -196,11 +189,8 @@ class RMSNormSwiGLUFFN(KernelModule):
 
 class AdaLNSwiGLUFFN(nn.Module):
     """Gated residual SwiGLU feed-forward behind an adaptive LayerNorm: forward(x, mod) = x + gate * SwiGLUFFN.update(AdaLN(x, mod)) (the
-    transition of the DiT blocks). Torch only: a fused kernel pair (norm, both stages, the gate and the gradients of scale, shift and
-    gate in one) was written and measured on an H20 for the atom DiT transition (3072 atoms, TF32, the decoder's precision): the
-    forward is 1.1x faster, the backward 2x slower than torch (the recomputation adds three TF32 matmuls, which are slower in Triton
-    than in cuBLAS, and 71% of torch's time is cuBLAS already: at most ~1 ms per block is left to fuse), so it was removed (git history:
-    kernels/adaln_swiglu_ffn.py)."""
+    transition of the DiT blocks). Torch only: a fused kernel was 1.1x faster forward and 2x slower backward at the decoder's TF32
+    precision, where cuBLAS is already 71% of the time (git history: kernels/adaln_swiglu_ffn.py)."""
 
     def __init__(self, dim: int, eps: float) -> None:
         super().__init__()
@@ -301,6 +291,13 @@ class RMSNormPairBias(KernelModule):
         return logits.masked_fill(z_mask[None] == 0, -self.inf).contiguous()
 
 
+def valid_length(pair_mask: torch.Tensor) -> torch.Tensor:
+    """[1] int32 on the device: 1 + the last position whose diagonal entry of the [N, N] pair mask is set (0 if none) = the length of the
+    part of the sequence that holds real positions when the padding is at the end, as in the training crops; no host synchronisation"""
+    diag = pair_mask.diagonal() != 0
+    return ((torch.arange(diag.numel(), device=diag.device, dtype=torch.int32) + 1) * diag).amax().reshape(1)
+
+
 def merge_heads(o: torch.Tensor) -> torch.Tensor:
     """[..., H, N, D] -> [..., N, H * D]"""
     o = o.transpose(-2, -3)
@@ -363,18 +360,16 @@ class SharedBiasAttention(KernelModule):
     backward of kernels.shared_bias_attention (the bias tile is loaded once for the whole batch, dbias accumulated in registers; the
     TF32 inputs are rounded as cuBLAS does), 1.7-2x faster than sdpa in forward + backward in bfloat16 and 2-5x in the TF32 forward.
 
-    decay (set by the DiT it belongs to, see set_distance_decay) multiplies the attention of distant atoms by a switching factor, the way a
-    force field cuts off an interaction: the score of a pair loses lambda[h] * w * softplus((d / r - 1) / w), with d the distance of the two
-    atoms in the coordinates the caller passes and r the radius of kernels.shared_bias_attention.radius_for_noise (12 A, lambda 10: factor
-    0.49 at 10 A, 0.25 at 12 A, 0.09 at 14 A). `learnable` makes lambda a parameter per head (softplus-parameterised, so it stays positive);
+    The distance decay (set by the DiT it belongs to, see set_distance_decay) multiplies the attention of distant atoms by a factor, the way
+    a force field cuts off an interaction: the score of a pair loses lambda[h] * max(d / r - 1, 0)^2, with d the distance of the two atoms in
+    the coordinates the caller passes and r the radius of kernels.shared_bias_attention.radius_for_noise (12 A, lambda 10: factor 1 inside,
+    0.94 at 13 A, 0.75 at 14 A, 0.54 at 15 A). `learnable` makes lambda a parameter per head (softplus-parameterised, so it stays positive);
     otherwise it is a buffer. No parameters at all when the decay is off."""
 
-    decay_width = 0.2                # width of the softplus switch, in units of the radius
-    decay_flat = False               # flat-bottom switch (nothing inside the radius, cheaper) instead of the softplus one
+    skip_padding = False            # set by PhysDock(skip_padding=True): the Triton kernels skip the padding at the end of the sequence
 
-    def set_distance_decay(self, heads: int, strength: float, learnable: bool, flat: bool = True) -> None:
+    def set_distance_decay(self, heads: int, strength: float, learnable: bool) -> None:
         """Add the per-head strength of the distance decay (lambda = softplus(raw), raw chosen so that lambda = strength)."""
-        self.decay_flat = flat
         self._decay_raw_value = math.log(math.expm1(max(strength, 1e-4)))
         raw = torch.full((heads,), self._decay_raw_value)
         if learnable:
@@ -393,8 +388,6 @@ class SharedBiasAttention(KernelModule):
         raw = getattr(self, "decay_raw", None)
         return None if raw is None else F.softplus(raw)
 
-    skip_padding = False            # set by PhysDock(skip_padding=True): the Triton kernels skip the padding at the end of the sequence
-
     def valid_length(self, pair_mask: torch.Tensor):
         """n_valid of a pair mask for forward; None (nothing computed, the kernels compiled without the feature) unless the Triton backend
         and skip_padding are on. Worth it only when the padding is a sizeable part and a rank does not wait for a fuller one (single GPU,
@@ -412,13 +405,12 @@ class SharedBiasAttention(KernelModule):
         if self.backend == "triton":
             sba = kernels.shared_bias_attention.shared_bias_attention
             if q.dim() == 3:
-                return sba(q[None], k[None], v[None], bias, n_valid, pos, radius, lam, self.decay_width, self.decay_flat)[0]
-            return sba(q, k, v, bias, n_valid, pos, radius, lam, self.decay_width, self.decay_flat)
+                return sba(q[None], k[None], v[None], bias, n_valid, pos, radius, lam)[0]
+            return sba(q, k, v, bias, n_valid, pos, radius, lam)
         if lam is not None:                                              # torch backend: the same function from a dense decay
-            d = torch.cdist(pos.detach().float(), pos.detach().float()) / radius.detach().float().reshape(-1, 1, 1)
-            w = self.decay_width
-            sw = torch.relu(d - 1.0) ** 2 if self.decay_flat else w * F.softplus((d - 1.0) / w)
-            bias = bias[None] - lam.reshape(1, -1, 1, 1) * sw[:, None]
+            pos = pos.detach().float()
+            d = torch.cdist(pos, pos) / radius.detach().float().reshape(-1, 1, 1)
+            bias = bias[None] - lam.reshape(1, -1, 1, 1) * torch.relu(d - 1.0).square()[:, None]
         return F.scaled_dot_product_attention(q, k, v, bias)
 
 

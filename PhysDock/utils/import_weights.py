@@ -64,8 +64,3 @@ def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = Tru
         torch.cuda.synchronize(device)
     return model.eval() if eval_mode else model.train()
 
-
-def import_unicore_ckpt(model: torch.nn.Module, ckpt_path, load_ema_state: bool = True, remove_compile_prefix: bool = False):
-    """Load a Uni-Core checkpoint into an existing model (strict); "_orig_mod." prefixes are always removed."""
-    model.load_state_dict(load_checkpoint_state_dict(ckpt_path, mmap=False, use_ema=load_ema_state))
-    print("Weights loaded")

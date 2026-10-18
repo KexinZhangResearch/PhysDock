@@ -1,53 +1,20 @@
-import copy
-import sys
-import torch
+"""Sidechain relaxation of a predicted complex with OpenMM (needs openmm, openmmforcefields, pdbfixer, openff and mdtraj; imported lazily
+by the inference scripts)."""
 import os
-import tqdm
-import pandas as pd
-import argparse
+import sys
 
-sys.path.append("../")
-from PhysDock.utils.io_utils import run_pool_tasks, load_txt, dump_txt
-from pathlib import Path
+import mdtraj
+import openmm as mm
 import openmm.app as mm_app
 import openmm.unit as mm_unit
-import openmm as mm
-import os.path
-import sys
-import mdtraj
-from openmm.app import PDBFile, Modeller
 import pdbfixer
-from openmmforcefields.generators import SystemGenerator
 from openff.toolkit import Molecule
-from openff.toolkit.utils.exceptions import UndefinedStereochemistryError, RadicalsNotSupportedError
+from openff.toolkit.utils.exceptions import RadicalsNotSupportedError, UndefinedStereochemistryError
 from openmm import CustomExternalForce
-from posebusters import PoseBusters
-from posebusters.posebusters import _dataframe_from_output
-from posebusters.cli import _select_mode, _format_results
+from openmm.app import Modeller
+from openmmforcefields.generators import SystemGenerator
 
-
-def get_bust_results(  # noqa: PLR0913
-        mol_pred,
-        mol_true,
-        mol_cond,
-        top_n: int | None = None,
-):
-    mol_pred = [Path(mol_pred)]
-    mol_true = Path(mol_true)
-    mol_cond = Path(mol_cond)  # Each bust running has different receptor
-
-    # run on single input
-    d = {k for k, v in dict(mol_pred=mol_pred, mol_true=mol_true, mol_cond=mol_cond).items() if v}
-    mode = _select_mode(None, d)
-    posebusters = PoseBusters(mode, top_n=top_n)
-    cols = ["mol_pred", "mol_true", "mol_cond"]
-    posebusters.file_paths = pd.DataFrame([[mol_pred, mol_true, mol_cond] for mol_pred in mol_pred], columns=cols)
-    posebusters_results = posebusters._run()
-    results = None
-    for i, results_dict in enumerate(posebusters_results):
-        results = _dataframe_from_output(results_dict, posebusters.config, full_report=True)
-        break
-    return results
+from PhysDock.utils.io_utils import dump_txt, load_txt
 
 
 def fix_pdb(pdbname, outdir, file_name):
@@ -59,12 +26,6 @@ def fix_pdb(pdbname, outdir, file_name):
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(7.0)
-    # 根据文件名判断是否写入指定目录
-    # if "relaxed_complex" in file_name:
-    #     target_path = f'{outdir}/{file_name}_hydrogen_added.pdb'
-    # else:
-    #     target_path = f'{file_name}_hydrogen_added.pdb'
-    # mm_app.PDBFile.writeFile(fixer.topology, fixer.positions, open(target_path, 'w'))
     return fixer.topology, fixer.positions
 
 

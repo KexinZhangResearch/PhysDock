@@ -24,19 +24,17 @@ rows from n_valid on are not computed (output 0, no gradient). The training crop
 60% real atom pairs and 74% real token pairs at crop 384 / 3072 atoms), and the score tiles of the padding are skipped in the forward
 and the backward.
 
-Distance decay (decay_* arguments, off by default): a physics-style switching factor on the attention of distant atoms, for the atom DiTs.
-With positions pos [B, N, 3] and a per-sample radius r [B] the score of a pair becomes
+Distance decay (the pos / radius / lam arguments, off by default): a flat-bottom restraint on the attention of distant atoms, for the atom
+DiTs. With positions pos [B, N, 3], a per-sample radius r [B] and a strength lam [H] the score of a pair becomes
 
-    s[i, j] -= lambda[h] * w * softplus((|pos_i - pos_j| / r[b] - 1) / w)        (w = decay_width)
+    s[i, j] -= lam[h] * max(|pos_i - pos_j| / r[b] - 1, 0)^2
 
-i.e. the attention weight is multiplied by a factor that is ~1 well inside r and decays beyond it (a Boltzmann factor in log space;
-12 A radius, lambda 10: 0.49 at 10 A, 0.25 at 12 A, 0.09 at 14 A). The caller passes r in the units of pos; for the preconditioned
-input of the decoder, x_in = (x + t e) / sqrt(1 + t^2), a true radius r_A corresponds to
+i.e. the attention weight is multiplied by exp(-lam * excess^2): exactly 1 inside r, falling quadratically beyond it, like the flat-bottom
+restraint of a force field (12 A radius, lam 10: 0.94 at 13 A, 0.75 at 14 A, 0.54 at 15 A; no exponential in the kernel). The caller passes r
+in the units of pos; for the preconditioned input of the decoder, x_in = (x + t e) / sqrt(1 + t^2), a true radius r_A corresponds to
 r[b]^2 = ((r_A / sigma_data)^2 + 6 t_b^2) / (1 + t_b^2), which keeps the factor meaningful at every noise level and switches the decay
-off by itself at high noise (every pair then has the same distance, so the factor is a constant the softmax ignores).
-lambda is [H] (its gradient is returned: a learnable strength per head) or a scalar broadcast over the heads (fixed strength).
-decay_flat picks max(d/r - 1, 0)^2 instead of the softplus: nothing changes inside the radius and the penalty grows quadratically outside it
-(the flat-bottom restraint of a force field; no exponential, so the kernel is cheaper). The positions receive no gradient.
+off by itself at high noise (every pair then has the same distance, so the factor is a constant the softmax ignores). The gradient of
+lam is returned (a learnable strength per head); the positions receive none.
 
 The kernels run behind torch.library custom ops (opaque for torch.compile, with fake implementations).
 """
@@ -51,50 +49,31 @@ from ._common import num_sms, round_tf32_ as _round_tf32
 _MAX_SPLIT = 8
 
 
-def _programs(B: int, H: int, N: int) -> int:
-    """number of 64-row query tiles of the forward: the tile size that is best depends on how full the GPU is"""
-    return B * triton.cdiv(N, 64) * H
-
-
-def _fwd_config(B: int, H: int, N: int, bf16: bool, decay: bool = False):
+def _fwd_config(B: int, H: int, N: int, bf16: bool, decay: bool):
     """(BLOCK_M, BLOCK_N, num_warps, num_stages) of the forward, fixed (no autotuning pass: it costs minutes of compilation
     per shape). Found by sweeping all configurations on an H20 (sm_90) at the shapes of the model (DiT atoms / tokens,
     triangle attention): with a head dim of 32 the score tile dominates the registers, so small tiles with few warps win
     when there are few programs (32 x 16 with 2 warps is 1.5x faster than 64 x 64 with 4), bigger ones when the GPU is
-    full anyway."""
-    if decay:                   # the distance in the inner loop needs the registers the wider warps used: fewer warps, same tiles
+    full anyway. The distance of the decay needs the registers of the wider warps: fewer warps, same tiles."""
+    if decay:
         return (64, 32, 2, 3)
-    full = _programs(B, H, N) >= 3000
+    full = B * triton.cdiv(N, 64) * H >= 3000            # 64-row query tiles: how full the GPU is
     if bf16:
-        if full:
-            return (64, 64, 4, 3) if N > 1024 else (64, 32, 4, 3)
-        return (64, 32, 4, 3) if N > 1024 else (32, 32, 1, 2)
-    if full:
-        return (64, 32, 4, 3)
-    if N > 1024:        # the atoms of the decoder (inputs rounded outside the kernel, see prepare_tf32)
+        if N > 1024:
+            return (64, 64, 4, 3) if full else (64, 32, 4, 3)
+        return (64, 32, 4, 3) if full else (32, 32, 1, 2)
+    if full or N > 1024:                                 # the atoms of the decoder (inputs rounded outside the kernel, see prepare_tf32)
         return (64, 32, 4, 3)
     return (32, 16, 2, 3)
 
 
-def _bwd_config(N: int, bf16: bool, decay: bool = False):
+def _bwd_config(N: int, bf16: bool, decay: bool):
     """(BLOCK_M, BLOCK_N, num_warps, num_stages) of the fused backward, fixed (see _fwd_config)"""
     if decay:
         return (64, 32, 4, 3)
     if N <= 512:
         return (64, 64, 4, 2) if bf16 else (32, 32, 2, 1)
     return (64, 64, 4, 3)
-
-
-@triton.jit
-def _switch(x, w, FLAT: tl.constexpr):
-    """the switch of the distance decay for x = d / r - 1 (see the module docstring):
-    FLAT: max(x, 0)^2 -- nothing inside the radius, a quadratic penalty outside it (the flat-bottom restraint of a force field, no exp)
-    else: w * softplus(x / w) -- a smooth switch that already decays a little inside the radius"""
-    if FLAT:
-        y = tl.maximum(x, 0.0)
-        return y * y
-    z = x / w
-    return tl.where(z > 20.0, x, w * tl.math.log2(1.0 + tl.math.exp2(z * 1.4426950408889634)) * 0.6931471805599453)
 
 
 # ----------------------------------------------------------------------------------------------- TF32 preparation
@@ -117,8 +96,8 @@ def _prep_one(X, Y, scale, N, H, bh, pid_n, sxb, sxh, sxn, D_HEAD: tl.constexpr,
 
 @triton.jit
 def _prep_kernel(X0, X1, X2, Y, scale, N, H, BH, s0b, s0h, s0n, s1b, s1h, s1n, s2b, s2h, s2n,
-                 NT: tl.constexpr, D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, SCALE0: tl.constexpr, BLOCK_N: tl.constexpr):
-    """Y[t] = round_tf32(X_t * scale if t == 0 and SCALE0 else X_t), contiguous [NT, B, H, N, D]; one launch for all NT tensors"""
+                 D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, SCALE0: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Y[t] = round_tf32(X_t * scale if t == 0 and SCALE0 else X_t), contiguous [T, B, H, N, D]; one launch for all T tensors"""
     pid_n, bh, t = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     if t == 0:
         _prep_one(X0, Y, scale, N, H, bh, pid_n, s0b, s0h, s0n, D_HEAD, BLOCK_D, SCALE0, BLOCK_N)
@@ -137,7 +116,7 @@ def prepare_tf32(tensors, scale: float = None):
     xs = list(tensors) + [x0] * (3 - len(tensors))
     y = torch.empty(len(tensors), B, H, N, D, device=x0.device, dtype=torch.float32)
     strides = [v for x in xs for v in x.stride()[:3]]
-    _prep_kernel[(triton.cdiv(N, 128), B * H, len(tensors))](*xs, y, 1.0 if scale is None else scale, N, H, B * H, *strides, NT=len(tensors),
+    _prep_kernel[(triton.cdiv(N, 128), B * H, len(tensors))](*xs, y, 1.0 if scale is None else scale, N, H, B * H, *strides,
                                                            D_HEAD=D, BLOCK_D=max(16, triton.next_power_of_2(D)), SCALE0=scale is not None,
                                                            BLOCK_N=128)
     return list(y.unbind(0))
@@ -145,10 +124,10 @@ def prepare_tf32(tensors, scale: float = None):
 
 # ----------------------------------------------------------------------------------------------- forward
 @triton.jit
-def _fwd(Q, K, V, Bias, NV, POS, RAD, LAM, O, LSE, scale_log2e, H, N, spa, spb, decay_w,
+def _fwd(Q, K, V, Bias, NV, POS, RAD, LAM, O, LSE, scale_log2e, H, N, spa, spb,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sob, soh, son, sbh, sbm,
          D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, PRE: tl.constexpr,
-         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_NV: tl.constexpr, DECAY: tl.constexpr, FLAT: tl.constexpr):
+         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_NV: tl.constexpr, DECAY: tl.constexpr):
     """PRE: q (already multiplied by scale * log2(e)), k and v are TF32-rounded by the caller (prepare_tf32), so the kernel
     loads them straight into the matmuls (the in-kernel rounding forced plain register loads instead of asynchronous,
     pipelined copies)."""
@@ -199,8 +178,8 @@ def _fwd(Q, K, V, Bias, NV, POS, RAD, LAM, O, LSE, scale_log2e, H, N, spa, spb, 
             e0 = xq0[:, None] - tl.load(pk, mask=n_in, other=0.0)[None, :]
             e1 = xq1[:, None] - tl.load(pk + spa, mask=n_in, other=0.0)[None, :]
             e2 = xq2[:, None] - tl.load(pk + 2 * spa, mask=n_in, other=0.0)[None, :]
-            u = tl.sqrt(e0 * e0 + e1 * e1 + e2 * e2) * inv_r
-            s -= lam * _switch(u - 1.0, decay_w, FLAT)
+            excess = tl.maximum(tl.sqrt(e0 * e0 + e1 * e1 + e2 * e2) * inv_r - 1.0, 0.0)
+            s -= lam * (excess * excess)
         s = tl.where(n_in[None, :], s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
         alpha = tl.math.exp2(m_i - m_new)
@@ -241,11 +220,11 @@ def _delta(O, DO, Delta, N, sob, soh, son, sdb, sdh, sdn, H,
 
 # ----------------------------------------------------------------------------------------------- backward
 @triton.jit
-def _bwd(Q, K, V, Bias, NV, POS, RAD, LAM, DLAM, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N, spa, spb, decay_w,
+def _bwd(Q, K, V, Bias, NV, POS, RAD, LAM, DLAM, DO, LSE, Delta, DQ, DK, DV, DBias, scale, scale_log2e, B, H, N, spa, spb,
          sqb, sqh, sqn, skb, skh, skn, svb, svh, svn, sdob, sdoh, sdon, sdqb, sdqh, sdqn, sdkb, sdkh, sdkn, sdvb, sdvh, sdvn,
          sbh, sbm, sdbs, sdbh, sdbm,
          D_HEAD: tl.constexpr, BLOCK_D: tl.constexpr, PREC: tl.constexpr, RN: tl.constexpr, SPLIT: tl.constexpr,
-         PRE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_NV: tl.constexpr, DECAY: tl.constexpr, FLAT: tl.constexpr):
+         PRE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_NV: tl.constexpr, DECAY: tl.constexpr):
     """One pass over the score tiles: recomputes p once and produces dq, dk, dv and dbias (see the module docstring).
     program_id(2) enumerates (head, batch chunk); chunk c sums the batch entries [c * ceil(B / SPLIT), ...)."""
     pid_m, pid_n, pid_hs = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -290,8 +269,8 @@ def _bwd(Q, K, V, Bias, NV, POS, RAD, LAM, DLAM, DO, LSE, Delta, DQ, DK, DV, DBi
             e0 = tl.load(pq, mask=m_in, other=0.0)[:, None] - tl.load(pk, mask=n_in, other=0.0)[None, :]
             e1 = tl.load(pq + spa, mask=m_in, other=0.0)[:, None] - tl.load(pk + spa, mask=n_in, other=0.0)[None, :]
             e2 = tl.load(pq + 2 * spa, mask=m_in, other=0.0)[:, None] - tl.load(pk + 2 * spa, mask=n_in, other=0.0)[None, :]
-            u = tl.sqrt(e0 * e0 + e1 * e1 + e2 * e2) / tl.load(RAD + b64)
-            fu = _switch(u - 1.0, decay_w, FLAT)
+            excess = tl.maximum(tl.sqrt(e0 * e0 + e1 * e1 + e2 * e2) / tl.load(RAD + b64) - 1.0, 0.0)
+            fu = excess * excess
             s -= lam * fu
         p = tl.where((m_in & (offs_m < nv))[:, None] & (n_in & (offs_n < nv))[None, :], tl.math.exp2(s - lse[:, None]), 0.0)
         dp = tl.dot(do, vt, input_precision=PREC).to(tl.float32)
@@ -340,15 +319,8 @@ def aligned_bias(bias: torch.Tensor) -> torch.Tensor:
     return out[..., :N]
 
 
-def _prep(dtype):
-    """(tl.dot input_precision, round the inputs to TF32?)"""
-    if dtype == torch.bfloat16:
-        return "ieee", False                                # bf16 inputs: the plain tensor-core product
-    return "tf32", True
-
-
 def radius_for_noise(t: torch.Tensor, radius_angstrom: float, sigma_data: float) -> torch.Tensor:
-    """Radius of the decay in the preconditioned input x_in = (x + t e) / sqrt(1 + t^2) that corresponds to `radius_angstrom` of the真 structure:
+    """Radius of the decay in the preconditioned input x_in = (x + t e) / sqrt(1 + t^2) that corresponds to `radius_angstrom` of the true structure:
     r_in^2 = ((r_A / sigma_data)^2 + 6 t^2) / (1 + t^2), the same relation the distances of two atoms follow (6 = E|e_i - e_j|^2 over 3 axes).
 
     Args:
@@ -372,13 +344,14 @@ def _decay_args(pos, radius, lam, q):
 
 @torch.library.custom_op("physdock::shared_bias_attention_fwd", mutates_args=())
 def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor],
-                   pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor],
-                   decay_width: float, decay_flat: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+                   pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor]
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
     """-> o [B, N, H, D] contiguous (the caller transposes to [B, H, N, D]), lse [B, H, N] (log2 units)"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
     bias = aligned_bias(bias)
-    prec, rn = _prep(q.dtype)
+    rn = q.dtype != torch.bfloat16                          # float32: TF32 matmuls with rounded inputs; bf16: the plain tensor-core product
+    prec = "tf32" if rn else "ieee"
     o = torch.empty(B, N, H, D, device=q.device, dtype=q.dtype)
     ov = o.transpose(1, 2)
     lse = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
@@ -389,22 +362,22 @@ def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torc
     ps, rs, ls, decay = _decay_args(pos, radius, lam, q)
     _fwd[(B, triton.cdiv(N, bm), H)](
         q, k, v, bias, n_valid, ps, rs, ls, ov, lse, D ** -0.5 * 1.4426950408889634, H, N,
-        *(ps.stride()[:2] if decay else (0, 0)), decay_width,
+        *(ps.stride()[:2] if decay else (0, 0)),
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *ov.stride()[:3], bias.stride(0), bias.stride(1),
         D_HEAD=D, BLOCK_D=max(16, triton.next_power_of_2(D)), PREC=prec, RN=rn, PRE=pre,
-        BLOCK_M=bm, BLOCK_N=bn, HAS_NV=n_valid is not None, DECAY=decay, FLAT=decay_flat, num_warps=warps, num_stages=stages)
+        BLOCK_M=bm, BLOCK_N=bn, HAS_NV=n_valid is not None, DECAY=decay, num_warps=warps, num_stages=stages)
     return o, lse
 
 
 @_attention_fwd.register_fake
-def _(q, k, v, bias, n_valid, pos, radius, lam, decay_width, decay_flat):
+def _(q, k, v, bias, n_valid, pos, radius, lam):
     B, H, N, D = q.shape
     return q.new_empty(B, N, H, D), q.new_empty(B, H, N, dtype=torch.float32)
 
 
 @torch.library.custom_op("physdock::shared_bias_attention_bwd", mutates_args=())
 def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor],
-                   pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor], decay_width: float, decay_flat: bool,
+                   pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor],
                    o: torch.Tensor, lse: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """do, o: [B, N, H, D] -> dq, dk, dv [B, N, H, D], dbias [H, N, N], dlambda [H] (zeros when the decay is off)"""
     B, H, N, D = q.shape
@@ -412,7 +385,8 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
     bias = aligned_bias(bias)
     if do.stride(-1) != 1:
         do = do.contiguous()
-    prec, rn = _prep(q.dtype)
+    rn = q.dtype != torch.bfloat16
+    prec = "tf32" if rn else "ieee"
     block_d = max(16, triton.next_power_of_2(D))
     ov, dov = o.transpose(1, 2), do.transpose(1, 2)
     delta = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
@@ -433,32 +407,31 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
     dlam = torch.zeros(H, device=q.device, dtype=torch.float32)
     _bwd[(triton.cdiv(N, bm), triton.cdiv(N, bn), H * split)](
         q, k, v, bias, n_valid, ps, rs, ls, dlam, dov, lse, delta, dqv, dkv, dvv, dbias, scale, scale * 1.4426950408889634, B, H, N,
-        *(ps.stride()[:2] if decay else (0, 0)), decay_width,
+        *(ps.stride()[:2] if decay else (0, 0)),
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], *dov.stride()[:3], *dqv.stride()[:3], *dkv.stride()[:3],
         *dvv.stride()[:3], bias.stride(0), bias.stride(1), dbias.stride(0), dbias.stride(1), dbias.stride(2), D_HEAD=D, BLOCK_D=block_d, PREC=prec, RN=rn,
-        SPLIT=split, PRE=pre, BLOCK_M=bm, BLOCK_N=bn, HAS_NV=n_valid is not None, DECAY=decay, FLAT=decay_flat, num_warps=warps, num_stages=stages)
+        SPLIT=split, PRE=pre, BLOCK_M=bm, BLOCK_N=bn, HAS_NV=n_valid is not None, DECAY=decay, num_warps=warps, num_stages=stages)
     return dq.to(dtype), dk.to(dtype), dv.to(dtype), dbias[0] if split == 1 else dbias.sum(0), dlam
 
 
 @_attention_bwd.register_fake
-def _(do, q, k, v, bias, n_valid, pos, radius, lam, decay_width, decay_flat, o, lse):
+def _(do, q, k, v, bias, n_valid, pos, radius, lam, o, lse):
     B, H, N, D = q.shape
     return (q.new_empty(B, N, H, D), q.new_empty(B, N, H, D), q.new_empty(B, N, H, D),
             bias.new_empty(H, N, N, dtype=torch.float32), q.new_empty(H, dtype=torch.float32))
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, bias, n_valid, pos, radius, lam, decay_width, decay_flat = inputs
+    q, k, v, bias, n_valid, pos, radius, lam = inputs
     ctx.save_for_backward(q, k, v, bias, output[0], output[1])
     ctx.n_valid, ctx.pos, ctx.radius, ctx.lam = n_valid, pos, radius, lam
-    ctx.decay_width, ctx.decay_flat = decay_width, decay_flat
 
 
-def _backward(ctx, do, dlse):
+def _backward(ctx, do, _dlse):
     q, k, v, bias, o, lse = ctx.saved_tensors
-    dq, dk, dv, dbias, dlam = _attention_bwd(do, q, k, v, bias, ctx.n_valid, ctx.pos, ctx.radius, ctx.lam, ctx.decay_width, ctx.decay_flat, o, lse)
+    dq, dk, dv, dbias, dlam = _attention_bwd(do, q, k, v, bias, ctx.n_valid, ctx.pos, ctx.radius, ctx.lam, o, lse)
     dlam = dlam.to(ctx.lam.dtype) if ctx.lam is not None and ctx.lam.requires_grad else None
-    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype), None, None, None, dlam, None, None
+    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype), None, None, None, dlam
 
 
 _attention_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -466,7 +439,7 @@ _attention_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor] = None,
                           pos: Optional[torch.Tensor] = None, radius: Optional[torch.Tensor] = None,
-                          lam: Optional[torch.Tensor] = None, decay_width: float = 0.2, decay_flat: bool = False) -> torch.Tensor:
+                          lam: Optional[torch.Tensor] = None) -> torch.Tensor:
     """softmax(q k^T / sqrt(D) + bias) v with a bias shared by the batch.
 
     Args:
@@ -475,8 +448,7 @@ def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bia
         n_valid: int32 tensor of one element on the device, the number of leading positions that are real (the rest is padding, see the
             module docstring); None: all N
         pos: [B, N, 3] positions of the distance decay (None: no decay, nothing is computed for it), radius: [B] its radius in the units
-            of pos, lam: [H] or [1] its strength per head (differentiable), decay_width: width of the switch, decay_flat: the
-            flat-bottom switch instead of the softplus one (see the module docstring)
+            of pos, lam: [H] its strength per head (differentiable); see the module docstring
 
     Returns:
         [B, H, N, D]
@@ -492,11 +464,8 @@ def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bia
         raise ValueError(f"head dim must be <= 128, got {D}")
     if pos is not None:
         if pos.shape[:2] != (B, N) or pos.shape[2] != 3 or radius is None or lam is None:
-            raise ValueError(f"the decay needs pos [B, N, 3] = {(B, N, 3)} (got {tuple(pos.shape)}), radius [B] and lam [H] or [1]")
+            raise ValueError(f"the decay needs pos [B, N, 3] = {(B, N, 3)} (got {tuple(pos.shape)}), radius [B] and lam [H]")
         pos = pos.detach().float().permute(2, 0, 1).contiguous()          # [3, B, N]: one coalesced load per axis in the kernels
         radius = radius.detach().float().reshape(-1).contiguous()
-        lam = lam.float().reshape(-1)
-        if lam.numel() == 1:
-            lam = lam.expand(H)
-        lam = lam.contiguous()
-    return _attention_fwd(q, k, v, bias, n_valid, pos, radius, lam, float(decay_width), bool(decay_flat))[0].transpose(1, 2)
+        lam = lam.float().reshape(-1).contiguous()
+    return _attention_fwd(q, k, v, bias, n_valid, pos, radius, lam)[0].transpose(1, 2)
