@@ -22,4 +22,3 @@ $PYTHON $ROOT/scripts/infer/redocking.py \
   features.use_key_res=true \
   ranking=true \
   "$@"
-#  sidechain_relaxation=true

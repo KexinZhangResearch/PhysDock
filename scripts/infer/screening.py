@@ -50,7 +50,6 @@ def screening(
         num_confs=128,
         karras_noise_schedule_power=1000,
         ranking=True,
-        sidechain_relaxation=False,
         align_mode="pocket_ca",  # pocket_ca and ca
         device_id=0,
 ):
@@ -124,7 +123,6 @@ def screening(
         print(f"# Use Key Residue Feature: {use_key_res}")
     print(f"# Align to GT mode: {align_mode}")
     print(f"# K-Means Clustering and Ranking: {ranking}")
-    print(f"# Sidechain Relaxation: {sidechain_relaxation and ranking}")
     print("###########################################################")
 
     for batch_id, sample in tqdm.tqdm(enumerate(dataloader), total=len(smis)):
@@ -384,15 +382,6 @@ def screening(
                                 f"{output_dir}/{sample_id}/system_rank_{rank_id}.pdb")
                     shutil.copy(f"{output_dir}/{sample_id}/tmp/receptor_pred_{i}.pdb",
                                 f"{output_dir}/{sample_id}/receptor_rank_{rank_id}.pdb")
-                if sidechain_relaxation:
-                    from PhysDock.utils.relaxation import relax   # needs openmm / pdbfixer
-                    # print("Start Relaxation!")
-                    for rank_id, i in enumerate(ids):
-                        # print(rank_id)
-                        relax(
-                            f"{output_dir}/{sample_id}/receptor_rank_{rank_id}.pdb",
-                            f"{output_dir}/{sample_id}/ligand_rank_{rank_id}.sdf"
-                        )
                 dump_json(rmsds, f"{output_dir}/{sample_id}/top5_rmsd.json")
 
         except Exception as e:
@@ -424,7 +413,6 @@ def main(cfg: DictConfig) -> None:
         num_confs=sp.num_confs,
         karras_noise_schedule_power=sp.rho,
         ranking=cfg.ranking,
-        sidechain_relaxation=cfg.sidechain_relaxation,
         align_mode=cfg.align_mode,
         device_id=cfg.device_id,
     )

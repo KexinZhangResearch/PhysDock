@@ -45,7 +45,7 @@ python scripts/download/download_homo_data.py --only uniref90 bfd   # or a subse
 
 ```shell
 # Create ENV
-conda env create -f enviroment.yaml
+conda env create -f environment.yaml
 
 # ENV Activation
 conda activate PhysDock

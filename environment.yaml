@@ -1,0 +1,29 @@
+# PhysDock environment, CUDA 12.4 (PyTorch 2.6.0, whose PyPI wheel is the CUDA 12.4 build; Triton 3.2 comes with it).
+#   conda env create -f environment.yaml && conda activate PhysDock
+# Everything imported by PhysDock/, scripts/ and tests/ (training, inference, the downloaders). PyPI through the Tsinghua mirror and
+# conda-forge only for python (replace the URLs to use the originals). The MSA search of scripts/prepare/homo_search also needs the
+# binaries hhblits, jackhmmer, hmmsearch and kalign:  conda install -c bioconda hhsuite hmmer kalign2   (or: apt install hhsuite hmmer)
+name: PhysDock
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+      - torch==2.6.0           # CUDA 12.4 wheel (+ nvidia-*-cu12 12.4 and triton 3.2 as dependencies)
+      - numpy<2                # rdkit 2024.3.3 is built against numpy 1.x
+      - scipy
+      - pandas
+      - rdkit==2024.3.3        # conformers / features / MMFF guidance as the released pipeline
+      - biopython==1.84        # mmCIF / PDB parsing as the released pipeline
+      - scikit-learn           # ranking (KMeans) in redocking / screening
+      - tqdm
+      - lightning>=2.5
+      - torchmetrics>=1.6
+      - hydra-core>=1.3.2
+      - omegaconf>=2.3
+      - wandb
+      - pytest                 # tests/
+      - google-crc32c          # optional: fast checksums in scripts/download

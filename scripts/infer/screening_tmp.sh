@@ -11,7 +11,6 @@ $PYTHON $ROOT/scripts/infer/screening.py \
   sampling.max_rounds=5 \
   sampling.num_samples_per_round=20 \
   ranking=true \
-  sidechain_relaxation=true \
   sampling.physics_correction=true \
   output_dir=./no_pocket_no_shift \
   "$@"

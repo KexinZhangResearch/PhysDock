@@ -218,4 +218,4 @@ logs/
 
 
 todo.txt
-tests/
+tests/*
