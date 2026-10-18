@@ -136,7 +136,7 @@ def _ffn_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: torch
 
 @_ffn_fwd.register_fake
 def _(x, norm_w, w13, w2, eps, residual, mode):
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 @torch.library.custom_op("physdock::rmsnorm_swiglu_ffn_bwd", mutates_args=())
@@ -164,7 +164,7 @@ def _ffn_bwd(dy: torch.Tensor, x: torch.Tensor, norm_w: torch.Tensor, w13: torch
 
 @_ffn_bwd.register_fake
 def _(dy, x, norm_w, w13, w2, eps, residual, mode):
-    return torch.empty_like(x), x.new_empty(norm_w.shape, dtype=torch.float32), x.new_empty(w13.shape, dtype=torch.float32), \
+    return x.new_empty(x.shape), x.new_empty(norm_w.shape, dtype=torch.float32), x.new_empty(w13.shape, dtype=torch.float32), \
         x.new_empty(w2.shape, dtype=torch.float32)
 
 
@@ -293,7 +293,7 @@ def _split_fwd(x: torch.Tensor, norm_w: torch.Tensor, w13: torch.Tensor, w2: tor
 @_split_fwd.register_fake
 def _(x, norm_w, w13, w2, eps, residual):
     M = x.numel() // x.shape[-1]
-    return torch.empty_like(x), x.new_empty(M, x.shape[-1], dtype=torch.bfloat16), x.new_empty(M, w13.shape[0], dtype=torch.bfloat16)
+    return x.new_empty(x.shape), x.new_empty(M, x.shape[-1], dtype=torch.bfloat16), x.new_empty(M, w13.shape[0], dtype=torch.bfloat16)
 
 
 @torch.library.custom_op("physdock::rmsnorm_swiglu_ffn_split_bwd", mutates_args=())
@@ -320,7 +320,7 @@ def _split_bwd(dy: torch.Tensor, x: torch.Tensor, n: torch.Tensor, h: torch.Tens
 
 @_split_bwd.register_fake
 def _(dy, x, n, h, norm_w, w13, w2, eps, residual):
-    return torch.empty_like(x), x.new_empty(norm_w.shape, dtype=torch.float32), x.new_empty(w13.shape, dtype=torch.float32), \
+    return x.new_empty(x.shape), x.new_empty(norm_w.shape, dtype=torch.float32), x.new_empty(w13.shape, dtype=torch.float32), \
         x.new_empty(w2.shape, dtype=torch.float32)
 
 

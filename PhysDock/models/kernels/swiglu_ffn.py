@@ -115,7 +115,7 @@ def _swiglu_ffn_fwd(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, mode: 
 
 @_swiglu_ffn_fwd.register_fake
 def _(x, w13, w2, mode):
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 @torch.library.custom_op("physdock::swiglu_ffn_bwd", mutates_args=())
@@ -139,7 +139,7 @@ def _swiglu_ffn_bwd(dy: torch.Tensor, x: torch.Tensor, w13: torch.Tensor, w2: to
 
 @_swiglu_ffn_bwd.register_fake
 def _(dy, x, w13, w2, mode):
-    return torch.empty_like(x), x.new_empty(w13.shape, dtype=torch.float32), x.new_empty(w2.shape, dtype=torch.float32)
+    return x.new_empty(x.shape), x.new_empty(w13.shape, dtype=torch.float32), x.new_empty(w2.shape, dtype=torch.float32)
 
 
 def _setup_context(ctx, inputs, output):

@@ -428,7 +428,7 @@ def _(z, mask, w_in, w_all, b_all, w_out, w_z, b_z, eps, outgoing, precision):
 def _(do, z, mask, w_in, w_all, b_all, w_out, w_z, b_z, r, ab, t, us, g, eps, outgoing, precision):
     N, C, H = _dims(z, w_out)
     _, pstride = _part_layout(C, H)
-    return torch.empty_like(z), z.new_empty(pstride, dtype=torch.float32), z.new_empty(4 * H + C, C, dtype=torch.float32)
+    return z.new_empty(z.shape), z.new_empty(pstride, dtype=torch.float32), z.new_empty(4 * H + C, C, dtype=torch.float32)
 
 
 def _unpack_grads(saved, small, mats):

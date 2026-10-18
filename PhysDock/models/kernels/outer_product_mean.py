@@ -198,7 +198,7 @@ def _fwd(qk: torch.Tensor, z: torch.Tensor, w: torch.Tensor, b: torch.Tensor, nw
 
 @_fwd.register_fake
 def _(qk, z, w, b, nw, eps, mode):
-    return torch.empty_like(z), z.new_empty(z.shape, dtype=torch.bfloat16 if mode == MODES["bf16"] else torch.float32)
+    return z.new_empty(z.shape), z.new_empty(z.shape, dtype=torch.bfloat16 if mode == MODES["bf16"] else torch.float32)
 
 
 @torch.library.custom_op("physdock::outer_product_mean_bwd", mutates_args=())

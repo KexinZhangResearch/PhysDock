@@ -371,9 +371,15 @@ class SharedBiasAttention(KernelModule):
         batched inference with padding); in data-parallel training the fullest crop of the ranks sets the speed."""
         return valid_length(pair_mask) if self.backend == "triton" and self.skip_padding else None
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: torch.Tensor = None,
+                layout=None) -> torch.Tensor:
         """q, k, v: [H, N, D] or [B, H, N, D]; bias [H, N, N]; n_valid: valid_length of the mask, the Triton kernels skip the padding
-        behind it (the keys there must be masked by the bias; the rows there get 0) -> o of the shape of q"""
+        behind it (the keys there must be masked by the bias; the rows there get 0); layout: kernels.block_neighbor_attention.BlockLayout:
+        q, k, v are [B, H, Np, D] in its sorted order and every atom attends only to the atoms of the neighbour blocks of its block
+        (Triton: only those blocks are computed; torch: the same function from gathered blocks) -> o of the shape of q"""
+        if layout is not None:
+            attend = kernels.block_neighbor_attention
+            return (attend.block_neighbor_attention if self.backend == "triton" else attend.torch_block_attention)(q, k, v, bias, layout)
         if self.backend == "triton":
             if q.dim() == 3:
                 return kernels.shared_bias_attention.shared_bias_attention(q[None], k[None], v[None], bias, n_valid)[0]

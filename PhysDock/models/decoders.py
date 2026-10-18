@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from PhysDock.models.kernels.block_neighbor_attention import build_block_layout
 from PhysDock.models.primitives import DiT, Linear, TimestepEmbeddings
 from PhysDock.utils.tensor_utils import pair_mask, segment_mean_pool
 
@@ -29,11 +30,17 @@ class AllAtomDecoder(nn.Module):
     Always runs in float32 (TF32 matmuls per torch.set_float32_matmul_precision), also under bf16 autocast: the
     token stream is large (rms ~3e3, from the encoder's s) and is added back to the atom stream, so bf16 rounding
     there shows up directly in the coordinates (ligand bond errors x2.5 in sampling).
+
+    atom_neighbors {"leaf": L, "blocks": M} (default None: every atom attends to all atoms): in the two atom DiTs every atom attends only to the
+    M * L atoms of the M blocks nearest to its own block, where the atoms are grouped into blocks of L by a k-d tree of the current noisy
+    coordinates, per sample and per denoising step (kernels/block_neighbor_attention.py). The token DiT is unchanged. This changes the
+    function: parameters trained with all-atom attention do not fit, train with it from the start.
     """
 
     def __init__(self, c_a: int, c_ap: int, c_s: int, c_z: int, inf: float, eps: float, no_blocks_atom: int,
-                 no_blocks_dit: int) -> None:
+                 no_blocks_dit: int, atom_neighbors: Optional[dict] = None) -> None:
         super().__init__()
+        self.atom_neighbors = atom_neighbors
         self.linear_x = Linear(3, c_a)
         self.linear_downscale = Linear(c_a, c_s)
         self.linear_upscale = Linear(c_s, c_a)
@@ -72,11 +79,14 @@ class AllAtomDecoder(nn.Module):
             [B, N_atom, 3] raw network output
         """
         with torch.autocast(x_in.device.type, enabled=False):
+            layout = None
+            if self.atom_neighbors is not None:
+                layout = build_block_layout(x_in, batch["atom_mask"].bool(), self.atom_neighbors["leaf"], self.atom_neighbors["blocks"])
             t = self.time_embedder(t_in.float())
             x = self.linear_x(x_in.float()) + cond.a[None]
-            x = self.atom_dit_encoder(x, cond.atom_bias_encoder, t, cond.atom_valid)
+            x = self.atom_dit_encoder(x, cond.atom_bias_encoder, t, cond.atom_valid, layout)
             xs = segment_mean_pool(F.silu(self.linear_downscale(x)), batch["split_sizes"]) + cond.s[None]   # to tokens
             xs = self.token_dit(xs, cond.token_bias, t, cond.token_valid)
             x = x + self.linear_upscale(xs)[:, batch["atom_to_token"]]                                     # to atoms
-            x = self.atom_dit_decoder(x, cond.atom_bias_decoder, t, cond.atom_valid)
+            x = self.atom_dit_decoder(x, cond.atom_bias_decoder, t, cond.atom_valid, layout)
             return self.linear_r(self.norm_r(x))
