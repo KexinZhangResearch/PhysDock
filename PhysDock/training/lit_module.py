@@ -150,7 +150,11 @@ class PhysDockLitModule(L.LightningModule):
         self.log("train/skipped_steps", float(self.skipped_steps), batch_size=1)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.optim["lr"], betas=tuple(self.optim["betas"]), eps=self.optim["eps"],
-                                      weight_decay=self.optim.get("weight_decay", 0.0), fused=self.device.type == "cuda")
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        decay = self.optim.get("weight_decay", 0.0)
+        groups = [{"params": [p for p in params if p.ndim >= 2], "weight_decay": decay},        # weight matrices
+                  {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0}]           # biases, norm scales, other vectors
+        optimizer = torch.optim.AdamW(groups, lr=self.optim["lr"], betas=tuple(self.optim["betas"]), eps=self.optim["eps"],
+                                      fused=self.device.type == "cuda")
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, af3_lr_lambda(**self.optim["scheduler"]))
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}

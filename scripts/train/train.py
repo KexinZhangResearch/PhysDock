@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("PHYSDOCK_ROOT", str(ROOT))
 
 import hydra  # noqa: E402
+import torch  # noqa: E402
 import lightning.pytorch as L  # noqa: E402
 from lightning.pytorch.callbacks import TQDMProgressBar  # noqa: E402
 from lightning.pytorch.loggers import WandbLogger  # noqa: E402
@@ -35,9 +36,17 @@ from PhysDock.training.resume import NewestCheckpoint, latest_checkpoint, wandb_
 def main(cfg: DictConfig) -> None:
     set_matmul_precision(cfg.matmul_precision)
     L.seed_everything(cfg.seed)
+    optim = to_dict(cfg.optim)
+    batch = cfg.trainer.num_nodes * (cfg.trainer.devices if isinstance(cfg.trainer.devices, int) and cfg.trainer.devices > 0 else
+                                     max(1, torch.cuda.device_count())) * cfg.trainer.accumulate_grad_batches
+    if optim["lr"] is None:                       # the learning rate of this batch size from the reference (batch, lr) of AlphaFold 3
+        optim["lr"] = optim["reference_lr"] * (batch / optim["reference_batch"]) ** 0.5
+    print(f"[train] {batch} structure(s) per optimiser step: lr {optim['lr']:.3e} (reference {optim['reference_lr']:.1e} at batch "
+          f"{optim['reference_batch']}), weight decay {optim['weight_decay']}", flush=True)
+    cfg.optim.lr = optim["lr"]
     datamodule = PhysDockDataModule(features=to_dict(cfg.features), val_features=to_dict(cfg.val_features),
                                     **to_dict(cfg.data))
-    module = PhysDockLitModule(model=to_dict(cfg.model), loss=to_dict(cfg.loss), optim=to_dict(cfg.optim),
+    module = PhysDockLitModule(model=to_dict(cfg.model), loss=to_dict(cfg.loss), optim=optim,
                                init_from=cfg.init_from, val=to_dict(cfg.val), grad_stats=cfg.grad_stats)
     set_checkpointing(module.model, to_dict(cfg.checkpointing))
     if cfg.compile:

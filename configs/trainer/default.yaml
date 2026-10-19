@@ -17,12 +17,15 @@ trainer:                          # lightning.pytorch.Trainer arguments
   num_sanity_val_steps: 0
   use_distributed_sampler: false  # the data module shards training (weighted) and validation over the ranks itself
 
-optim:                            # fused AdamW with PhysDock2's settings (train.py of PhysDock2: Adam, no weight decay = AdamW with weight_decay 0),
-                                  # linear warmup, a plateau, then a stepwise exponential decay (AlphaFoldLRScheduler)
-  lr: 6.0e-4                      # PhysDock2: 1.8e-3 / 3 (the released PhysDock trained with 1.8e-3 on many GPUs)
-  betas: [0.9, 0.95]
-  eps: 1.0e-8
-  weight_decay: 0.0
+optim:                            # fused AdamW; linear warmup, a plateau, then a stepwise exponential decay (AlphaFoldLRScheduler)
+  lr: null                        # null: derived from the batch size, lr = reference_lr * (batch / reference_batch) ** 0.5 (the square-root rule for Adam),
+                                  # batch = nodes * GPUs per node * accumulate_grad_batches structures per optimiser step; a number is used as given
+  reference_lr: 1.8e-3            # AlphaFold 3 (supplement 3.7.1): 1.8e-3 at a batch of 256 structures (each with 48 diffusion samples)
+  reference_batch: 256
+  betas: [0.9, 0.95]              # AlphaFold 3
+  eps: 1.0e-8                     # AlphaFold 3
+  weight_decay: 0.0               # AlphaFold 3 trains with plain Adam (no weight decay is given in its supplement): AdamW with 0. If > 0 it is applied to
+                                  # the weight matrices only (parameters with two or more dimensions), not to biases, norm scales and other vectors
   scheduler:
     warmup_steps: 1000
     start_decay_after: 5000

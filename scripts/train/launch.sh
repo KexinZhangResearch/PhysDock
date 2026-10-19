@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Training of the standard PhysDock (configs/model/medium.yaml: Pairformer 24, atom DiTs 3 + 3, token DiT 12; crop 256 / 2048 atoms, bf16-mixed,
-# torch.compile, no activation checkpointing; BACKEND=triton for the Triton kernels) on one node, or on several nodes with DDP. Run it on EVERY node.
-# The optimiser, learning-rate schedule and EMA are PhysDock2's (configs/trainer/default.yaml), and a model trained from scratch conditions on
-# the noise level as ln(t) / 4 (PhysDock2; the default "legacy" form is only for the released weights): use the same override at inference:
+# torch.compile, no activation checkpointing, Triton kernels; BACKEND=torch for the plain torch ops) on one node, or on several nodes with DDP. Run it on
+# EVERY node. The optimiser (fused AdamW with AlphaFold 3's betas, eps and weight decay), the learning rate (AlphaFold 3's 1.8e-3 at a batch of 256,
+# scaled to the batch of this run by the square-root rule, see configs/trainer/default.yaml), the schedule and the EMA are in configs/trainer/default.yaml;
+# a model trained from scratch conditions on the noise level as ln(t) / 4 (the default "legacy" form is only for the released weights), so inference
+# of such a checkpoint needs model.diffusion.noise_conditioning=af3.
 #
 #   # one node, one GPU (or all of them: GPUS_PER_NODE=8)
 #   RUN_NAME=standard sh scripts/train/launch.sh
@@ -28,7 +30,7 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 MAX_STEPS=${MAX_STEPS:-100000}
-BACKEND=${BACKEND:-torch}                     # torch | triton
+BACKEND=${BACKEND:-triton}                    # triton | torch
 COMPILE=${COMPILE:-true}
 SEED=${SEED:-42}
 NUM_WORKERS=${NUM_WORKERS:-32}                # featurisation workers per GPU

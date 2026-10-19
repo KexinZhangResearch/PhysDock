@@ -28,7 +28,7 @@ for node in $NODES; do
     ENVS="NNODES=1 NODE_RANK=0 RUN_NAME=${RUN_NAME}_node$i SEED=$((SEED + i))"
     LOG=$ROOT/logs/train/${RUN_NAME}_node$i
   fi
-  ENVS="$ENVS GPUS_PER_NODE=$GPUS_PER_NODE MAX_STEPS=${MAX_STEPS:-100000} NUM_WORKERS=${NUM_WORKERS:-32} BACKEND=${BACKEND:-torch} COMPILE=${COMPILE:-true}"
+  ENVS="$ENVS GPUS_PER_NODE=$GPUS_PER_NODE MAX_STEPS=${MAX_STEPS:-100000} NUM_WORKERS=${NUM_WORKERS:-32} BACKEND=${BACKEND:-triton} COMPILE=${COMPILE:-true}"
   CMD="mkdir -p $LOG && cd $ROOT && $ENVS setsid nohup bash scripts/train/launch.sh$EXTRA > $LOG/launch_node$i.out 2>&1 < /dev/null &"
   if [ "$node" = local ]; then
     bash -c "$CMD" > /dev/null 2>&1 < /dev/null
