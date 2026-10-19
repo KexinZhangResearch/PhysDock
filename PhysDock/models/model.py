@@ -66,7 +66,15 @@ class PhysDock(nn.Module):
         z, t = self.diffuser.noising(x_gt, batch["atom_mask"], self.num_augmentation_sample)
         x_denoised = self.diffuser.denoise(self.dit, batch, z, t, self.dit.condition(batch, conds))
         return {"x_gt": x_gt, "x_denoised": x_denoised, "x_hat": z, "t_hat": self.diffuser.noise_level(t),
-                "p_distogram": self.distogram_logits(conds.z)}
+                "p_distogram": self.distogram_logits(conds.z), "stream_rms": self.stream_rms(conds, batch)}
+
+    @torch.no_grad()
+    def stream_rms(self, conds, batch) -> torch.Tensor:
+        """[3] root mean square of the real (unpadded) entries of the encoder output a, s, z: the scale of the residual streams, which the
+        architecture does not normalise and which grows during training (a diagnostic, logged by the training module)"""
+        am, tm = batch["atom_mask"].float(), batch["token_mask"].float()
+        masks = (am[:, None], tm[:, None], (tm[:, None] * tm[None, :])[..., None])
+        return torch.stack([((c.float() ** 2 * m).sum() / (m.sum() * c.shape[-1])).sqrt() for c, m in zip((conds.a, conds.s, conds.z), masks)])
 
     def distogram_logits(self, z: torch.Tensor) -> torch.Tensor:
         """z: [N_token, N_token, c_z] -> symmetric logits [N_token, N_token, bins], in float32.

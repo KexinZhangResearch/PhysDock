@@ -1,4 +1,4 @@
-"""LightningModule: training with PhysDockLoss, validation = diffusion loss + sampling metrics, Adam + AF3 LR schedule.
+"""LightningModule: training with PhysDockLoss, validation = diffusion loss + sampling metrics, fused AdamW + AF3 LR schedule.
 
 Logged (Boltz style): train/<loss terms> and train/lr every step; every log_every_n_steps the gradient statistics
 (train/grad_norm, grad_abs_max, grad_abs_min, param_norm, per module train/grad_norm/<module>, and with
@@ -42,7 +42,7 @@ class PhysDockLitModule(L.LightningModule):
     Args:
         model: model config (configs/model/<size>.yaml)
         loss: loss config (configs/model/loss.yaml)
-        optim: {lr, betas, eps, scheduler: {warmup_steps, start_decay_after, decay_every, decay_factor}}
+        optim: {lr, betas, eps, weight_decay, scheduler: {warmup_steps, start_decay_after, decay_every, decay_factor}}
         init_from: optional checkpoint to start from (params.pt, Lightning or Uni-Core checkpoint)
         val: {num_samples, steps} of the validation sampling
         grad_stats: "total", "module" or "parameter" (see module docstring)
@@ -75,9 +75,11 @@ class PhysDockLitModule(L.LightningModule):
 
     # ------------------------------------------------------------------ training
     def training_step(self, batch, batch_idx):
-        loss, logs = self.loss_fn(self.model(batch), batch)
+        outputs = self.model(batch)
+        loss, logs = self.loss_fn(outputs, batch)
         self.log("train/loss", logs.pop("loss"), prog_bar=True, batch_size=1)
         self.log_dict({f"train/{k}": v for k, v in logs.items()}, batch_size=1)
+        self.log_dict({f"train/rms_{n}": v for n, v in zip("asz", outputs["stream_rms"])}, batch_size=1)      # scale of the encoder streams
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], batch_size=1)
         return loss
 
@@ -148,7 +150,7 @@ class PhysDockLitModule(L.LightningModule):
         self.log("train/skipped_steps", float(self.skipped_steps), batch_size=1)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.optim["lr"], betas=tuple(self.optim["betas"]),
-                                     eps=self.optim["eps"], fused=self.device.type == "cuda")
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.optim["lr"], betas=tuple(self.optim["betas"]), eps=self.optim["eps"],
+                                      weight_decay=self.optim.get("weight_decay", 0.0), fused=self.device.type == "cuda")
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, af3_lr_lambda(**self.optim["scheduler"]))
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}

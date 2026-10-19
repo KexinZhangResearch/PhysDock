@@ -138,6 +138,9 @@ class PhysDockLoss(nn.Module):
         with torch.autocast(batch["x_gt"].device.type, enabled=False):
             outputs = {k: v.float() for k, v in outputs.items()}
             x, x_gt, atom_mask = outputs["x_denoised"], outputs["x_gt"], batch["atom_mask"]       # normalised
+            # the padding is replaced, not multiplied by 0 (0 * nan = nan): whatever the network or the data holds there cannot reach a loss term
+            real = (atom_mask > 0)[..., None]
+            x, x_gt = torch.where(real, x, torch.zeros_like(x)), torch.where(real, x_gt, torch.zeros_like(x_gt))
             is_lig = batch["is_ligand"][batch["atom_to_token"]] * atom_mask          # real ligand atoms
             w_t = edm_weight(outputs["t_hat"])
             terms = {}
@@ -149,8 +152,8 @@ class PhysDockLoss(nn.Module):
                 terms["ligand_mse"] = (aligned_mse(x, x_gt, align, is_lig) * w_t).mean()
             if self.weights.get("smooth_lddt") or self.weights.get("within_smooth_lddt"):
                 terms["smooth_lddt"], terms["within_smooth_lddt"] = smooth_lddt(
-                    x * self.sigma_data, batch["x_gt"], atom_mask, batch["atom_to_conformer"], self.max_clamp_distance)
+                    x * self.sigma_data, x_gt * self.sigma_data, atom_mask, batch["atom_to_conformer"], self.max_clamp_distance)
             if self.weights.get("distogram"):
-                terms["distogram"] = distogram_loss(outputs["p_distogram"], batch["x_gt"], batch["token_mask"],
+                terms["distogram"] = distogram_loss(outputs["p_distogram"], x_gt * self.sigma_data, batch["token_mask"],
                                                     batch["token_to_pseudo_beta_atom"], **self.distogram)
             return terms
