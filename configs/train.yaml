@@ -2,7 +2,7 @@
 #   python scripts/train/train.py trainer=ddp                          # all GPUs of the node
 #   python scripts/train/train.py model=toy trainer.max_steps=200 data.samples_per_epoch=100     (quick test)
 #   python scripts/train/train.py init_from=data/params/params.pt      # fine-tune the released weights
-#   python scripts/train/train.py ckpt_path=logs/train/<run>/checkpoints/last.ckpt               (resume)
+#   python scripts/train/train.py hydra.run.dir=logs/train/<run>   (a fixed run directory resumes from its newest checkpoint)
 #   python scripts/train/train.py compile=true logger.offline=true
 defaults:
   - model: medium                 # model/{toy,tiny,small,medium,full,medium_linear}.yaml
@@ -19,7 +19,8 @@ output_dir: ${hydra:runtime.output_dir}   # logs/train/<time>: checkpoints, wand
 ccd: ${root_dir}/data/ccd_id_meta_data.pkl.gz
 seed: 42
 init_from: null                   # start from these weights (params.pt, Lightning or Uni-Core checkpoint)
-ckpt_path: null                   # resume this Lightning checkpoint (weights, optimiser, EMA, step)
+ckpt_path: auto                   # resume this Lightning checkpoint (weights, optimiser, EMA, step); auto: the newest complete one of
+                                  # ${output_dir}/checkpoints (none: start from scratch); null: always start from scratch
 compile: false                    # torch.compile the training step region by region (faster, less memory)
 checkpointing:                    # activation checkpointing per stack: full (recompute in the backward), none (keep
                                   # all activations: faster, more memory), or a fraction between 0 and 1 (only that fraction
@@ -35,6 +36,7 @@ checkpointing:                    # activation checkpointing per stack: full (re
   Pairformer: full
   DiT: attention
 matmul_precision: auto          # float32 matmuls: auto = TF32 if the GPU supports it; highest = full float32
+progress_refresh: 20            # steps between updates of the progress bar (in a log file: one line per update)
 
 val:                              # validation: diffusion loss, then sampling + structure metrics
   num_samples: 5

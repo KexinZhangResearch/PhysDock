@@ -31,15 +31,16 @@ ema:                              # moving average of the weights; validation an
   decay: 0.999
   warm_start: true
 
-checkpoint:                       # lightning.pytorch.callbacks.ModelCheckpoint
-  every_n_train_steps: 2000
-  save_top_k: -1
-  save_last: true
+checkpoint:                       # lightning.pytorch.callbacks.ModelCheckpoint: only the newest checkpoint is kept (the new file is written
+                                  # before the previous one is deleted, so a crash while saving leaves a complete one)
+  every_n_train_steps: 1000
+  save_top_k: 1
+  save_last: false
 
 logger:                           # lightning.pytorch.loggers.WandbLogger; logger=null disables logging
   project: PhysDock
   name: ${task_name}
-  offline: false                  # true: log locally (wandb sync later)
+  offline: auto                   # auto: online if there is an API key (wandb login / WANDB_API_KEY), else local; true: local (wandb sync later)
   log_model: false
 
 grad_stats: parameter             # gradient statistics every log_every_n_steps: total | module | parameter

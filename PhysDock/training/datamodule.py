@@ -47,10 +47,13 @@ class PhysDockDataModule(L.LightningDataModule):
                                        ccd=ccd, config=self.val_features, on_error="skip")
 
     def train_dataloader(self):
-        # weighted draws split over the DDP ranks; Lightning must not replace this sampler (use_distributed_sampler)
+        # weighted draws split over the DDP ranks; Lightning must not replace this sampler (use_distributed_sampler). A resumed run starts
+        # from the step of its checkpoint: its draws are seeded with that step too, so it does not repeat the systems the epoch began with.
+        start = self.trainer.global_step if self.trainer is not None else 0
+        print(f"[data] training sampler seeded from step {start}", flush=True)
         return PhysDockDataloader(self.train_set, weighted_sampling=True, num_samples=self.samples_per_epoch,
                                   num_workers=self.num_workers, collate_fn=_features_only, distributed=True,
-                                  seed=self.seed, pin_memory=torch.cuda.is_available())
+                                  seed=self.seed + 7919 * start, pin_memory=torch.cuda.is_available())
 
     def val_dataloader(self):
         # every rank validates its own slice of the systems (metrics are synced at the end of the epoch)

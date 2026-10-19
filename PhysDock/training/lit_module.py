@@ -61,6 +61,7 @@ class PhysDockLitModule(L.LightningModule):
         self.optim = optim
         self.val = val or {"num_samples": 5, "steps": 20}
         self.grad_stats = grad_stats
+        self.skipped_steps = 0                  # updates skipped because of a non-finite gradient
         # MeanMetric is synced over the DDP ranks at epoch end, also for ranks with no (or skipped) systems
         names = ["loss"] + [f"loss_{k}" for k in self.loss_fn.weights] + list(SAMPLE_METRICS)
         self.val_metrics = torch.nn.ModuleDict({k: MeanMetric() for k in names})
@@ -139,7 +140,12 @@ class PhysDockLitModule(L.LightningModule):
             raise ValueError("fp16 (loss scaling) is not supported, use precision 32 or bf16-mixed")
         if gradient_clip_algorithm not in (None, "norm"):
             raise ValueError(f"only norm clipping is supported, got {gradient_clip_algorithm!r}")
-        torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_val)
+        norm = torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_val)
+        if not torch.isfinite(norm):          # a bad batch: skip the update (Adam leaves parameters without a gradient alone) instead of poisoning the weights
+            optimizer.zero_grad(set_to_none=True)
+            self.skipped_steps += 1
+            print(f"[train] step {self.global_step}: non-finite gradient norm, update skipped ({self.skipped_steps} so far)", flush=True)
+        self.log("train/skipped_steps", float(self.skipped_steps), batch_size=1)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.optim["lr"], betas=tuple(self.optim["betas"]),
