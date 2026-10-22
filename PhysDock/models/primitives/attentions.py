@@ -172,7 +172,8 @@ class DiTAttention(nn.Module):
         h, gate = self.norm_s(x, mod)
         q, k, v = self.linear_qkv(h).split(h.shape[-1], dim=-1)
         g = _heads(torch.sigmoid(self.linear_g(h))) if hasattr(self, "linear_g") else None
-        return self.norm_q(_heads(q)), self.norm_k(_heads(k)), _heads(v), gate, g
+        v = _heads(v)
+        return self.norm_q(_heads(q)).to(v.dtype), self.norm_k(_heads(k)).to(v.dtype), v, gate, g       # (the norm scale is float32: back to the dtype of the matmuls)
 
     def output(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor, g: torch.Tensor = None) -> torch.Tensor:
         """Attention output o [B, H, N, 32] -> x + gated update [B, N, c_s]"""

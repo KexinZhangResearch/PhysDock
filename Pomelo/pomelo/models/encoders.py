@@ -123,7 +123,10 @@ class InputEmbedder(nn.Module):
 class TemplateEmbedder(nn.Module):
     """PhysDock's TemplatePairEmbedder, typed: z_t = linear_in(norm(z)) + linear(templ_feat) (0e); the template positions give the node vectors of the triangle multiplications
     (u: the direction to the previous and to the next residue of the chain, the direction from the local centre of the template, all polar) and the directions between the
-    nodes; TemplateBlocks on the pairs of one chain with a template (templ_feat mask); update = linear_out(gate(norm(z_t))) * templ_mask."""
+    nodes; TemplateBlocks on the pairs of one chain with a template (templ_feat mask); update = linear_out(gate(norm(z_t))) * templ_mask.
+
+    cfg.template_unit_directions: the template enters as PhysDock's binned distogram (templ_feat) plus unit directions (the hand): every vector from the positions (the node
+    vectors u, the directions between the nodes of the triangle updates) is a unit vector, so no length beyond the bins reaches the model."""
 
     def __init__(self, cfg: Config, heads: int, channels: int, n_blocks: int) -> None:
         super().__init__()
@@ -132,7 +135,9 @@ class TemplateEmbedder(nn.Module):
         self.linear_templ_feat = nn.Linear(40, mz["0e"], bias=False)
         self.mult_u = {"1o": channels}
         self.linear_u = TypedLinear({"1o": 3}, self.mult_u, bias=False)
-        self.blocks = nn.ModuleList([TemplateBlock(mz, self.mult_u, heads, channels) for _ in range(n_blocks)])
+        self.unit = cfg.template_unit_directions
+        ls = 1e-3 if self.unit else 8.0                         # directions(): w / sqrt(l^2 + |w|^2), with l = 1e-3 Angstrom a unit vector
+        self.blocks = nn.ModuleList([TemplateBlock(mz, self.mult_u, heads, channels, length_scale=ls) for _ in range(n_blocks)])
         self.norm_out, self.gate = TypedNorm(mz), Gate(mz)
         self.linear_out = TypedLinear(mz, mz, bias=False)
 
@@ -147,11 +152,21 @@ class TemplateEmbedder(nn.Module):
         def neighbour(offset):
             nb = (res[None, :] - res[:, None] == offset) & same_chain                                          # [i, j]: j is the residue i + offset of the chain of i
             return torch.where(nb.any(1, keepdim=True), nb.to(pos.dtype) @ pos - pos, torch.zeros_like(pos))
-        d2 = (pos[:, None] - pos[None]).square().sum(-1)
+        if self.unit:                                                                                           # the distances of the bins only (their centres)
+            lo, hi, nb = Fe.TEMPL_BINS
+            edges = torch.linspace(lo, hi, nb, dtype=pos.dtype, device=pos.device)
+            centres = torch.cat([(edges[:-1] + edges[1:]) / 2, edges[-1:] + 2.0])
+            d2 = (m["templ_feat"][..., :nb].to(pos.dtype) @ centres).square()
+        else:
+            d2 = (pos[:, None] - pos[None]).square().sum(-1)
         w = torch.exp(-d2 / (2 * 10.0 ** 2)) * same_chain.to(pos.dtype)
         local = pos - (w @ pos) / w.sum(1, keepdim=True).clamp(min=1e-6)
         vec = torch.stack([neighbour(-1), neighbour(1), torch.where(tok[:, None], local, torch.zeros_like(local))], -2) * REF_SCALE
-        u = self.linear_u({"1o": G.squash(vec, 2.0)})
+        if self.unit:
+            vec = vec * torch.rsqrt(vec.square().sum(-1, keepdim=True) + 1e-12)                                  # unit vectors (0 where there is none)
+        else:
+            vec = G.squash(vec, 2.0)
+        u = self.linear_u({"1o": vec})
         zt = add(self.linear_in(z), {"0e": self.linear_templ_feat(m["templ_feat"].to(pos.dtype))})
         valid = (tok & (mask_t > 0)).to(pos.dtype)
         for blk in self.blocks:

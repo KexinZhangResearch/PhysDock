@@ -1,6 +1,8 @@
 """Decoder (the paper's DiffusionModule): atom DiT -> pool to tokens -> token DiT -> broadcast to atoms -> atom DiT."""
 from typing import NamedTuple, Optional
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +29,7 @@ class DecoderConditions(NamedTuple):
 class AllAtomDecoder(nn.Module):
     """Multi-scale all-atom network. Pre-/post-conditioning (c_in, c_skip, c_out) is done by the diffuser.
 
-    Always runs in float32 (TF32 matmuls per torch.set_float32_matmul_precision), also under bf16 autocast: the
+    Runs in float32 (TF32 matmuls per torch.set_float32_matmul_precision), also under bf16 autocast (unless `half` is set): the
     token stream is large (rms ~3e3, from the encoder's s) and is added back to the atom stream, so bf16 rounding
     there shows up directly in the coordinates (ligand bond errors x2.5 in sampling).
 
@@ -71,6 +73,12 @@ class AllAtomDecoder(nn.Module):
             for stack in (self.atom_dit_encoder, self.atom_dit_decoder):
                 stack.set_distance_decay(float(atom_decay.get("strength", 10.0)), bool(atom_decay.get("learnable", False)))
 
+    half = False        # True: the decoder follows the surrounding autocast (float16 / bfloat16 matmuls) instead of running in float32; the loss stays float32
+
+    def _precision(self, device_type: str):
+        """context of the decoder computations: float32 (autocast off) unless `half`"""
+        return contextlib.nullcontext() if self.half else torch.autocast(device_type, enabled=False)
+
     def condition(self, batch, conds) -> DecoderConditions:
         """Per-structure decoder inputs from the encoder output (computed once, reused by every noisy sample and
         denoising step), in float32.
@@ -79,7 +87,7 @@ class AllAtomDecoder(nn.Module):
             batch: atom_mask [N_atom], token_mask [N_token]
             conds: encoder output (a, ap, s, z)
         """
-        with torch.autocast(batch["atom_mask"].device.type, enabled=False):
+        with self._precision(batch["atom_mask"].device.type):
             a, ap, s, z = (c.float() for c in conds)
             ap_mask, z_mask = pair_mask(batch["atom_mask"].float()), pair_mask(batch["token_mask"].float())
             attend = self.token_dit.blocks[0].attention.attend
@@ -100,7 +108,7 @@ class AllAtomDecoder(nn.Module):
         Returns:
             [B, N_atom, 3] raw network output
         """
-        with torch.autocast(x_in.device.type, enabled=False):
+        with self._precision(x_in.device.type):
             pos = radius = None
             if self.atom_decay is not None:                      # the decay of the atom attentions: its own input, radius following the noise
                 pos = x_in.float()

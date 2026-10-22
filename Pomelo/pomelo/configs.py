@@ -24,6 +24,7 @@ class Config:
     direction_length: float = 2.0   # decoder: the direction messages squashed at this length (units of 4 A)
     vector_cond_gate: bool = False  # decoder: the encoder vectors moved into the noisy sample are gated per channel by the noise level
     zero_gates: bool = False        # decoder: the AdaLN gates of the DiT blocks start at about 0 (AdaLN-Zero, as PhysDock), not at 1
+    template_unit_directions: bool = False   # encoder: the template positions only as unit directions (the distances only through the distogram bins, as PhysDock)
 
     def __post_init__(self):
         self.mult_a = self.mult_a or {"0e": 64, "0o": 16, "1o": 16, "1e": 8}
@@ -52,3 +53,9 @@ def tiny_dist() -> Config:
     the moved encoder vectors and the AdaLN gates of the DiT starting at about 0"""
     import dataclasses
     return dataclasses.replace(tiny(), distance_logits=True, centroid_length=16.0, direction_length=8.0, vector_cond_gate=True, zero_gates=True)
+
+
+def tiny_dist3() -> Config:
+    """tiny_dist with the atom DiT of the decoder 3 + 3 blocks (as PhysDock's) and the template as the binned distogram plus unit directions"""
+    import dataclasses
+    return dataclasses.replace(tiny_dist(), n_atom_blocks=3, template_unit_directions=True)
