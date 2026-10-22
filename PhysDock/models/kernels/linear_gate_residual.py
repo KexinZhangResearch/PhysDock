@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import MODES, compute_dtype, matmul_mode, mm, prep_weight
+from ._common import MODES, compute_dtype, is_half, matmul_mode, mm, prep_weight
 
 HEAD_DIM = 32
 
@@ -42,12 +42,13 @@ MIN_ROWS = 16384        # below this (the single stream: 384 rows) the launch-bo
 
 
 def can_fuse(x: torch.Tensor, o: torch.Tensor) -> bool:
-    """the kernels apply: bfloat16 matmuls (autocast; in TF32 cuBLAS wins the backward) of a CUDA float32 residual x [..., N, C] with
+    """the kernels apply: bfloat16 / float16 matmuls (in TF32 cuBLAS wins the backward, in 3xTF32 torch's float32 is 1.8x faster; the kernels support
+    all four modes) of a CUDA float32 residual x [..., N, C] with
     C = 32 .. 512 a power of two, the attention output o [..., H, N, 32] with a unit stride along the head dimension, and enough rows"""
     c = x.shape[-1]
     if torch.compiler.is_compiling():       # inductor fuses the norm / gate / residual around the matmul itself: 6% faster than this kernel
         return False
-    return (matmul_mode() == MODES["bf16"] and x.numel() // c >= MIN_ROWS and x.is_cuda and x.dtype == torch.float32 and x.dim() in (2, 3) and o.dim() == x.dim() + 1 and 32 <= c <= 512 and c & (c - 1) == 0
+    return (is_half(matmul_mode()) and x.numel() // c >= MIN_ROWS and x.is_cuda and x.dtype == torch.float32 and x.dim() in (2, 3) and o.dim() == x.dim() + 1 and 32 <= c <= 512 and c & (c - 1) == 0
             and o.shape[-1] == HEAD_DIM and o.shape[-3] * HEAD_DIM == c and o.stride(-1) == 1 and x.stride(-1) == 1)
 
 
@@ -134,7 +135,7 @@ def _bwd(dy: torch.Tensor, o: torch.Tensor, g: torch.Tensor, w: torch.Tensor, b:
     cdt = compute_dtype(mode)
     dg = torch.empty(B, N, C, device=dy.device, dtype=g.dtype)
     dt = torch.empty(B, N, C, device=dy.device, dtype=cdt)
-    do = torch.empty(o.shape, device=o.device, dtype=o.dtype if mode == MODES["bf16"] else torch.float32)
+    do = torch.empty(o.shape, device=o.device, dtype=o.dtype if is_half(mode) else torch.float32)
     ntiles = triton.cdiv(M, bp)
     dbp = torch.empty(ntiles, C, device=dy.device, dtype=torch.float32)
     _bwd_kernel[(ntiles,)](dy, o, g, prep_weight(w, mode), b.contiguous(), dt, dg, dbp, do, M, N, dy.stride(0), dy.stride(1), o.stride(0),
@@ -146,7 +147,7 @@ def _bwd(dy: torch.Tensor, o: torch.Tensor, g: torch.Tensor, w: torch.Tensor, b:
 
 @_bwd.register_fake
 def _(dy, o, g, w, b, mode):
-    return (dy.new_empty(dy.shape, dtype=g.dtype), o.new_empty(o.shape, dtype=o.dtype if mode == MODES["bf16"] else torch.float32),
+    return (dy.new_empty(dy.shape, dtype=g.dtype), o.new_empty(o.shape, dtype=o.dtype if is_half(mode) else torch.float32),
             dy.new_empty(w.shape, dtype=torch.float32), dy.new_empty(b.shape, dtype=torch.float32))
 
 

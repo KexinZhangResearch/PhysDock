@@ -12,9 +12,10 @@ columns: cutlass runs them at a few percent of the GPU) and a column reduction o
 read once in the forward and z + dbias once in the backward.
 
 Precision, the same as the torch expression it replaces (never lower): the normalisation in float32, then
-  bfloat16 result (autocast): the matmul inputs rounded to bfloat16, float32 accumulation, the mask added in bfloat16
-                              (what torch's autocast linear does);
-  float32 result:             float32 FMAs (more accurate than torch's TF32 / float32 matmul; these paths are not hot).
+  bfloat16 / float16 result (autocast): the matmul inputs rounded to the half type, float32 accumulation, the mask added in the half type
+                              (what torch's autocast linear does; float16 cannot hold -1e9: the caller passes the finite minimum);
+  float32 result:             float32 FMAs (the narrow atom pairs) or 3xTF32 tensor-core matmuls (the 128-channel pair representation): the accuracy
+                              of torch's float32, more than its TF32 (these paths are not hot).
 The 128-channel pair representation uses tensor cores; the 16-channel atom pairs (K = 16, 4 heads) are memory bound and use per-head
 float32 multiply-reduce in both cases.
 """
@@ -24,27 +25,27 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import MODES, mm, mm_act, num_sms, prep_weight
+from ._common import MODES, is_half, mm, mm_act, num_sms, prep_weight
 
 
-def _config(c: int, bf16: bool):
+def _config(c: int, half: bool):
     """fixed launch configuration (swept on an H20): (FMA path, forward block, warps, stages, backward block, warps, stages,
     programs per SM). Wide z (c >= 64): tl.dot, small tiles in float32 / tensor-core tiles in bfloat16; narrow z (the atom
     pairs): per-head multiply-reduce, big tiles."""
     if c < 64:
         return (True, 128, 2, 2, 256, 2, 2, 4)
-    return (False, 64, 4, 2, 32, 4, 3, 4) if bf16 else (False, 32, 2, 2, 16, 4, 2, 4)
+    return (False, 64, 4, 2, 32, 4, 3, 4) if half else (False, 32, 2, 2, 16, 4, 2, 4)
 
 
 def can_fuse(z: torch.Tensor, n_heads: int) -> bool:
     """the kernels apply: CUDA z with c a power of two in [16, 256] and 1 to 16 heads"""
     c = z.shape[-1]
-    return z.is_cuda and z.dtype in (torch.float32, torch.bfloat16) and 16 <= c <= 256 and c & (c - 1) == 0 and 1 <= n_heads <= 16
+    return z.is_cuda and z.dtype in (torch.float32, torch.bfloat16, torch.float16) and 16 <= c <= 256 and c & (c - 1) == 0 and 1 <= n_heads <= 16
 
 
 @triton.jit
 def _fwd_kernel(Z, MASK, NW, W, LB, OUT, NN, N, stride_oh, stride_oi, eps, neg,
-                C: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, OUT_BF16: tl.constexpr, FMA: tl.constexpr,
+                C: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, FMA: tl.constexpr,
                 MODE: tl.constexpr, BLOCK_P: tl.constexpr, CENTER: tl.constexpr, HAS_B: tl.constexpr):
     pos = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     pm = pos < NN
@@ -63,8 +64,10 @@ def _fwd_kernel(Z, MASK, NW, W, LB, OUT, NN, N, stride_oh, stride_oi, eps, neg,
             lg = tl.sum(zn * tl.load(W + h * C + oc)[None, :], 1)
             if HAS_B:
                 lg = lg + tl.load(LB + h).to(tl.float32)
-            if OUT_BF16:
+            if MODE == 2:
                 res = lg.to(tl.bfloat16) + add.to(tl.bfloat16)
+            elif MODE == 3:
+                res = lg.to(tl.float16) + add.to(tl.float16)
             else:
                 res = lg + add
             tl.store(OUT + h * stride_oh + dst, res, mask=pm)
@@ -73,8 +76,10 @@ def _fwd_kernel(Z, MASK, NW, W, LB, OUT, NN, N, stride_oh, stride_oi, eps, neg,
         logit = mm(zn, w, MODE)                                                                         # [BLOCK_P, HP]
         if HAS_B:
             logit = logit + tl.load(LB + oh, mask=oh < H, other=0.0).to(tl.float32)[None, :]
-        if OUT_BF16:
+        if MODE == 2:
             res = logit.to(tl.bfloat16) + add.to(tl.bfloat16)[:, None]
+        elif MODE == 3:
+            res = logit.to(tl.float16) + add.to(tl.float16)[:, None]
         else:
             res = logit + add[:, None]
         tl.store(OUT + oh[None, :] * stride_oh + dst[:, None], res, mask=pm[:, None] & (oh < H)[None, :])
@@ -141,69 +146,73 @@ def _mask_flat(mask: torch.Tensor) -> torch.Tensor:
     return mask if mask.dtype == torch.float32 and mask.is_contiguous() else mask.float().contiguous()
 
 
-def _weight(lin_w: torch.Tensor, fma: bool, bf16: bool) -> torch.Tensor:
+def _weight(lin_w: torch.Tensor, fma: bool, mode: int) -> torch.Tensor:
     """linear weight as the kernel loads it: float32 for the FMA path, the matmul operand of the mode otherwise"""
-    return lin_w.float().contiguous() if fma else prep_weight(lin_w, MODES["bf16" if bf16 else "fp32"])
+    return lin_w.float().contiguous() if fma else prep_weight(lin_w, mode)
+
+
+def _out_dtype(mode: int) -> torch.dtype:
+    return {MODES["bf16"]: torch.bfloat16, MODES["fp16"]: torch.float16}.get(mode, torch.float32)
 
 
 @torch.library.custom_op("physdock::pair_bias_fwd", mutates_args=())
 def _pair_bias_fwd(z: torch.Tensor, mask: torch.Tensor, norm_w: torch.Tensor, lin_w: torch.Tensor, lin_b: Optional[torch.Tensor],
-                   eps: float, neg_inf: float, bf16: bool, pad: bool, center: bool) -> torch.Tensor:
+                   eps: float, neg_inf: float, mode: int, pad: bool, center: bool) -> torch.Tensor:
     """-> [H, N, N_out] buffer (N_out = N rounded up to 16 if pad else N), the caller slices [..., :N]"""
     N, H, C = z.shape[0], lin_w.shape[0], z.shape[-1]
     z = z.contiguous()
     n_out = (N + 15) // 16 * 16 if pad else N
-    out = torch.empty(H, N, n_out, device=z.device, dtype=torch.bfloat16 if bf16 else torch.float32)
+    out = torch.empty(H, N, n_out, device=z.device, dtype=_out_dtype(mode))
     NN = N * N
-    fma, bp, warps, stages = _config(C, bf16)[:4]
+    fma, bp, warps, stages = _config(C, is_half(mode))[:4]
     lb = lin_b if lin_b is not None else norm_w
-    _fwd_kernel[(triton.cdiv(NN, bp),)](z, _mask_flat(mask), norm_w.contiguous(), _weight(lin_w, fma, bf16), lb.contiguous(), out, NN, N,
-                                        out.stride(0), out.stride(1), eps, neg_inf, C=C, H=H, HP=_hp(H, fma), OUT_BF16=bf16,
-                                        FMA=fma, MODE=MODES["bf16" if bf16 else "fp32"], BLOCK_P=bp, num_warps=warps,
+    _fwd_kernel[(triton.cdiv(NN, bp),)](z, _mask_flat(mask), norm_w.contiguous(), _weight(lin_w, fma, mode), lb.contiguous(), out, NN, N,
+                                        out.stride(0), out.stride(1), eps, neg_inf, C=C, H=H, HP=_hp(H, fma),
+                                        FMA=fma, MODE=mode, BLOCK_P=bp, num_warps=warps,
                                         num_stages=stages, CENTER=center, HAS_B=lin_b is not None)
     return out
 
 
 @_pair_bias_fwd.register_fake
-def _(z, mask, norm_w, lin_w, lin_b, eps, neg_inf, bf16, pad, center):
+def _(z, mask, norm_w, lin_w, lin_b, eps, neg_inf, mode, pad, center):
     N, H = z.shape[0], lin_w.shape[0]
-    return z.new_empty(H, N, (N + 15) // 16 * 16 if pad else N, dtype=torch.bfloat16 if bf16 else torch.float32)
+    return z.new_empty(H, N, (N + 15) // 16 * 16 if pad else N, dtype=_out_dtype(mode))
 
 
 @torch.library.custom_op("physdock::pair_bias_bwd", mutates_args=())
-def _pair_bias_bwd(db: torch.Tensor, z: torch.Tensor, mask: torch.Tensor, norm_w: torch.Tensor, lin_w: torch.Tensor, eps: float, bf16: bool,
+def _pair_bias_bwd(db: torch.Tensor, z: torch.Tensor, mask: torch.Tensor, norm_w: torch.Tensor, lin_w: torch.Tensor, eps: float, mode: int,
                    center: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """db [H, N, N] (any strides) -> dz [N, N, C] (dtype of z), d norm_w [C], d lin_w [H, C], d lin_b [H] (float32)"""
     N, H, C = z.shape[0], lin_w.shape[0], z.shape[-1]
     z = z.contiguous()
-    fma, _, _, _, bp, warps, stages, mult = _config(C, bf16)
+    fma, _, _, _, bp, warps, stages, mult = _config(C, is_half(mode))
     NN, hp = N * N, _hp(H, fma)
     ntiles = triton.cdiv(NN, bp)
     nprog = min(mult * num_sms(), ntiles)
     dz = torch.empty_like(z)
     part = torch.empty(nprog, hp * C + C + hp, device=z.device, dtype=torch.float32)
-    _bwd_kernel[(nprog,)](z, _mask_flat(mask), norm_w.contiguous(), _weight(lin_w, fma, bf16), db, dz, part, NN, N, db.stride(0), db.stride(1),
-                          db.stride(2), eps, ntiles, C=C, H=H, HP=hp, NPROG=nprog, FMA=fma, MODE=MODES["bf16" if bf16 else "fp32"],
+    _bwd_kernel[(nprog,)](z, _mask_flat(mask), norm_w.contiguous(), _weight(lin_w, fma, mode), db, dz, part, NN, N, db.stride(0), db.stride(1),
+                          db.stride(2), eps, ntiles, C=C, H=H, HP=hp, NPROG=nprog, FMA=fma, MODE=mode,
                           BLOCK_P=bp, num_warps=warps, num_stages=stages, CENTER=center)
     tot = part.sum(0)
     return dz, tot[hp * C:hp * C + C].clone(), tot[:H * C].view(H, C).clone(), tot[hp * C + C:hp * C + C + H].clone()
 
 
 @_pair_bias_bwd.register_fake
-def _(db, z, mask, norm_w, lin_w, eps, bf16, center):
+def _(db, z, mask, norm_w, lin_w, eps, mode, center):
     return (z.new_empty(z.shape), z.new_empty(z.shape[-1], dtype=torch.float32), z.new_empty(lin_w.shape, dtype=torch.float32),
             z.new_empty(lin_w.shape[0], dtype=torch.float32))
 
 
 def _setup_context(ctx, inputs, output):
-    z, mask, norm_w, lin_w, lin_b, eps, neg_inf, bf16, pad, center = inputs
+    z, mask, norm_w, lin_w, lin_b, eps, neg_inf, mode, pad, center = inputs
     ctx.save_for_backward(z, mask, norm_w, lin_w)
-    ctx.eps, ctx.bf16, ctx.center, ctx.has_b = eps, bf16, center, lin_b is not None
+    ctx.eps, ctx.mode, ctx.center, ctx.has_b = eps, mode, center, lin_b is not None
 
 
 def _backward(ctx, dout):
     z, mask, norm_w, lin_w = ctx.saved_tensors
-    dz, dnw, dw, db = _pair_bias_bwd(dout, z, mask, norm_w, lin_w, ctx.eps, ctx.bf16, ctx.center)
+    dz, dnw, dw, db = _pair_bias_bwd(dout, z, mask, norm_w, lin_w, ctx.eps, ctx.mode, ctx.center)
     return dz, None, dnw, dw.to(lin_w.dtype), (db.to(lin_w.dtype) if ctx.has_b else None), None, None, None, None, None
 
 
@@ -216,11 +225,11 @@ def pair_bias(z: torch.Tensor, mask: torch.Tensor, norm_weight: torch.Tensor, li
     """linear(norm(z)) + attention mask, see the module docstring (differentiable w.r.t. z, norm_weight, lin_weight and lin_bias)
 
     Args:
-        z: [N, N, C] float32 (or bfloat16)
+        z: [N, N, C] float32 (or bfloat16 / float16)
         mask: [N, N] pair mask (1 = keep)
         norm_weight: [C] RMSNorm scale, lin_weight: [H, C]
         eps: RMSNorm epsilon, inf: masked logits get -inf (e.g. 1e9)
-        out_dtype: float32, or bfloat16 under autocast (selects the matmul precision, see the module docstring)
+        out_dtype: float32, or bfloat16 / float16 under autocast (selects the matmul precision, see the module docstring)
         pad: row stride of the result a multiple of 16 elements (the layout the Triton attention kernel loads fastest)
         lin_bias: [H] bias of the linear layer, or None
         center: LayerNorm (mean subtracted) instead of RMSNorm; norm_weight then is a vector of ones
@@ -229,4 +238,5 @@ def pair_bias(z: torch.Tensor, mask: torch.Tensor, norm_weight: torch.Tensor, li
         [H, N, N] out_dtype (a view of a [H, N, N_pad] buffer if pad)
     """
     N = z.shape[0]
-    return _pair_bias_fwd(z, mask, norm_weight, lin_weight, lin_bias, eps, -inf, out_dtype == torch.bfloat16, pad, center)[..., :N]
+    mode = {torch.bfloat16: MODES["bf16"], torch.float16: MODES["fp16"]}.get(out_dtype, MODES["tf32x3"])
+    return _pair_bias_fwd(z, mask, norm_weight, lin_weight, lin_bias, eps, -min(inf, torch.finfo(out_dtype).max), mode, pad, center)[..., :N]

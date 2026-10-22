@@ -32,7 +32,7 @@ from pomelo.data import features as Fe
 from pomelo.models.primitives import frames as Fr
 from pomelo.models.primitives import geometry as G
 from pomelo.models.primitives.irreps import Gate, NormLinear, TypedLinear, TypedNorm, TypedPool, add
-from pomelo.models.primitives.transformers import SingleBlock, TemplateBlock, TrunkBlock
+from pomelo.models.primitives.transformers import AtomBlock, TemplateBlock, TrunkBlock
 from pomelo.models.primitives.triangle import PairFromSingle
 from pomelo.utils.tensor_utils import N_RBF, rbf
 
@@ -95,8 +95,15 @@ class InputEmbedder(nn.Module):
         self.linear_bonds = nn.Linear(1, mz["0e"], bias=False)
 
     def forward(self, m: Dict[str, torch.Tensor]) -> Dict[str, object]:
+        """m: the features, padded or not: atom_mask [Na] / token_mask [Nt] (absent: all real), n_conformers (absent: max + 1; padded: a fixed number, the padding atoms
+        in a conformer of their own)"""
         ref, conf, a2t = m["ref_pos"], m["atom_to_conformer"], m["atom_to_token"]
         dt = ref.dtype
+        am = m["atom_mask"].to(dt) if "atom_mask" in m else torch.ones(ref.shape[0], dtype=dt, device=ref.device)
+        nt = m["restype"].shape[0]
+        tm = m["token_mask"].to(dt) if "token_mask" in m else torch.ones(nt, dtype=dt, device=ref.device)
+        nc = int(m["n_conformers"]) if "n_conformers" in m else int(conf.max()) + 1
+        real = am > 0
         same = conf[:, None] == conf[None]
         a0e = self.linear_c(m["ref_feat"][:, ATOM_COLUMNS].to(dt))
         d = torch.cdist(ref, ref, compute_mode="donot_use_mm_for_euclid_dist")
@@ -105,11 +112,12 @@ class InputEmbedder(nn.Module):
         ap0e = self.ffn(self.linear_c_l(h)[:, None] + self.linear_c_m(h)[None] + self.linear_d(geo))
         s0e = self.linear_target_feat(m["target_feat"].to(dt)) + self.linear_key_res_feat(m["key_res_feat"].to(dt)) + self.linear_pocket(m["is_pocket"].to(dt)[:, None])
         z0e = self.rel_pos({**m, "ligand_pair_feat": m["ligand_pair_feat"].to(dt)}) + self.linear_bonds(m["token_bonds"].to(dt)[..., None])
-        nt, nc = m["restype"].shape[0], int(conf.max()) + 1
-        onehot = F.one_hot(a2t, nt).T.to(dt)                                                                    # [Nt, Na]
-        t2c = torch.zeros(nt, dtype=torch.long, device=ref.device).scatter_(0, a2t, conf)
-        return {"a0e": a0e, "ap0e": ap0e, "s0e": s0e, "z0e": z0e, "pool": onehot / onehot.sum(1, keepdim=True), "atom_to_token": a2t, "atom_to_conformer": conf,
-                "token_to_conformer": t2c, "neighbour_mean": neighbour_mean(Fe.bonded(ref, conf), dt), "n_atoms": a2t.shape[0], "n_tokens": nt, "n_conformers": nc}
+        onehot = F.one_hot(a2t, nt).T.to(dt) * am[None]                                                         # [Nt, Na]: the real atoms of every token
+        t2c = torch.full((nt,), nc - 1, dtype=torch.long, device=ref.device).scatter_reduce(0, a2t, torch.where(real, conf, nc - 1), "amin", include_self=True)
+        bonded = Fe.bonded(ref, conf) & real[:, None] & real[None]
+        return {"a0e": a0e, "ap0e": ap0e, "s0e": s0e, "z0e": z0e, "pool": onehot / onehot.sum(1, keepdim=True).clamp(min=1), "atom_to_token": a2t, "atom_to_conformer": conf,
+                "token_to_conformer": t2c, "neighbour_mean": neighbour_mean(bonded, dt), "n_atoms": a2t.shape[0], "n_tokens": nt, "n_conformers": nc,
+                "atom_mask": am, "token_mask": tm}
 
 
 class TemplateEmbedder(nn.Module):
@@ -131,7 +139,7 @@ class TemplateEmbedder(nn.Module):
     def forward(self, m, z, mask_t: torch.Tensor):
         pos = m["templ_pos"].to(z["0e"].dtype)
         chain = m["asym_id"]
-        tok = m["is_protein"] > 0
+        tok = (m["is_protein"] > 0) & (mask_t > 0)                                                            # the real protein tokens
         same_chain = (chain[:, None] == chain[None]) & tok[:, None] & tok[None]
         pair_mask = same_chain & (m["templ_feat"][..., 39] > 0) & (mask_t[:, None] > 0) & (mask_t[None] > 0)
         res = m["residue_index"]
@@ -161,7 +169,7 @@ class EncoderTrunk(nn.Module):
         self.a_in_vec = TypedLinear({"1o": 2, "1e": 1}, {"1o": ma["1o"], "1e": ma["1e"]}, bias=False)
         self.ap_vol = nn.Linear(mp["0e"], mp["0o"], bias=False)
         self.a_in_0o = nn.Linear(mp["0o"], ma["0o"], bias=False)                                # 0o -> 0o: no bias
-        self.atom_blocks = nn.ModuleList([SingleBlock(ma, mp, cfg.heads_atom, cfg.product_channels) for _ in range(cfg.n_encoder_atom_blocks)])
+        self.atom_blocks = nn.ModuleList([AtomBlock(ma, mp, cfg.heads_atom, cfg.product_channels) for _ in range(cfg.n_encoder_atom_blocks)])
         self.atom_pair = PairFromSingle(ma, mp, channels=pair_channels)
         self.pool = TypedPool(ma, ms)
         sc = {k: ms[k] for k in ("0e", "0o")}
@@ -186,9 +194,10 @@ class EncoderTrunk(nn.Module):
         size = same_atom.sum(1, keepdim=True).to(dt)
         a = {"0e": st["a0e"], "0o": self.a_in_0o(ap["0o"].sum(1) / size),                                     # the mean over the conformer of the pair pseudoscalars
              **self.a_in_vec({"1o": vec, "1e": torch.linalg.cross(vec[:, 0], vec[:, 1], dim=-1)[:, None]})}
-        mask_a, mask_t = torch.ones(n, dtype=dt, device=dev), torch.ones(nt, dtype=dt, device=dev)
+        mask_a, mask_t = st["atom_mask"], st["token_mask"]
+        attend = same_atom & (mask_a[None] > 0)                                                                 # the real atoms of the own conformer (padding: a conformer of its own)
         for blk in self.atom_blocks:
-            a = blk(a, ap, ref, mask_a, same_atom, same_atom)                                                  # the atoms of a conformer attend to each other only
+            a = blk(a, ap, ref - cm[conf], attend)                                                              # the atoms of a conformer attend to each other only
         ap = add(ap, self.atom_pair(a, ref, mask_a, same_atom))
         s = self.pool(a, pool)
         s = {**s, "0e": s["0e"] + st["s0e"]}
@@ -202,5 +211,5 @@ class EncoderTrunk(nn.Module):
             s, z = blk(s, z, centre_t, mask_t, same_token)
         ref_rel = (ref - cm[conf]) * REF_SCALE
         inv, null = Fr.reference_moments(ref_rel, conf, nc)
-        keep = ("pool", "atom_to_token", "atom_to_conformer", "token_to_conformer", "neighbour_mean", "n_atoms", "n_tokens", "n_conformers")
+        keep = ("pool", "atom_to_token", "atom_to_conformer", "token_to_conformer", "neighbour_mean", "n_atoms", "n_tokens", "n_conformers", "atom_mask", "token_mask")
         return {**{k: st[k] for k in keep}, "a": a, "ap": ap, "s": s, "z": z, "frames": {"ref_rel": ref_rel, "inv": inv, "null": null}}

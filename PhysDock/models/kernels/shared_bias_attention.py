@@ -8,9 +8,13 @@ the triangle attention of the pair stack, the single attention and the MSA row a
 The bias is the same for every b: the B noisy samples of the DiT, or the N rows of triangle attention. Gradients for
 q, k, v and bias (summed over b).
 
-Precision (float32 inputs): TF32 matmuls with the inputs rounded to nearest, like cuBLAS does for torch's TF32 matmuls
-(the Triton default truncates the low 13 mantissa bits, which makes the gradients ~6x less accurate than torch's TF32);
-softmax and accumulators in float32. bfloat16 inputs use plain bf16 matmuls. Scores are kept in log2 units (exp2 is a hardware instruction).
+Precision (the mode follows the dtype of q, k, v and torch's float32 matmul precision, see kernels/_common.py): float32 inputs with
+torch.set_float32_matmul_precision("high") (the default of the training): TF32 matmuls with the inputs rounded to nearest, like cuBLAS does for torch's TF32
+matmuls (the Triton default truncates the low 13 mantissa bits, which makes the gradients ~6x less accurate); with "highest": 3xTF32 matmuls, the
+accuracy of float32 (and the speed of torch's float32 attention: 3.5x slower than TF32 at the atoms of the decoder). torch's own
+scaled_dot_product_attention computes float32 inputs in float32 whatever the flag, so the TF32 mode is 4e-4 less accurate than it, by design.
+bfloat16 / float16 inputs: plain half matmuls; softmax and accumulators in float32. `precision=` overrides the mode. Scores are kept in log2
+units (exp2 is a hardware instruction).
 
 Backward, one fused kernel instead of the usual three passes: grid (query block, key block, head [x batch split]),
 looping over the batch inside. The bias tile is loaded once for all b, the scores are recomputed once, and dbias is
@@ -44,12 +48,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import num_sms, round_tf32_ as _round_tf32
+from ._common import MODES, float32_mode, is_half, num_sms, round_tf32_ as _round_tf32
 
 _MAX_SPLIT = 8
 
 
-def _fwd_config(B: int, H: int, N: int, bf16: bool, decay: bool):
+def _fwd_config(B: int, H: int, N: int, half: bool, decay: bool):
     """(BLOCK_M, BLOCK_N, num_warps, num_stages) of the forward, fixed (no autotuning pass: it costs minutes of compilation
     per shape). Found by sweeping all configurations on an H20 (sm_90) at the shapes of the model (DiT atoms / tokens,
     triangle attention): with a head dim of 32 the score tile dominates the registers, so small tiles with few warps win
@@ -58,7 +62,7 @@ def _fwd_config(B: int, H: int, N: int, bf16: bool, decay: bool):
     if decay:
         return (64, 32, 2, 3)
     full = B * triton.cdiv(N, 64) * H >= 3000            # 64-row query tiles: how full the GPU is
-    if bf16:
+    if half:
         if N > 1024:
             return (64, 64, 4, 3) if full else (64, 32, 4, 3)
         return (64, 32, 4, 3) if full else (32, 32, 1, 2)
@@ -67,12 +71,12 @@ def _fwd_config(B: int, H: int, N: int, bf16: bool, decay: bool):
     return (32, 16, 2, 3)
 
 
-def _bwd_config(N: int, bf16: bool, decay: bool):
+def _bwd_config(N: int, half: bool, decay: bool):
     """(BLOCK_M, BLOCK_N, num_warps, num_stages) of the fused backward, fixed (see _fwd_config)"""
     if decay:
         return (64, 32, 4, 3)
     if N <= 512:
-        return (64, 64, 4, 2) if bf16 else (32, 32, 2, 1)
+        return (64, 64, 4, 2) if half else (32, 32, 2, 1)
     return (64, 64, 4, 3)
 
 
@@ -344,18 +348,18 @@ def _decay_args(pos, radius, lam, q):
 
 @torch.library.custom_op("physdock::shared_bias_attention_fwd", mutates_args=())
 def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor],
-                   pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor]
+                   pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor], mode: int
                    ) -> Tuple[torch.Tensor, torch.Tensor]:
     """-> o [B, N, H, D] contiguous (the caller transposes to [B, H, N, D]), lse [B, H, N] (log2 units)"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
     bias = aligned_bias(bias)
-    rn = q.dtype != torch.bfloat16                          # float32: TF32 matmuls with rounded inputs; bf16: the plain tensor-core product
-    prec = "tf32" if rn else "ieee"
+    rn = mode == MODES["tf32"]                              # TF32: matmuls with rounded inputs; 3xTF32: the matmul splits float32; half: the plain product
+    prec = {MODES["tf32"]: "tf32", MODES["tf32x3"]: "tf32x3"}.get(mode, "ieee")
     o = torch.empty(B, N, H, D, device=q.device, dtype=q.dtype)
     ov = o.transpose(1, 2)
     lse = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
-    bm, bn, warps, stages = _fwd_config(B, H, N, q.dtype == torch.bfloat16, pos is not None)
+    bm, bn, warps, stages = _fwd_config(B, H, N, is_half(mode), pos is not None)
     pre = rn and N >= PRE_MIN_N
     if pre:
         q, k, v = prepare_tf32([q, k, v], D ** -0.5 * 1.4426950408889634)
@@ -370,7 +374,7 @@ def _attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torc
 
 
 @_attention_fwd.register_fake
-def _(q, k, v, bias, n_valid, pos, radius, lam):
+def _(q, k, v, bias, n_valid, pos, radius, lam, mode):
     B, H, N, D = q.shape
     return q.new_empty(B, N, H, D), q.new_empty(B, H, N, dtype=torch.float32)
 
@@ -378,15 +382,15 @@ def _(q, k, v, bias, n_valid, pos, radius, lam):
 @torch.library.custom_op("physdock::shared_bias_attention_bwd", mutates_args=())
 def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor],
                    pos: Optional[torch.Tensor], radius: Optional[torch.Tensor], lam: Optional[torch.Tensor],
-                   o: torch.Tensor, lse: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                   o: torch.Tensor, lse: torch.Tensor, mode: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """do, o: [B, N, H, D] -> dq, dk, dv [B, N, H, D], dbias [H, N, N], dlambda [H] (zeros when the decay is off)"""
     B, H, N, D = q.shape
     q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
     bias = aligned_bias(bias)
     if do.stride(-1) != 1:
         do = do.contiguous()
-    rn = q.dtype != torch.bfloat16
-    prec = "tf32" if rn else "ieee"
+    rn = mode == MODES["tf32"]
+    prec = {MODES["tf32"]: "tf32", MODES["tf32x3"]: "tf32x3"}.get(mode, "ieee")
     block_d = max(16, triton.next_power_of_2(D))
     ov, dov = o.transpose(1, 2), do.transpose(1, 2)
     delta = torch.empty(B, H, N, device=q.device, dtype=torch.float32)
@@ -397,7 +401,7 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
     dbias = torch.empty(split, H, N, _pad16(N), device=q.device, dtype=torch.float32)[..., :N]
     dqv, dkv, dvv = dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2)
     scale = D ** -0.5
-    bm, bn, warps, stages = _bwd_config(N, q.dtype == torch.bfloat16, pos is not None)
+    bm, bn, warps, stages = _bwd_config(N, is_half(mode), pos is not None)
     dtype = q.dtype
     pre = rn and N >= PRE_MIN_N
     if pre:                                         # TF32 rounding of the matmul inputs once, not once per tile
@@ -415,23 +419,23 @@ def _attention_bwd(do: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.
 
 
 @_attention_bwd.register_fake
-def _(do, q, k, v, bias, n_valid, pos, radius, lam, o, lse):
+def _(do, q, k, v, bias, n_valid, pos, radius, lam, o, lse, mode):
     B, H, N, D = q.shape
     return (q.new_empty(B, N, H, D), q.new_empty(B, N, H, D), q.new_empty(B, N, H, D),
             bias.new_empty(H, N, N, dtype=torch.float32), q.new_empty(H, dtype=torch.float32))
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, bias, n_valid, pos, radius, lam = inputs
+    q, k, v, bias, n_valid, pos, radius, lam, mode = inputs
     ctx.save_for_backward(q, k, v, bias, output[0], output[1])
-    ctx.n_valid, ctx.pos, ctx.radius, ctx.lam = n_valid, pos, radius, lam
+    ctx.n_valid, ctx.pos, ctx.radius, ctx.lam, ctx.mode = n_valid, pos, radius, lam, mode
 
 
 def _backward(ctx, do, _dlse):
     q, k, v, bias, o, lse = ctx.saved_tensors
-    dq, dk, dv, dbias, dlam = _attention_bwd(do, q, k, v, bias, ctx.n_valid, ctx.pos, ctx.radius, ctx.lam, o, lse)
+    dq, dk, dv, dbias, dlam = _attention_bwd(do, q, k, v, bias, ctx.n_valid, ctx.pos, ctx.radius, ctx.lam, o, lse, ctx.mode)
     dlam = dlam.to(ctx.lam.dtype) if ctx.lam is not None and ctx.lam.requires_grad else None
-    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype), None, None, None, dlam
+    return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), dbias.to(bias.dtype), None, None, None, dlam, None
 
 
 _attention_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -439,16 +443,18 @@ _attention_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, n_valid: Optional[torch.Tensor] = None,
                           pos: Optional[torch.Tensor] = None, radius: Optional[torch.Tensor] = None,
-                          lam: Optional[torch.Tensor] = None) -> torch.Tensor:
+                          lam: Optional[torch.Tensor] = None, precision: Optional[str] = None) -> torch.Tensor:
     """softmax(q k^T / sqrt(D) + bias) v with a bias shared by the batch.
 
     Args:
-        q, k, v: [B, H, N, D] float32 or bfloat16
+        q, k, v: [B, H, N, D] float32, bfloat16 or float16
         bias: [H, N, N] attention logit bias (pair features + key mask), shared by the B batch entries
         n_valid: int32 tensor of one element on the device, the number of leading positions that are real (the rest is padding, see the
             module docstring); None: all N
         pos: [B, N, 3] positions of the distance decay (None: no decay, nothing is computed for it), radius: [B] its radius in the units
             of pos, lam: [H] its strength per head (differentiable); see the module docstring
+        precision: "tf32x3", "tf32", "bf16" or "fp16" (default: bf16 / fp16 for bf16 / fp16 inputs, tf32 / tf32x3 for float32 as torch's float32
+            matmul precision is "high" / "highest")
 
     Returns:
         [B, H, N, D]
@@ -458,8 +464,8 @@ def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bia
         raise ValueError(f"q, k, v must have the same shape [B, H, N, D], got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}")
     if tuple(bias.shape) != (H, N, N):
         raise ValueError(f"bias must be [H, N, N] = {(H, N, N)}, got {tuple(bias.shape)}")
-    if q.dtype not in (torch.float32, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
-        raise ValueError(f"q, k, v must be float32 or bfloat16 of the same dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
+    if q.dtype not in (torch.float32, torch.bfloat16, torch.float16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError(f"q, k, v must be float32, bfloat16 or float16 of the same dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
     if D > 128:
         raise ValueError(f"head dim must be <= 128, got {D}")
     if pos is not None:
@@ -468,4 +474,8 @@ def shared_bias_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bia
         pos = pos.detach().float().permute(2, 0, 1).contiguous()          # [3, B, N]: one coalesced load per axis in the kernels
         radius = radius.detach().float().reshape(-1).contiguous()
         lam = lam.float().reshape(-1).contiguous()
-    return _attention_fwd(q, k, v, bias, n_valid, pos, radius, lam)[0].transpose(1, 2)
+    auto = {torch.bfloat16: MODES["bf16"], torch.float16: MODES["fp16"]}.get(q.dtype, float32_mode())
+    mode = MODES[precision] if precision else auto
+    if is_half(auto) and mode != auto or not is_half(auto) and is_half(mode):
+        raise ValueError(f"precision {precision!r} does not fit the dtype {q.dtype}")
+    return _attention_fwd(q, k, v, bias, n_valid, pos, radius, lam, mode)[0].transpose(1, 2)

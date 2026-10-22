@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pomelo.models.primitives import geometry as G
-from pomelo.models.primitives.attentions import TypedAttention, TypedTriangleAttention
+from pomelo.models.primitives.attentions import MASKED, PairBias, SharedBiasAttention, TypedAttention, TypedTriangleAttention
 from pomelo.models.primitives.irreps import (Feats, GeometricProduct, Mult, TypedLinear, TypedNorm, add, mask_pairs, mask_rows)
 from pomelo.models.primitives.triangle import PairFromSingle, TypedTriangleMultiplication
 
@@ -114,3 +114,25 @@ class TemplateBlock(nn.Module):
         y = add(y, self.transition(y))
         keep = pair_mask[..., None]
         return {k: torch.where(keep, v, z[k].detach()) for k, v in y.items()}
+
+
+class AtomBlock(nn.Module):
+    """One block of the atom stage of the encoder (PhysDock's AtomBlock: attention with the pair bias + transition, here with the geometric products in front): the attention is
+    the shared-bias kernel (SharedBiasAttention) with the logit bias of the atom pairs and the mask of the conformers (an atom attends to the atoms of its own conformer only, so
+    every vector term of a pair is in one frame). s += products, s += attention, s += transition. No [H, N, N] weight tensor is kept."""
+
+    def __init__(self, mult_s: Mult, mult_z: Mult, heads: int, product_channels: int = 32, expansion: float = 8 / 3) -> None:
+        super().__init__()
+        self.product = GeometricProduct(mult_s, mult_s, product_channels)
+        self.norm = TypedNorm(mult_s)
+        self.pair_bias = PairBias(mult_z, heads, 1)
+        self.attention = SharedBiasAttention(mult_s, heads)
+        self.transition = TypedTransition(mult_s, expansion)
+
+    def forward(self, s: Feats, z: Feats, centers: torch.Tensor, attn_mask: torch.Tensor) -> Feats:
+        """s {kind: [N, ...]}, z the atom pairs, centers [N, 3] (each in the frame of its conformer), attn_mask [N, N] bool (the pairs of one conformer)"""
+        s = add(s, self.product(s))
+        bias = self.pair_bias(z)[0] + torch.where(attn_mask, 0.0, MASKED).to(centers.dtype)
+        x = {k: v[None] for k, v in self.norm(s).items()}
+        s = add(s, {k: v[0] for k, v in self.attention(x, bias, centers[None]).items()})
+        return add(s, self.transition(s))

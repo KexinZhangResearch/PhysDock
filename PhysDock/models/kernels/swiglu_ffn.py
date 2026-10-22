@@ -7,7 +7,7 @@ silu and a product and keeps the hidden activations for the backward: three [M, 
 and its backward spends 7 ms on a concatenation of the two hidden gradients. The kernels keep a tile of x in registers, compute the
 hidden units for it and write only the [M, C] result; the backward recomputes the hidden units from x, so only x is saved.
 
-Precision: see kernels/_common.py (bf16 under autocast, TF32 or float32 otherwise, the residual x kept in its own dtype: float32 in
+Precision: see kernels/_common.py (bf16 / fp16 under autocast, TF32 or 3xTF32 otherwise, the residual x kept in its own dtype: float32 in
 the model). The hidden units, the silu and the products are float32 (torch rounds them to the matmul dtype), the result is
 x + ffn(x) in float32, rounded once to the dtype of x. Weight gradients are summed in float32 from per-program partial sums.
 """
@@ -21,8 +21,8 @@ from ._common import matmul_mode, mm, mm_act, num_sms, prep_weight
 
 
 def can_fuse(x: torch.Tensor, hidden: int) -> bool:
-    """CUDA float32 / bfloat16 x with 16 or 32 channels and a hidden size of 128"""
-    return x.is_cuda and x.dtype in (torch.float32, torch.bfloat16) and x.shape[-1] in (16, 32) and hidden == 128
+    """CUDA float32 / bfloat16 / float16 x with 16 or 32 channels and a hidden size of 128"""
+    return x.is_cuda and x.dtype in (torch.float32, torch.bfloat16, torch.float16) and x.shape[-1] in (16, 32) and hidden == 128
 
 
 @triton.jit

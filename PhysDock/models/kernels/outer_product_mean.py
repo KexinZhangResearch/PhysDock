@@ -29,28 +29,30 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import MODES, compute_dtype, matmul_mode, mm, mm_act, prep_weight
+from ._common import MODES, cfg_mode, compute_dtype, matmul_mode, mm, mm_act, prep_weight
 
 _H = 32                # channels of q and k
 HEAD = tl.constexpr(_H)
 # (forward: BI, warps, stages), (dW: BI, warps, stages, slices), (dq: BI, warps, stages), (dk: BI, warps, stages, slices), swept on an H20
 _CONFIGS = {
     MODES["bf16"]: ((64, 4, 2), (128, 8, 3, 16), (64, 4, 2), (64, 4, 2, 4)),
-    MODES["tf32"]: ((32, 4, 3), (64, 4, 3, 16), (32, 4, 3), (128, 8, 3, 1)),
+    MODES["tf32"]: ((32, 4, 3), (64, 4, 3, 16), (32, 4, 3), (128, 8, 3, 1)),          # (3xTF32: these; float16: the bfloat16 ones, see cfg_mode)
 }
 
 
 def _config(mode: int):
-    return _CONFIGS.get(mode, _CONFIGS[MODES["tf32"]])
+    return _CONFIGS[cfg_mode(mode)]
 
 
 def can_fuse(qk: torch.Tensor, z: torch.Tensor) -> bool:
-    """the kernels apply: CUDA qk [S, N, 64] (float32 or bfloat16, unit stride in the last dimension) and a float32 z [N, N, CZ] with CZ a
-    power of two in [32, 128]; in TF32 only without gradients (the forward is 1.1x faster than torch's, the backward 1.6x slower)"""
+    """the kernels apply: CUDA qk [S, N, 64] (float32, bfloat16 or float16, unit stride in the last dimension) and a float32 z [N, N, CZ] with CZ a
+    power of two in [32, 128]; in TF32 only without gradients (the forward is 1.1x faster than torch's, the backward 1.6x slower); not in 3xTF32
+    (the kernels support it; 3x slower than torch's float32 here)"""
     cz = z.shape[-1]
-    if matmul_mode() != MODES["bf16"] and torch.is_grad_enabled():
+    mode = matmul_mode()
+    if mode == MODES["tf32x3"] or (mode == MODES["tf32"] and torch.is_grad_enabled()):
         return False
-    return (qk.is_cuda and qk.dim() == 3 and qk.shape[-1] == 64 and qk.stride(-1) == 1 and qk.dtype in (torch.float32, torch.bfloat16)
+    return (qk.is_cuda and qk.dim() == 3 and qk.shape[-1] == 64 and qk.stride(-1) == 1 and qk.dtype in (torch.float32, torch.bfloat16, torch.float16)
             and z.dtype == torch.float32 and z.dim() == 3 and z.shape[0] == z.shape[1] == qk.shape[1] and 32 <= cz <= 128 and cz & (cz - 1) == 0)
 
 
@@ -84,6 +86,8 @@ def _fwd_kernel(QT, K, WP, BO, NW, Z, Y, U, S, N, sqc, sqs, sks, skn, eps,
     u = acc + tl.load(BO + ocz).to(tl.float32)[None, :]
     if MODE == 2:
         u = u.to(tl.bfloat16).to(tl.float32)
+    elif MODE == 3:
+        u = u.to(tl.float16).to(tl.float32)
     off = (oi * N + j)[:, None] * CZ + ocz[None, :]
     tl.store(U + off, u.to(U.dtype.element_ty), mask=imask[:, None])
     n = u * tl.math.rsqrt(tl.sum(u * u, 1) / CZ + eps)[:, None] * tl.load(NW + ocz).to(tl.float32)[None, :]

@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._common import MODES, compute_dtype, matmul_mode, mm, prep_weight
+from ._common import MODES, cfg_mode, compute_dtype, half_dtype, is_half, matmul_mode, mm, prep_weight
 
 
 # (K, NOUT, mode) -> (forward: rows per program, output columns per step, warps, stages; backward kernel: the same), swept on an H20
@@ -40,6 +40,7 @@ _CONFIGS = {
 
 
 def _config(k: int, nout: int, mode: int):
+    mode = cfg_mode(mode)
     if (k, nout, mode) in _CONFIGS:
         return _CONFIGS[(k, nout, mode)]
     return ((64, 32, 4, 2), (32, 32, 4, 2)) if k <= 256 else ((16, 32, 4, 2), (16, 32, 4, 2))
@@ -49,14 +50,16 @@ MIN_ROWS = 16384        # below this (the atom stream: 3072 rows) the launch-bou
 
 
 def can_fuse(x: torch.Tensor, nout: int) -> bool:
-    """the kernels apply: bfloat16 matmuls (autocast) of a CUDA float32 x with a power-of-two channel count in [16, 512] and an output
-    width divisible by 16, and enough work. In TF32 the Triton matmuls are slower than cuBLAS's (pair projection 0.48 vs 0.60 ms forward but
-    the backward 1.7 vs 2.2 ms only; MSA and single projections lose), so the TF32 and float32 paths run torch."""
+    """the kernels apply: bfloat16 / float16 / 3xTF32 matmuls of a CUDA float32 x with a power-of-two channel count in [16, 512] and an output
+    width divisible by 16, and enough work (3xTF32: the 512-channel single stream with its 384 rows loses to torch's float32, 0.5x). In TF32 the
+    Triton matmuls are slower than cuBLAS's (pair projection 0.48 vs 0.60 ms forward but the backward 1.7 vs 2.2 ms only; MSA and single projections
+    lose), so the TF32 path runs torch (the kernels support all four modes)."""
     k = x.shape[-1]
     if torch.compiler.is_compiling():       # inductor fuses the norm / gate / residual around the matmul itself: 6% faster than this kernel
         return False
-    return (matmul_mode() == MODES["bf16"] and x.is_cuda and x.dtype == torch.float32 and 16 <= k <= 512 and k & (k - 1) == 0
-            and nout % 16 == 0 and (k >= 512 or x.numel() // k >= MIN_ROWS))
+    mode = matmul_mode()
+    return (mode != MODES["tf32"] and x.is_cuda and x.dtype == torch.float32 and 16 <= k <= 512 and k & (k - 1) == 0
+            and nout % 16 == 0 and ((k >= 512 and is_half(mode)) or x.numel() // k >= MIN_ROWS))
 
 
 @triton.jit
@@ -109,7 +112,7 @@ def _fwd(x: torch.Tensor, norm_w: torch.Tensor, w: torch.Tensor, b: Optional[tor
     bp, bn, warps, stages = _config(K, nout, mode)[0]
     x = x.contiguous()
     M = x.numel() // K
-    y = torch.empty(*x.shape[:-1], nout, device=x.device, dtype=compute_dtype(mode) if mode == MODES["bf16"] else x.dtype)
+    y = torch.empty(*x.shape[:-1], nout, device=x.device, dtype=half_dtype(mode) if is_half(mode) else x.dtype)
     bias = b if b is not None else norm_w
     _fwd_kernel[(triton.cdiv(M, bp),)](x, norm_w.contiguous(), prep_weight(w, mode), bias.contiguous(), y, M, eps, K=K, NOUT=nout,
                                        BIAS=0 if b is None else b.numel(), BN=bn, MODE=mode, BLOCK_M=bp, num_warps=warps,
@@ -119,7 +122,7 @@ def _fwd(x: torch.Tensor, norm_w: torch.Tensor, w: torch.Tensor, b: Optional[tor
 
 @_fwd.register_fake
 def _(x, norm_w, w, b, eps, mode):
-    return x.new_empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16 if mode == MODES["bf16"] else x.dtype)
+    return x.new_empty(*x.shape[:-1], w.shape[0], dtype=half_dtype(mode) if is_half(mode) else x.dtype)
 
 
 @torch.library.custom_op("physdock::rmsnorm_linear_bwd", mutates_args=())

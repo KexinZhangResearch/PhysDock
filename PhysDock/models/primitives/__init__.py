@@ -288,7 +288,7 @@ class RMSNormPairBias(KernelModule):
         # a uniform softmax and passes gradient to every masked logit, which the RMSNorm of the zero padding pairs amplifies by 1 / sqrt(eps));
         # contiguous: sdpa gives wrong gradients for a permuted bias view
         logits = self.linear(self.norm(z)).permute(2, 0, 1).to(like.dtype)
-        return logits.masked_fill(z_mask[None] == 0, -self.inf).contiguous()
+        return logits.masked_fill(z_mask[None] == 0, -min(self.inf, torch.finfo(like.dtype).max)).contiguous()      # (float16 cannot hold -1e9: -inf would make a fully masked row nan)
 
 
 def valid_length(pair_mask: torch.Tensor) -> torch.Tensor:
@@ -350,7 +350,8 @@ class LayerNormPairBias(KernelModule):
             z = zc * torch.rsqrt(zc.pow(2).mean(-1, keepdim=True) + self.eps)
         else:
             z = F.layer_norm(z, z.shape[-1:], eps=self.eps)
-        logits = self.linear(z).permute(2, 0, 1).masked_fill(z_mask == 0, -self.inf)       # no gradient at the masked entries (see RMSNormPairBias)
+        logits = self.linear(z).permute(2, 0, 1)
+        logits = logits.masked_fill(z_mask == 0, -min(self.inf, torch.finfo(logits.dtype).max))       # no gradient at the masked entries (see RMSNormPairBias)
         logits = logits.reshape(-1, self.heads, *z_mask.shape)
         # the padded layout only pays off in the Triton kernels; sdpa keeps the contiguous bias (torch.compile handles its alignment
         # itself and fails on the padded view)
