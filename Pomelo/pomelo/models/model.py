@@ -51,16 +51,16 @@ class Pomelo(nn.Module):
         x = self.diffuser.sample(self.dit, batch, conds, batch["atom_mask"], num_sample, steps)
         return x * self.sigma_data
 
-    def set_attention_backend(self, atom: str = "efficient", token: str = "efficient") -> None:
+    def set_attention_backend(self, atom: str = "math", token: str = "math") -> None:
         """the SDPA backend of the atom and of the token attentions (pomelo.models.primitives.attentions.BACKENDS)"""
         for blk in [*self.dit.atom_enc, *self.dit.atom_dec]:
             blk.attention.backend = atom
         for blk in self.dit.token_blocks:
             blk.attention.backend = token
 
-    def prepare_training(self, compile: bool = True, checkpoint_blocks: bool = True) -> None:
-        """every DiT block: torch.compile (static shapes: PhysDock pads the crop) inside activation checkpointing, used while gradients are on (validation and sampling,
-        other numbers of samples, stay eager); the condition embedder compiled as one region"""
+    def prepare_training(self, compile: bool = True, checkpoint_blocks: bool = False) -> None:
+        """every DiT block: torch.compile (static shapes: PhysDock pads the crop), optionally inside activation checkpointing (less memory, one more forward), used while
+        gradients are on (validation and sampling, other numbers of samples, stay eager); the condition embedder compiled as one region"""
         def wrap(module, compiled_forward):
             eager = module.forward
 

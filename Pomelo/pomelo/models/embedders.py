@@ -9,11 +9,10 @@ features, no attention: as SimpleFold, everything is per atom and per token.
                    (PhysDock's TokenEmbedder.embed);  0o = linear(the mean over the atoms of the atom 0o)
           vectors  the template positions of the tokens (PhysDock's self-template: the pseudo-beta atom of x_gt, where templ_feat says the template is there; one frame for
                    all of them): they enter the vector channels of the tokens in the DiT, rotated into the frame of every noisy sample by one Kabsch rotation
-  and what the attentions of the DiT need: the boolean masks of the local atom windows and of the tokens (the padding; the diagonal always kept), the RoPE angles (residue
+  and what the attentions of the DiT need: the boolean key masks of the atoms and of the tokens [N, N] (the padding; the diagonal always kept), the RoPE angles (residue
   index, chain) of the tokens and of the atoms (by their token), the pool matrix atoms -> tokens.
 
-Padding: PhysDock pads the crop; a padded atom has atom_to_token 0 and atom_to_conformer 0, so every reduction goes through atom_mask / token_mask. The atoms are padded further
-to a multiple of WQ here.
+Padding: PhysDock pads the crop; a padded atom has atom_to_token 0 and atom_to_conformer 0, so every reduction goes through atom_mask / token_mask.
 """
 from typing import Dict
 
@@ -22,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pomelo.configs import Config
-from pomelo.models.primitives.attentions import FRONT, WK, WQ, rope_angles, windows
+from pomelo.models.primitives.attentions import rope_angles
 
 REF_SCALE = 0.25                        # Angstrom -> units of 4 Angstrom (the unit of the positions of the DiT)
 BOND_CUTOFF = 2.05                      # Angstrom: a covalent bond between heavy atoms in a reference conformer (C-Br 1.94; the shortest 1-3 distance is ~2.2)
@@ -65,15 +64,6 @@ def pad_rows(x: torch.Tensor, n: int, value=0) -> torch.Tensor:
     return torch.cat([x, x.new_full((n - x.shape[0], *x.shape[1:]), value)]) if n > x.shape[0] else x
 
 
-def window_mask(real: torch.Tensor) -> torch.Tensor:
-    """[L, WQ, WK] bool: a real atom in the key window of the block, or the query itself (no row without a key)"""
-    n = real.shape[0]
-    L = n // WQ
-    key = (windows(real[None].to(torch.uint8), 1)[0] > 0)[:, None, :].expand(L, WQ, WK).clone()
-    key[:, torch.arange(WQ), torch.arange(WQ) + FRONT] = True                                         # query a of block l is key FRONT + a of its window
-    return key
-
-
 class ConditionEmbedder(nn.Module):
     def __init__(self, cfg: Config) -> None:
         super().__init__()
@@ -100,7 +90,7 @@ class ConditionEmbedder(nn.Module):
         dt = ref.dtype
         am, tm = b["atom_mask"].to(dt), b["token_mask"].to(dt)
         na, nt = am.shape[0], tm.shape[0]
-        npad = -(-na // WQ) * WQ                                                                     # atoms: a multiple of WQ
+        npad = na
         ref_p, conf_p, am_p, a2t_p = pad_rows(ref, npad), pad_rows(conf, npad), pad_rows(am, npad), pad_rows(a2t, npad)
         idx, has3, nbr_mean = neighbours(ref_p, conf_p, am_p)
         v_ref = signed_volume(ref_p, idx, has3)
@@ -122,4 +112,5 @@ class ConditionEmbedder(nn.Module):
         return {"a": {"0e": a0e, "0o": a0o}, "s": {"0e": s0e, "0o": s0o}, "v_ref": v_ref, "idx": idx, "has3": has3, "nbr_mean": nbr_mean, "pool": pool,
                 "atom_to_token": a2t_p, "atom_to_conformer": conf_p, "atom_mask": am_p, "token_mask": tm, "n_atoms": na,
                 "ref": ref_s, "ref_nbr": ref_nbr, "templ_pos": templ_pos, "templ_on": templ_on, "templ_next": nxt, "templ_prev": prv,
-                "atom_geo": {"mask": window_mask(am_p > 0), "angles": angles[a2t_p]}, "token_geo": {"mask": (tm > 0)[None].expand(nt, nt) | eye, "angles": angles}}
+                "atom_geo": {"mask": (am_p > 0)[None].expand(na, na) | torch.eye(na, dtype=torch.bool, device=tm.device), "angles": angles[a2t_p]},
+                "token_geo": {"mask": (tm > 0)[None].expand(nt, nt) | eye, "angles": angles}}

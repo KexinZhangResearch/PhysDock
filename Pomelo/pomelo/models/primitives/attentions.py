@@ -1,5 +1,5 @@
 """The typed attention of Pomelo (torch only, parity-equivariant by construction), for a batch of noisy samples [B, N, ...] of one structure, without a pair representation.
-Every attention is one F.scaled_dot_product_attention call; its only mask is boolean (no gradient: the key window, the padding); what has a learned weight is in q and k:
+Every attention is one F.scaled_dot_product_attention call; its only mask is boolean (no gradient: the padding); what has a learned weight is in q and k:
 
     logit_ij = q_i . k_j / sqrt(D)                q . k over all kinds (0e.0e, 0o.0o, 1o.1o, 1e.1e: even); RoPE (residue index, chain) on the 0e channels
              - w_h(t) |x_i - x_j|^2               the noisy sample (w >= 0 per head and noise level): q gets [x_i, 1], k gets [2 w x_j, -w |x_j|^2] (the term -w |x_i|^2 is
@@ -9,8 +9,7 @@ Every term is even, so the weights are even and every kind of value keeps its ki
 (a polar vector) comes from the same call. The reference conformers and the template are not here: they are vectors of the streams (rotated into the frame of the sample,
 pomelo.models.primitives.alignment).
 
-LocalAttention: AF3's local atom attention, the queries in blocks of WQ atoms (atom order), the keys in a window of WK atoms centred on the block (the windows on the "heads"
-axis of the SDPA call, the mask [L, WQ, WK] shared by the samples and heads). GlobalAttention: all pairs (the tokens), mask [N, N].
+GlobalAttention: all pairs (the atoms, the tokens), the mask [N, N] (the padding keys; the diagonal kept) shared by the samples and heads.
 """
 from typing import Dict
 
@@ -23,8 +22,6 @@ from pomelo.models.primitives import geometry as G
 from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear
 
 KINDS = G.KINDS
-WQ, WK = 32, 128                    # AF3: 32 query atoms, 128 key atoms
-FRONT = (WK - WQ) // 2              # the window of block l: atoms [WQ l - FRONT, WQ l - FRONT + WK)
 BACKENDS = {"efficient": [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],          # the memory-efficient kernel (fp32 on the CUDA cores)
             "math": [SDPBackend.MATH]}                                                 # matmul + softmax + matmul (TF32 tensor cores)
 
@@ -72,13 +69,6 @@ def apply_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     return torch.cat([rot, x[..., 2 * f:]], -1)
 
 
-def windows(x: torch.Tensor, dim: int) -> torch.Tensor:
-    """the key windows of a sequence along `dim` (its length a multiple of WQ): padded by FRONT before and WK - WQ - FRONT after, unfolded: the axis `dim` becomes the
-    L windows, the WK keys are appended last"""
-    pad = [0, 0] * (x.dim() - dim - 1) + [FRONT, WK - WQ - FRONT]
-    return F.pad(x, pad).unfold(dim, WK, WQ)
-
-
 def pad8(x: torch.Tensor) -> torch.Tensor:
     """zero columns up to a multiple of 8 (the memory-efficient kernel wants the head width divisible by 4)"""
     p = (-x.shape[-1]) % 8
@@ -101,7 +91,7 @@ class _TypedAttention(nn.Module):
             raise ValueError("RoPE needs 2 * (rope_res + rope_chain) <= the 0e channels of a head")
         self.mult, self.heads, self.direction_length = dict(mult), heads, direction_length
         self.rope_res, self.rope_chain = rope_res, rope_chain
-        self.backend = "efficient"
+        self.backend = "math"                         # matmul + softmax + matmul on the TF32 tensor cores: the fastest here (the memory-efficient kernel: fp32 on CUDA cores)
         self.qkv = TypedLinear(self.mult, {k: 3 * c for k, c in self.mult.items()})
         self.q_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in self.mult.items()})
         self.k_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in self.mult.items()})
@@ -145,23 +135,9 @@ class _TypedAttention(nn.Module):
 
 
 class GlobalAttention(_TypedAttention):
-    """all pairs (the tokens)"""
+    """all pairs (the atoms, the tokens)"""
 
     def forward(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, geo: Dict[str, torch.Tensor]) -> Feats:
         """x {kind: [B, N, ...]} (normalised), pos [B, N, 3] (centred), w [B, H] >= 0, geo: angles [N, F], mask [N, N] bool -> the update"""
         q, k, v = self.project(x, pos, w, geo["angles"])
         return self.finish(x, self.sdpa(q, k, v, geo["mask"]).transpose(1, 2), pos)
-
-
-class LocalAttention(_TypedAttention):
-    """AF3's local atom attention"""
-
-    def forward(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, geo: Dict[str, torch.Tensor]) -> Feats:
-        """x {kind: [B, N, ...]} with N a multiple of WQ (the caller pads), pos [B, N, 3], w [B, H], geo: angles [N, F], mask [L, WQ, WK] bool -> the update"""
-        b, n = pos.shape[:2]
-        L, H = n // WQ, self.heads
-        q, k, v = self.project(x, pos, w, geo["angles"])
-        q = q.unflatten(2, (L, WQ)).flatten(0, 1)                                                        # [B H, L, WQ, D]: the windows on the heads axis of SDPA
-        k, v = (windows(t, 2).transpose(-1, -2).flatten(0, 1) for t in (k, v))                          # [B H, L, WK, D]
-        o = self.sdpa(q, k, v, geo["mask"][None]).unflatten(0, (b, H)).flatten(2, 3)                    # [B, H, N, Dv + 3]
-        return self.finish(x, o.transpose(1, 2), pos)

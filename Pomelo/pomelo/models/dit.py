@@ -1,8 +1,8 @@
 """The DiT of Pomelo, multi-scale as PhysDock's AllAtomDecoder and SimpleFold (atom encoder -> pool to tokens -> token trunk -> unpool -> atom decoder), parity-equivariant,
 without a pair representation and without pair biases (as SimpleFold: the capacity is in the token trunk):
 
-  atom encoder / decoder  n_atom_blocks DiT blocks each with LocalAttention (AF3's local atom attention: blocks of WQ queries, windows of WK keys in atom order)
-  token trunk             n_token_blocks DiT blocks with GlobalAttention (all tokens)
+  atom encoder / decoder  n_atom_blocks DiT blocks each, global attention over all atoms (as PhysDock's atom DiTs)
+  token trunk             n_token_blocks DiT blocks, global attention over all tokens
   RoPE (residue index, chain) on the 0e channels of q and k, the distance of the noisy sample in the logits (w_h(t)), the direction messages: the positions of the attentions are
   the noisy atoms (atom blocks) and the mean of the atoms of every token (token blocks)
 
@@ -31,7 +31,7 @@ from pomelo.configs import Config
 from pomelo.models.embedders import masked_group_mean, pad_rows, signed_volume
 from pomelo.models.primitives import geometry as G
 from pomelo.models.primitives.alignment import kabsch, rotate
-from pomelo.models.primitives.attentions import GlobalAttention, LocalAttention
+from pomelo.models.primitives.attentions import GlobalAttention
 from pomelo.models.primitives.irreps import Feats, GeometricProduct, Mult, NormLinear, TypedLinear, TypedNorm, add
 from pomelo.models.primitives.transformers import TypedTransition
 
@@ -56,13 +56,12 @@ class DiTBlock(nn.Module):
     per channel by (1 + scale) (every kind: an even number keeps the kind), shifted on 0e only, the update multiplied per channel by a gate; scale, shift, gate and the weights
     w_h of the distance term are functions of the time embedding of the sample."""
 
-    def __init__(self, mult: Mult, heads: int, local: bool, cfg: Config, product_channels: int) -> None:
+    def __init__(self, mult: Mult, heads: int, cfg: Config, product_channels: int) -> None:
         super().__init__()
         self.mult = {k: c for k, c in mult.items() if c}
         self.product = GeometricProduct(self.mult, self.mult, product_channels)
         self.product.norm = None                                                                 # the AdaLN normalises (the sublayers are called normed)
-        attn = LocalAttention if local else GlobalAttention
-        self.attention = attn(self.mult, heads, cfg.rope_res, cfg.rope_chain, cfg.direction_length)
+        self.attention = GlobalAttention(self.mult, heads, cfg.rope_res, cfg.rope_chain, cfg.direction_length)
         self.transition = TypedTransition(self.mult)
         self.transition.norm = None
         self.norm = TypedNorm(self.mult, affine=False)
@@ -120,11 +119,11 @@ class PomeloDiT(nn.Module):
         self.cond_a_token = NormLinear(ss, sa, bias=False)                                     # + the token conditions broadcast to the atoms (PhysDock: s -> a)
         self.noisy_in = TypedLinear({"0e": 2, "0o": 1, "1o": 6, "1e": 3}, ma, bias=False)                   # the noisy sample and the reference conformer
         self.templ_in = TypedLinear({"1o": 3, "1e": 1}, {"1o": ms["1o"], "1e": ms["1e"]}, bias=False)         # the template
-        atom = lambda: DiTBlock(ma, cfg.heads_atom, True, cfg, cfg.atom_product_channels)
+        atom = lambda: DiTBlock(ma, cfg.heads_atom, cfg, cfg.atom_product_channels)
         self.atom_enc = nn.ModuleList([atom() for _ in range(cfg.n_atom_blocks)])
         self.pool_norm, self.pool_lin = TypedNorm(ma), TypedLinear(ma, ms)                     # PhysDock: silu(linear_downscale(x)), mean over the token
         self.cond_s = NormLinear(ss, ss)
-        self.token_blocks = nn.ModuleList([DiTBlock(ms, cfg.heads_token, False, cfg, cfg.token_product_channels) for _ in range(cfg.n_token_blocks)])
+        self.token_blocks = nn.ModuleList([DiTBlock(ms, cfg.heads_token, cfg, cfg.token_product_channels) for _ in range(cfg.n_token_blocks)])
         self.unpool = NormLinear(ms, ma)
         self.atom_dec = nn.ModuleList([atom() for _ in range(cfg.n_atom_blocks)])
         self.head_product = GeometricProduct(ma, {"1o": 8}, channels=8)
@@ -174,7 +173,7 @@ class PomeloDiT(nn.Module):
         """x_in [B, Na, 3]: the preconditioned noisy coordinates (normalised, times c_in), t_in [B]: the noise conditioning -> the raw output F [B, Na, 3] (a polar vector per
         atom; 0 at the padding)"""
         b, na = x_in.shape[:2]
-        am = c["atom_mask"].to(x_in.dtype)                                                     # [Npad]: the atoms padded to a multiple of WQ by the embedder
+        am = c["atom_mask"].to(x_in.dtype)
         t = self.time(t_in)
         xg = pad_rows(x_in.transpose(0, 1), am.shape[0]).transpose(0, 1) * GEOM * am[None, :, None]
         pos = (xg - xg.sum(1, keepdim=True) / am.sum()) * am[None, :, None]                   # centred on the real atoms: translation-free
