@@ -35,6 +35,7 @@ from PhysDock.pomelo.primitives.attentions import GlobalAttention
 from PhysDock.pomelo.primitives.irreps import Feats, GeometricProduct, Mult, NormLinear, TypedLinear, TypedNorm, add
 from PhysDock.pomelo.primitives.transformers import TypedTransition
 
+W0, W_MAX_LOG = 0.05, math.log(40.0)   # the distance weight at the start, its largest value W0 * 40 = 2 (a logit of -2 at 1 unit, 4 Angstrom)
 GEOM = 4.0                      # the normalised coordinates (sigma_data = 16 Angstrom) times 4: positions in units of 4 Angstrom
 
 
@@ -67,14 +68,14 @@ class DiTBlock(nn.Module):
         self.norm = TypedNorm(self.mult, affine=False)
         self.width = sum(self.mult.values())
         self.mod = nn.Linear(cfg.t_dim, 3 * (self.mult["0e"] + 2 * self.width))
-        self.dist = nn.Linear(cfg.t_dim, heads)                                                    # w_h(t) >= 0: local at small noise, global at large noise (learned)
+        self.dist = nn.Linear(cfg.t_dim, heads)                                                    # w_h(t) = W0 exp(dist(t)) >= 0: local at small noise, global at large (learned)
         with torch.no_grad():
             self.mod.weight.mul_(0.1)
             self.mod.bias.zero_()
             for i in range(3):
                 self.mod.bias[self._slices(i)[2]] = 0.0 if cfg.zero_gates else 1.0
             self.dist.weight.zero_()
-            self.dist.bias.fill_(math.log(math.expm1(0.05)))                                     # w = 0.05 at the start: a logit of -1 at 4.5 units (18 Angstrom)
+            self.dist.bias.zero_()                                                               # w = W0 at the start: a logit of -1 at 4.5 units (18 Angstrom)
 
     def _slices(self, i: int):
         w = self.mult["0e"] + 2 * self.width
@@ -88,7 +89,7 @@ class DiTBlock(nn.Module):
         """s {kind: [B, N, C(, 3)]}, pos [B, N, 3] (centred), t [B, t_dim], geo: the static geometry of the attention"""
         tt = F.silu(t)
         m = self.mod(tt)[:, None]                                                                # [B, 1, ...]: per sample, the same for all rows
-        w = F.softplus(self.dist(tt))
+        w = W0 * torch.exp(self.dist(tt).clamp(max=W_MAX_LOG))                                  # log-parametrised: a relative step per update (softplus at 0.05: 20x slower)
         updates = (lambda x: self.product(x, normed=True), lambda x: self.attention(x, pos, w, geo), lambda x: self.transition(x, normed=True))
         for i, update in enumerate(updates):
             sh, sc, ga = (m[..., sl] for sl in self._slices(i))

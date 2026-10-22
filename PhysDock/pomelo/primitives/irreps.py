@@ -211,6 +211,7 @@ class GeometricProduct(nn.Module):
         for t in self.terms:
             mult_cat[t[0]] = mult_cat.get(t[0], 0) + channels
         self.mult_cat = mult_cat
+        self.norm_out = TypedNorm(mult_cat)                               # the products normalised: the update is linear in a normalised feature, not quadratic in the weights
         self.out = TypedLinear(mult_cat, {k: c for k, c in mult_out.items() if c}, zero_init=zero_init)
 
     def forward(self, x: Feats, normed: bool = False) -> Feats:
@@ -223,7 +224,7 @@ class GeometricProduct(nn.Module):
             value, kind = t[4](a, b, c)
             assert kind == t[0], (kind, t[0])
             cat.setdefault(kind, []).append(value)
-        return self.out({k: torch.cat(v, dim=-1 if k in G.SCALAR_KINDS else -2) for k, v in cat.items()})
+        return self.out(self.norm_out({k: torch.cat(v, dim=-1 if k in G.SCALAR_KINDS else -2) for k, v in cat.items()}))
 
 
 class TypedPool(nn.Module):

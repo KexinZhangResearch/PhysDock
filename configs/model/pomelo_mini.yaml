@@ -1,0 +1,8 @@
+# Pomelo (PhysDock/pomelo) in place of PhysDock's encoder and decoder: O(3)-equivariant typed features, one DiT trunk without a pair representation, at the
+# scale of mini_p2 (69.5M parameters). Everything outside the network is mini_p2's (sigma_data, diffusion, 48 noisy samples); its encoder / decoder
+# sections are not read.   python scripts/train/train.py model=pomelo_mini      (pomelo: a preset of PhysDock/pomelo/configs.py, or {preset: mini, n_token_blocks: 8, ...})
+defaults:
+  - mini_p2
+  - _self_
+
+pomelo: mini

@@ -40,7 +40,8 @@ def _module_of(name: str) -> str:
 class PhysDockLitModule(L.LightningModule):
     """
     Args:
-        model: model config (configs/model/<size>.yaml)
+        model: model config (configs/model/<size>.yaml); with a `pomelo` entry (configs/model/pomelo_mini.yaml) the network is Pomelo (PhysDock.pomelo),
+            the same interface, the rest of the config (sigma_data, diffusion, num_augmentation_sample) used as for PhysDock
         loss: loss config (configs/model/loss.yaml)
         optim: {lr, betas, eps, weight_decay, scheduler: {warmup_steps, start_decay_after, decay_every, decay_factor}}
         init_from: optional checkpoint to start from (params.pt, Lightning or Uni-Core checkpoint)
@@ -54,7 +55,11 @@ class PhysDockLitModule(L.LightningModule):
         if grad_stats not in ("total", "module", "parameter"):
             raise ValueError(f"grad_stats must be total, module or parameter, got {grad_stats!r}")
         self.save_hyperparameters(logger=False)         # the full run config is logged by scripts/train/train.py
-        self.model = PhysDock(**model)
+        if model.get("pomelo"):
+            from PhysDock.pomelo import Pomelo
+            self.model = Pomelo(**model)
+        else:
+            self.model = PhysDock(**model)
         if init_from:
             self.model.load_state_dict(load_checkpoint_state_dict(init_from, mmap=False))
         self.loss_fn = PhysDockLoss(**loss)
@@ -135,16 +140,19 @@ class PhysDockLitModule(L.LightningModule):
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None) -> None:
         """Gradient norm clipping (trainer.gradient_clip_val) without Lightning's precision plugin, which refuses fused
-        optimizers under mixed precision; with fp32 / bf16 the gradients are not loss-scaled."""
+        optimizers under mixed precision. With fp32 / bf16 the gradients are not loss-scaled; with 16-mixed the optimizer is not
+        fused (configure_optimizers), so Lightning has unscaled the gradients before this hook."""
         if not gradient_clip_val:
             return
-        if self.trainer.precision in ("16-mixed", "16", "16-true"):
-            raise ValueError("fp16 (loss scaling) is not supported, use precision 32 or bf16-mixed")
+        if self.trainer.precision == "16-true":
+            raise ValueError("16-true is not supported, use precision 32, bf16-mixed or 16-mixed")
         if gradient_clip_algorithm not in (None, "norm"):
             raise ValueError(f"only norm clipping is supported, got {gradient_clip_algorithm!r}")
         norm = torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_val)
         if not torch.isfinite(norm):          # a bad batch: skip the update (Adam leaves parameters without a gradient alone) instead of poisoning the weights
             optimizer.zero_grad(set_to_none=True)
+            if self.trainer.precision == "16-mixed":          # an overflow of the loss scale: the GradScaler skips the step and lowers the scale
+                return
             self.skipped_steps += 1
             print(f"[train] step {self.global_step}: non-finite gradient norm, update skipped ({self.skipped_steps} so far)", flush=True)
         self.log("train/skipped_steps", float(self.skipped_steps), batch_size=1)
@@ -155,6 +163,6 @@ class PhysDockLitModule(L.LightningModule):
         groups = [{"params": [p for p in params if p.ndim >= 2], "weight_decay": decay},        # weight matrices
                   {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0}]           # biases, norm scales, other vectors
         optimizer = torch.optim.AdamW(groups, lr=self.optim["lr"], betas=tuple(self.optim["betas"]), eps=self.optim["eps"],
-                                      fused=self.device.type == "cuda")
+                                      fused=self.device.type == "cuda" and self.trainer.precision != "16-mixed")    # 16-mixed: Lightning unscales before clipping
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, af3_lr_lambda(**self.optim["scheduler"]))
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}

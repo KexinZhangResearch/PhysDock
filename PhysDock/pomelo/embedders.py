@@ -5,10 +5,13 @@ features, no attention: as SimpleFold, everything is per atom and per token.
                    neighbours (by atom index) in the reference conformer
           vectors  the reference positions, centred on their conformer and on the bonded-neighbour mean: they enter the vector channels of the atoms in the DiT, rotated
                    into the frame of every noisy sample by the proper Kabsch rotation of their conformer (PhysDock.pomelo.primitives.alignment)
-  tokens  scalars  0e = linear(target_feat) + linear(key_res_feat) + linear(is_pocket) + linear(template availability) + the mean over the atoms of silu(linear(atom 0e))
+  tokens  scalars  0e = linear(target_feat) + linear(key_res_feat) + linear(the flags) + the mean over the atoms of silu(linear(atom 0e))
                    (PhysDock's TokenEmbedder.embed);  0o = linear(the mean over the atoms of the atom 0o)
           vectors  the template positions of the tokens (PhysDock's self-template: the pseudo-beta atom of x_gt, where templ_feat says the template is there; one frame for
                    all of them): they enter the vector channels of the tokens in the DiT, rotated into the frame of every noisy sample by one Kabsch rotation
+  flags    0 / 1 scalars of where an input is there (ATOM_FLAGS into the atom 0e, TOKEN_FLAGS into the token 0e): an absent vector (no template for a ligand
+           token, no x - token centre for a one-atom token, no neighbour vectors / signed volume without bonded neighbours, no next / previous residue at a chain end)
+           or scalar (no pocket, no key residues, no template in this structure) is a 0 that the network cannot tell from a measured 0 otherwise
   and what the attentions of the DiT need: the boolean key masks of the atoms and of the tokens [N, N] (the padding; the diagonal always kept), the RoPE angles (residue
   index, chain) of the tokens and of the atoms (by their token), the pool matrix atoms -> tokens.
 
@@ -26,6 +29,10 @@ from PhysDock.pomelo.primitives.attentions import rope_angles
 REF_SCALE = 0.25                        # Angstrom -> units of 4 Angstrom (the unit of the positions of the DiT)
 BOND_CUTOFF = 2.05                      # Angstrom: a covalent bond between heavy atoms in a reference conformer (C-Br 1.94; the shortest 1-3 distance is ~2.2)
 REF_DIM, POS, CHIRALITY = 167, slice(0, 3), slice(158, 161)
+USED = ["pocket_used", "key_res_used", "template_used"]                                              # of the structure: the input was given at all
+TOKEN_FLAGS = ["is_protein", "is_ligand", "is_pocket", "templ_on", "has_next", "has_prev", "multi_atom_token"] + USED
+ATOM_FLAGS = ["is_protein_atom", "is_ligand_atom", "is_pocket_atom", "templ_on", "multi_atom_token", "has_neighbour", "has_three_neighbours", "multi_atom_conformer"] + USED
+N_ATOM_FLAGS, N_TOKEN_FLAGS = len(ATOM_FLAGS), len(TOKEN_FLAGS)
 ATOM_COLUMNS = [i for i in range(REF_DIM) if not (POS.start <= i < POS.stop or CHIRALITY.start <= i < CHIRALITY.stop)]
 
 
@@ -69,12 +76,12 @@ class ConditionEmbedder(nn.Module):
         super().__init__()
         self.cfg = cfg
         ma, ms = cfg.mult_a, cfg.mult_s
-        self.linear_c = nn.Linear(len(ATOM_COLUMNS), ma["0e"], bias=False)
+        self.linear_c = nn.Linear(len(ATOM_COLUMNS) + N_ATOM_FLAGS, ma["0e"], bias=False)            # ref_feat and the atom flags
         self.linear_v = nn.Linear(ma["0e"], ma["0o"], bias=False)                                     # times V_ref: 0e -> 0o (no bias)
         self.linear_a = nn.Linear(ma["0e"], ms["0e"])
         self.linear_ao = nn.Linear(ma["0o"], ms["0o"], bias=False)
         self.linear_target_feat, self.linear_key_res_feat = nn.Linear(65, ms["0e"], bias=False), nn.Linear(7, ms["0e"], bias=False)
-        self.linear_pocket, self.linear_templ = nn.Linear(1, ms["0e"], bias=False), nn.Linear(1, ms["0e"], bias=False)
+        self.linear_flags_s = nn.Linear(N_TOKEN_FLAGS, ms["0e"], bias=False)
 
     @staticmethod
     def template(b, tm: torch.Tensor):
@@ -84,6 +91,21 @@ class ConditionEmbedder(nn.Module):
         pos = b["templ_pos"] if "templ_pos" in b else b["x_gt"][b["token_to_pseudo_beta_atom"]]
         on = (torch.diagonal(b["templ_feat"][..., 39]) > 0) & (tm > 0) & (b["templ_mask"] > 0)
         return pos.to(dt) * REF_SCALE * on[:, None].to(dt), on
+
+    @staticmethod
+    def flags(b, am, tm, a2t, conf, onehot, has3, nbr_mean, templ_on, nxt, prv):
+        """0 / 1 scalars of where the inputs are there (an absent vector or scalar is a 0 that the network cannot tell from a measured 0): atoms [Na, N_ATOM_FLAGS],
+        tokens [Nt, N_TOKEN_FLAGS] (0 at the padding), in the order of ATOM_FLAGS / TOKEN_FLAGS"""
+        dt = am.dtype
+        nt = tm.shape[0]
+        tok_multi = onehot.sum(1) > 1                                                                  # x - token centre exists (not for a ligand atom: its own token)
+        conf_size = torch.zeros(nt, dtype=dt, device=am.device).index_add(0, conf, am)
+        is_pocket = b["is_pocket"].to(dt) * tm
+        used = torch.stack([is_pocket.sum() > 0, (b["key_res_feat"].to(dt) * tm[:, None]).abs().sum() > 0, (b["templ_mask"] > 0) & templ_on.any()]).to(dt)
+        tok = torch.stack([b["is_protein"].to(dt) > 0, b["is_ligand"].to(dt) > 0, is_pocket > 0, templ_on, nxt.sum(1) > 0, prv.sum(1) > 0, tok_multi], -1).to(dt)
+        atom = torch.cat([tok[a2t][:, [0, 1, 2, 3, 6]], torch.stack([nbr_mean.sum(1) > 0, has3, conf_size[conf] > 1], -1).to(dt)], -1)
+        return (torch.cat([atom, used.expand(atom.shape[0], 3)], -1) * am[:, None],
+                torch.cat([tok, used.expand(nt, 3)], -1) * tm[:, None])
 
     def forward(self, b: Dict[str, torch.Tensor]) -> Dict[str, object]:
         ref, conf, a2t = b["ref_pos"], b["atom_to_conformer"], b["atom_to_token"]
@@ -98,17 +120,18 @@ class ConditionEmbedder(nn.Module):
             v_ref = signed_volume(ref_p, idx, has3)
             ref_s = ref_p * REF_SCALE * am_p[:, None]
             ref_nbr = torch.where(nbr_mean.sum(1, keepdim=True) > 0, ref_s - nbr_mean @ ref_s, torch.zeros_like(ref_s))    # r - mean of the bonded neighbours (frame-free difference)
-        a0e = self.linear_c(pad_rows(b["ref_feat"][:, ATOM_COLUMNS].to(dt), npad)) * am_p[:, None]
-        a0o = v_ref[:, None] * self.linear_v(a0e)
         onehot = F.one_hot(a2t_p, nt).T.to(dt) * am_p[None]                                            # [Nt, Na]: the real atoms of every token
         pool = onehot / onehot.sum(1, keepdim=True).clamp(min=1)
         templ_pos, templ_on = self.template(b, tm)
-        s0e = (self.linear_target_feat(b["target_feat"].to(dt)) + self.linear_key_res_feat(b["key_res_feat"].to(dt)) + self.linear_pocket(b["is_pocket"].to(dt)[:, None])
-               + self.linear_templ(templ_on.to(dt)[:, None]) + pool @ F.silu(self.linear_a(a0e))) * tm[:, None]
-        s0o = self.linear_ao(pool @ a0o)
         res, chain = b["residue_index"], b["asym_id"]
         both = (chain[None] == chain[:, None]) & templ_on[None] & templ_on[:, None]
         nxt, prv = ((res[None] - res[:, None] == 1) & both).to(dt), ((res[None] - res[:, None] == -1) & both).to(dt)     # [i, j]: j is the next / previous residue of i
+        flags_a, flags_s = self.flags(b, am_p, tm, a2t_p, conf_p, onehot, has3, nbr_mean, templ_on, nxt, prv)
+        a0e = self.linear_c(torch.cat([pad_rows(b["ref_feat"][:, ATOM_COLUMNS].to(dt), npad), flags_a], -1)) * am_p[:, None]
+        a0o = v_ref[:, None] * self.linear_v(a0e)
+        s0e = (self.linear_target_feat(b["target_feat"].to(dt)) + self.linear_key_res_feat(b["key_res_feat"].to(dt)) + self.linear_flags_s(flags_s)
+               + pool @ F.silu(self.linear_a(a0e))) * tm[:, None]
+        s0o = self.linear_ao(pool @ a0o)
         angles = rope_angles(res, chain, self.cfg.rope_res, self.cfg.rope_chain, dt)
         eye = torch.eye(nt, dtype=torch.bool, device=tm.device)
         return {"a": {"0e": a0e, "0o": a0o}, "s": {"0e": s0e, "0o": s0o}, "v_ref": v_ref, "idx": idx, "has3": has3, "nbr_mean": nbr_mean, "pool": pool,

@@ -37,6 +37,7 @@ checkpointing:                    # activation checkpointing per stack: full (re
   DiT: attention
 matmul_precision: auto          # float32 matmuls: auto = TF32 if the GPU supports it; highest = full float32
 progress_refresh: 20            # steps between updates of the progress bar (in a log file: one line per update)
+text_log_every: 100             # steps between the text lines of the losses (means of x_mse, smooth lDDT, gradient norm, s / step); 0: none
 
 val:                              # validation: diffusion loss, then sampling + structure metrics
   num_samples: 5
