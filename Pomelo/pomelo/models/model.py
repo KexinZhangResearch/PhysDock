@@ -1,34 +1,79 @@
-"""The model of Pomelo, as PhysDock's: the encoder (pomelo.models.encoders.EncoderTrunk: the conformer features in, the Pairformer on the tokens) + the multi-scale decoder
-(pomelo.models.decoders.PomeloDiT, conditioned on the 12 outputs of the encoder), wrapped in the EDM preconditioning.
+"""The model of Pomelo with the interface of PhysDock's model (PhysDock/models/model.py), so that PhysDock's training (PhysDockLitModule, the data module, PhysDockLoss,
+the EMA, the optimiser and its schedule) and its sampler run it unchanged: forward(batch) -> {x_gt, x_denoised, x_hat, t_hat, stream_rms}, sample_diffusion(batch, ...).
 
-D(mol, x_t [B, Na, 3], sigma [B]) -> [B, Na, 3] in coordinates normalised by sigma_data (16 Angstrom). The noisy structure is centred, the network sees  c_in * (x_t - mean),
-the denoised structure is  mean + c_skip * x_c + c_out * F(...). The encoder runs once per structure, the decoder on the B noisy samples at once (PhysDock's layout).
+What is PhysDock's: the diffuser (PhysDock.models.diffusion, built from the `diffusion` section of the model config: EDM, the training noise ln t ~ N(-1.2, 1.5^2), the
+noising of num_augmentation_sample samples with PhysDock's random rotation and translation, the preconditioning, the AF3 sampler), sigma_data. What is Pomelo's: the
+condition embedder (pomelo.models.embedders) and the DiT (pomelo.models.dit) in place of PhysDock's encoder and decoder. The random rotation of the noising is kept: for an
+equivariant network it changes nothing, and it keeps the training process the same as PhysDock's.
 """
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
-from pomelo.configs import Config
-from pomelo.models.decoders import PomeloDiT
-from pomelo.models.encoders import EncoderTrunk
-
-
-def edm_denoise(dit: PomeloDiT, enc, x_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    xbar = x_t.mean(1, keepdim=True)
-    xc = x_t - xbar
-    s = sigma[:, None, None]
-    c_in, c_skip, c_out = (s ** 2 + 1) ** -0.5, 1 / (1 + s ** 2), s * (s ** 2 + 1) ** -0.5
-    raw = dit(c_in * xc, torch.log(sigma) / 4, enc)                     # the decoder takes the batch of noisy samples (shared biases)
-    return xbar + c_skip * xc + c_out * raw
+from pomelo.configs import preset
+from pomelo.models.dit import PomeloDiT
+from pomelo.models.embedders import ConditionEmbedder
 
 
-class Denoiser(nn.Module):
-    """EDM denoiser D(x_t, sigma) of a system: EncoderTrunk + PomeloDiT. No stereo label is read: the hand of every molecule is the hand of its reference conformer."""
+class Pomelo(nn.Module):
+    """Pomelo(**model_config): model_config is PhysDock's (configs/model/mini_p2.yaml: num_augmentation_sample, diffusion, sigma_data; its encoder / decoder sections are not
+    used) plus `pomelo`: a preset name of pomelo.configs ("mini", "tiny") or a dict of Config fields with an optional "preset"."""
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, num_augmentation_sample: int, diffusion: dict, sigma_data: float, pomelo="mini", **physdock_only) -> None:
         super().__init__()
-        self.encoder = EncoderTrunk(cfg)
-        self.dit = PomeloDiT(cfg)
+        from PhysDock.models.diffusion import build_diffuser
+        self.cfg = preset(pomelo)
+        self.num_augmentation_sample, self.sigma_data = num_augmentation_sample, sigma_data
+        self.diffuser = build_diffuser(diffusion)
+        self.diffusion_conditioning = ConditionEmbedder(self.cfg)
+        self.dit = PomeloDiT(self.cfg)
 
-    def forward(self, mol, x_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        """x_t [B, Na, 3] (normalised, with noise of standard deviation sigma [B]) -> the denoised coordinates [B, Na, 3]"""
-        return edm_denoise(self.dit, self.encoder(mol), x_t, sigma)
+    def forward(self, batch):
+        """Training step on one (padded) structure. Returns (normalised by sigma_data): x_gt [N_atom, 3], x_denoised [S, N_atom, 3], x_hat [S, N_atom, 3], t_hat [S],
+        stream_rms [3] (the RMS of the atom and token conditions, 0: no pair representation)"""
+        x_gt = batch["x_gt"] / self.sigma_data
+        conds = self.dit.condition(batch, self.diffusion_conditioning(batch))
+        z, t = self.diffuser.noising(x_gt, batch["atom_mask"], self.num_augmentation_sample)
+        x_denoised = self.diffuser.denoise(self.dit, batch, z, t, conds)
+        return {"x_gt": x_gt, "x_denoised": x_denoised, "x_hat": z, "t_hat": self.diffuser.noise_level(t), "stream_rms": self.stream_rms(conds)}
+
+    @torch.no_grad()
+    def stream_rms(self, c) -> torch.Tensor:
+        am, tm = c["atom_mask"][:, None], c["token_mask"][:, None]
+        rms = lambda x, m: ((x.float() ** 2 * m).sum() / (m.sum() * x.shape[-1])).sqrt()
+        return torch.stack([rms(c["a"]["0e"], am), rms(c["s"]["0e"], tm), torch.zeros((), device=am.device)])
+
+    @torch.no_grad()
+    def sample_diffusion(self, batch, num_sample: int = 5, steps: int = 200, **guidance) -> torch.Tensor:
+        """PhysDock's sampler (AF3 Alg. 18 with the settings of the diffusion config) -> [num_sample, N_atom, 3] Angstrom. The ligand guidance of PhysDock (MMFF relaxation,
+        reference poses) is not wired in: its arguments are accepted and ignored."""
+        conds = self.dit.condition(batch, self.diffusion_conditioning(batch))
+        x = self.diffuser.sample(self.dit, batch, conds, batch["atom_mask"], num_sample, steps)
+        return x * self.sigma_data
+
+    def set_attention_backend(self, atom: str = "efficient", token: str = "efficient") -> None:
+        """the SDPA backend of the atom and of the token attentions (pomelo.models.primitives.attentions.BACKENDS)"""
+        for blk in [*self.dit.atom_enc, *self.dit.atom_dec]:
+            blk.attention.backend = atom
+        for blk in self.dit.token_blocks:
+            blk.attention.backend = token
+
+    def prepare_training(self, compile: bool = True, checkpoint_blocks: bool = True) -> None:
+        """every DiT block: torch.compile (static shapes: PhysDock pads the crop) inside activation checkpointing, used while gradients are on (validation and sampling,
+        other numbers of samples, stay eager); the condition embedder compiled as one region"""
+        def wrap(module, compiled_forward):
+            eager = module.forward
+
+            def forward(*args):
+                if not torch.is_grad_enabled():
+                    return eager(*args)
+                return checkpoint(compiled_forward, *args, use_reentrant=False) if checkpoint_blocks else compiled_forward(*args)
+            module.forward = forward
+        if compile:
+            torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        for blk in [*self.dit.atom_enc, *self.dit.token_blocks, *self.dit.atom_dec]:
+            wrap(blk, torch.compile(blk.forward, dynamic=False) if compile else blk.forward)
+        if compile:
+            emb = self.diffusion_conditioning
+            eager, compiled = emb.forward, torch.compile(emb.forward, dynamic=False)
+            emb.forward = lambda b: compiled(b) if torch.is_grad_enabled() else eager(b)

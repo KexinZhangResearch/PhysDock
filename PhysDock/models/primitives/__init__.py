@@ -360,7 +360,8 @@ class LayerNormPairBias(KernelModule):
 
 class SharedBiasAttention(KernelModule):
     """softmax(q k^T / sqrt(D) + bias) v for q, k, v [..., H, N, D] and a logit bias [H, N, N] shared by all leading (batch) entries: the
-    noisy samples of the DiT, the rows of the triangle and MSA row attention. Torch: sdpa; Triton: the fused forward and
+    noisy samples of the DiT, the rows of the triangle and MSA row attention. Torch: sdpa; Triton (where it is faster than sdpa, see
+    kernels.shared_bias_attention.can_fuse: the batched attentions of the DiT and the triangle attention, not the single one): the fused forward and
     backward of kernels.shared_bias_attention (the bias tile is loaded once for the whole batch, dbias accumulated in registers; the
     TF32 inputs are rounded as cuBLAS does), 1.7-2x faster than sdpa in forward + backward in bfloat16 and 2-5x in the TF32 forward.
 
@@ -406,16 +407,18 @@ class SharedBiasAttention(KernelModule):
         lam = self.decay_strength if pos is not None else None
         if lam is None:
             pos = radius = None
-        if self.backend == "triton":
+        if self.backend == "triton" and kernels.shared_bias_attention.can_fuse(q):
             sba = kernels.shared_bias_attention.shared_bias_attention
             if q.dim() == 3:
                 return sba(q[None], k[None], v[None], bias, n_valid, pos, radius, lam)[0]
             return sba(q, k, v, bias, n_valid, pos, radius, lam)
-        if lam is not None:                                              # torch backend: the same function from a dense decay
+        if lam is not None:                                              # torch: the same function from a dense decay
             pos = pos.detach().float()
             d = torch.cdist(pos, pos) / radius.detach().float().reshape(-1, 1, 1)
             bias = bias[None] - lam.reshape(1, -1, 1, 1) * torch.relu(d - 1.0).square()[:, None]
-        return F.scaled_dot_product_attention(q, k, v, bias)
+        # (the padding rows get the softmax of their masked keys instead of 0: nothing downstream reads them); a bias in the padded layout of the
+        # Triton backend (aligned_bias) is copied: sdpa gives wrong gradients for a strided view
+        return F.scaled_dot_product_attention(q, k, v, bias if bias.is_contiguous() else bias.contiguous())
 
 
 class TriangleMultiplication(KernelModule):

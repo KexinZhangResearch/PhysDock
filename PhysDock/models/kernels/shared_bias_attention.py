@@ -276,7 +276,10 @@ def _bwd(Q, K, V, Bias, NV, POS, RAD, LAM, DLAM, DO, LSE, Delta, DQ, DK, DV, DBi
             excess = tl.maximum(tl.sqrt(e0 * e0 + e1 * e1 + e2 * e2) / tl.load(RAD + b64) - 1.0, 0.0)
             fu = excess * excess
             s -= lam * fu
-        p = tl.where((m_in & (offs_m < nv))[:, None] & (n_in & (offs_n < nv))[None, :], tl.math.exp2(s - lse[:, None]), 0.0)
+        # p <= 1 exactly: s - lse can come out positive when the forward and this kernel round the scores differently (3xTF32 sums its three products
+        # in an order that depends on the tile shape) and a masked row's scores sit near -1e9, where a float32 ulp is 128 (exp2(128) = inf, and the
+        # zero gradient of such a row times inf is nan)
+        p = tl.where((m_in & (offs_m < nv))[:, None] & (n_in & (offs_n < nv))[None, :], tl.math.exp2(tl.minimum(s - lse[:, None], 0.0)), 0.0)
         dp = tl.dot(do, vt, input_precision=PREC).to(tl.float32)
         ds = p * (dp - delta[:, None])
         dbias += ds
@@ -300,6 +303,21 @@ def _bwd(Q, K, V, Bias, NV, POS, RAD, LAM, DLAM, DO, LSE, Delta, DQ, DK, DV, DBi
 
 
 # ----------------------------------------------------------------------------------------------- torch ops
+# Fusion policy, from forward + backward timings against torch's sdpa on an H20 (scripts/diagnose: B x H x N^2 work, head dim 32). The Triton kernels
+# have a fixed cost of ~1.5 ms forward + backward (the backward grid and the delta pass); sdpa's flash / memory-efficient kernels are faster below it:
+#   float32 (TF32 / 3xTF32): Triton wins from 2^25 (B48 H16 N256: 2.4x, B256 H4 N256: 2.9x, B48 H4 N2048: 3.6x), loses below (B16 H16 N256: 0.6x,
+#                            B1 H16 N256, the single attention: 0.22x, B1 H4 N2048, the encoder atoms: 0.62x)
+#   bfloat16 / float16:      sdpa's half kernels are 2-3x faster than its float32 ones; Triton wins from 2^28 (B16 H4 N2048: 2.2x), loses below
+#                            (B256 H4 N256: 0.7x, B48 H16 N256: 0.47x)
+MIN_WORK = {False: 1 << 25, True: 1 << 28}
+
+
+def can_fuse(q: torch.Tensor) -> bool:
+    """the Triton kernels are faster than sdpa for q [..., H, N, D] (the batch and the heads of the leading dimensions, N the sequence length)"""
+    n = q.shape[-2]
+    return q.is_cuda and q.numel() // q.shape[-1] * n >= MIN_WORK[q.dtype != torch.float32]
+
+
 def _split(B, H, N):
     """batch chunks of the backward: enough programs (~4 per SM, counted for 64 x 64 tiles) to fill the GPU"""
     programs = triton.cdiv(N, 64) ** 2 * H

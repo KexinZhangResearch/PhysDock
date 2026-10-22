@@ -1,1 +1,1 @@
-"""Training of Pomelo: metrics.py (RMSD, hand agreement of sampled structures), overfit.py (the loop of the overfitting experiments, scripts/overfit/overfit_synth.py)."""
+"""Training of Pomelo: metrics.py (RMSD, hand agreement of sampled structures). The training loop is PhysDock's (scripts/train/train.py)."""

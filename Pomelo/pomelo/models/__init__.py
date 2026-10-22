@@ -1,2 +1,2 @@
-"""Models of Pomelo: encoders.py (InputEmbedder, EncoderTrunk), decoders.py (the multi-scale DiT), model.py (the denoiser), diffusion.py (EDM noise, sampler), loss.py,
-baselines.py (PhysDock-like models without symmetry, for comparison), primitives/ (the typed layers)."""
+"""Models of Pomelo: embedders.py (the condition embedder: PhysDock's features -> frame-free conditions and static attention biases), dit.py (the DiT trunk), model.py
+(Pomelo, with the interface of PhysDock's model), primitives/ (the typed layers)."""

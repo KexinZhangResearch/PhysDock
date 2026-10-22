@@ -38,9 +38,11 @@ def _config(c: int, half: bool):
 
 
 def can_fuse(z: torch.Tensor, n_heads: int) -> bool:
-    """the kernels apply: CUDA z with c a power of two in [16, 256] and 1 to 16 heads"""
+    """the kernels apply: CUDA z with c a power of two in [16, 32] and 1 to 16 heads. The narrow atom pairs (2048^2 x 16: 5x faster than torch forward +
+    backward, and without the [N, N, C] normalised copy) are memory bound; on the 128-channel pair representation torch's norm + matmul are faster
+    (0.8x in TF32, 0.5x in 3xTF32, 0.8x in bfloat16 at 256 tokens), so it runs torch (the kernels support c up to 256)."""
     c = z.shape[-1]
-    return z.is_cuda and z.dtype in (torch.float32, torch.bfloat16, torch.float16) and 16 <= c <= 256 and c & (c - 1) == 0 and 1 <= n_heads <= 16
+    return z.is_cuda and z.dtype in (torch.float32, torch.bfloat16, torch.float16) and 16 <= c <= 32 and c & (c - 1) == 0 and 1 <= n_heads <= 16
 
 
 @triton.jit
