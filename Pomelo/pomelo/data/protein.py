@@ -1,9 +1,8 @@
 """Real proteins for the model: a window of `crop` consecutive residues of a protein chain of the training set (data/v1/train_val), as a system dict of pomelo.data.molecule.
 
 As in PhysDock, a standard residue is one token and one conformer: its reference conformer is the CCD one (pomelo.data.molecule.random_frames puts every residue into a frame of its
-own), its atom features are those of the atoms in the CCD reference molecule, the bonds inside a residue are features, the peptide bonds are bonds of the system but no feature (they join
-two conformers; the chain is in residue_index). The atoms are the heavy atoms that are resolved in the structure, in the order of the CCD library (so the coordinates, the reference
-molecule of the residue and its bonds line up).
+own), its atom features (ref_feat) are those of the CCD library, the chain is in residue_index; the self-template is the pseudo-beta atom (CB, CA of glycine) of every residue. The atoms
+are the heavy atoms that are resolved in the structure, in the order of the CCD library.
 
 The stereo table of the evaluation: the C-alpha of every residue but glycine and the C-beta of isoleucine and threonine (RDKit's potential stereocentres of the reference molecules), each
 with its three heavy neighbours and the implicit hydrogen; the label is the sign of the signed volume of the ordered neighbours in the real structure, so all L residues carry the same
@@ -21,7 +20,8 @@ import numpy as np
 import torch
 from rdkit import Chem
 
-from pomelo.data.molecule import ATOM_KEYS, BOND_TYPES, ELEMENTS, HYBRIDISATION, add_features, random_frames, signed_volume
+from pomelo.data import features as PF
+from pomelo.data.molecule import random_frames, signed_volume, with_template
 
 ROOT = Path(os.environ.get("PHYSDOCK_ROOT", Path(__file__).resolve().parents[3]))          # the PhysDock repository (the data lives there)
 STANDARD = "ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split()
@@ -75,27 +75,22 @@ def stereo_atoms(ccd: str) -> List[int]:
 
 def build_window(ccds, pos, mask, start: int, crop: int = 128) -> Dict[str, torch.Tensor]:
     lib = ccd_library()
-    feats = {k: [] for k in ATOM_KEYS + ("atom_to_token",)}
-    coords, refs, bonds, glob = [], [], [], {}
-    centres_local = []
+    feats, coords, refs, glob, conf_ = [], [], [], {}, []
+    centres_local, beta = [], []
     for u, r in enumerate(range(start, start + crop)):
-        m = lib[ccds[r]]["ref_mol"]
+        entry = lib[ccds[r]]
+        m = entry["ref_mol"]
         keep = [a for a in range(m.GetNumAtoms()) if mask[r][a]]
+        names = ["".join(entry["ref_atom_name_chars"][a]).strip() for a in keep]
         for a in keep:
-            at = m.GetAtomWithIdx(a)
             glob[(u, a)] = len(coords)
             coords.append(pos[r][a])
-            refs.append(np.asarray(lib[ccds[r]]["ref_pos"][a], dtype=np.float32))                    # the reference conformer of the residue (CCD), its own frame
-            for k, v in (("ref_element", ELEMENTS.get(at.GetAtomicNum(), 9)), ("ref_charge", at.GetFormalCharge()), ("ref_is_aromatic", int(at.GetIsAromatic())),
-                         ("ref_hybridization", HYBRIDISATION.get(at.GetHybridization(), 3)), ("ref_n_h", at.GetTotalNumHs()), ("ref_in_ring", int(at.IsInRing())),
-                         ("atom_to_token", u)):
-                feats[k].append(v)                                                               # the features of the atom in the reference molecule (the free amino acid)
-        for b in m.GetBonds():
-            i, j = (u, b.GetBeginAtomIdx()), (u, b.GetEndAtomIdx())
-            if i in glob and j in glob:
-                bonds.append((glob[i], glob[j], BOND_TYPES.get(b.GetBondType(), 1)))
-        if u > 0 and (u - 1, 2) in glob and (u, 0) in glob:
-            bonds.append((glob[(u - 1, 2)], glob[(u, 0)], 1))                                    # the peptide bond C(i-1) - N(i): a bond of the system, not a feature (two conformers)
+            conf_.append(u)
+        f = PF.ref_feat(entry, keep)
+        ref = np.asarray(entry["ref_pos"], dtype=np.float32)[keep]
+        refs.append(ref - ref.mean(0))
+        feats.append(f)
+        beta.append(glob[(u, keep[names.index("CB")])] if "CB" in names else glob[(u, keep[names.index("CA")])])        # the pseudo-beta atom of the template
         centres_local.append([(glob[(u, c)], [glob[(u, x.GetIdx())] for x in m.GetAtomWithIdx(c).GetNeighbors() if (u, x.GetIdx()) in glob])
                               for c in stereo_atoms(ccds[r]) if (u, c) in glob])
     x = torch.from_numpy(np.stack(coords)).float()
@@ -107,14 +102,16 @@ def build_window(ccds, pos, mask, start: int, crop: int = 128) -> Dict[str, torc
                 centre.append(c)
                 nbrs.append(sorted(nb) + [-1] * (4 - len(nb)))
     centre_t, nbrs_t = torch.tensor(centre, dtype=torch.int64), torch.tensor(nbrs, dtype=torch.int64)
-    sign = torch.sign(signed_volume(x, centre_t, nbrs_t)).float()
-    out = {k: torch.tensor(v) for k, v in feats.items()}
-    conformer = out["atom_to_token"].clone()                                                     # a residue is a token and a conformer: one frame per residue
-    out.update({"bonds": torch.tensor(bonds), "x_gt": x, "stereo_center": centre_t, "stereo_nbrs": nbrs_t, "stereo_sign": sign, "atom_to_conformer": conformer,
-                "ref_pos": random_frames(torch.from_numpy(np.stack(refs)).float(), conformer, seed=start),
-                "restype": torch.tensor([STANDARD.index(ccds[r]) for r in range(start, start + crop)]),
-                "residue_index": torch.arange(start, start + crop), "asym_id": torch.zeros(crop, dtype=torch.int64)})
-    return add_features(out)
+    conformer = torch.tensor(conf_)                                                               # a residue is a token and a conformer: one frame per residue
+    ref_pos = random_frames(torch.from_numpy(np.concatenate(refs)).float(), conformer, seed=start)
+    feat = torch.cat(feats)
+    feat[:, PF.POS] = ref_pos
+    restype = torch.tensor([STANDARD.index(ccds[r]) for r in range(start, start + crop)])
+    out = {"ref_feat": feat, "ref_pos": ref_pos, "atom_to_conformer": conformer, "atom_to_token": conformer.clone(), "x_gt": x,
+           **PF.token_features(restype, torch.arange(start, start + crop), torch.zeros(crop, dtype=torch.long), torch.zeros(crop, dtype=torch.long)),
+           "token_bonds": torch.zeros(crop, crop), "ligand_pair_feat": torch.zeros(crop, crop, 42), "templ_source": torch.tensor(beta),
+           "stereo_center": centre_t, "stereo_nbrs": nbrs_t, "stereo_sign": torch.sign(signed_volume(x, centre_t, nbrs_t)).float()}
+    return with_template(out, seed=start)
 
 
 def window_meta(ccds, mask, start: int, crop: int) -> List[Tuple[str, str, int, str]]:

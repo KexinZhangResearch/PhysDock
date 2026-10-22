@@ -1,17 +1,17 @@
-"""The decoder of Pomelo (the DiT), multi-scale as in AF3 / PhysDock (atoms -> tokens -> atoms), built from the typed layers and conditioned on the 12 outputs of the encoder trunk;
-equivariant under rotations, reflections and translations, so there is no augmentation of the coordinates, in training or in sampling.
+"""The decoder of Pomelo (the DiT), multi-scale as PhysDock's AllAtomDecoder (atom DiT -> tokens -> token DiT -> atoms -> atom DiT), built from the typed layers and conditioned on
+the 12 outputs of the encoder trunk; equivariant under rotations, reflections and translations, so there is no augmentation of the coordinates, in training or in sampling.
 
-One noisy sample is processed by PomeloDiT.forward; models/model.py vmaps it over the noisy samples of a structure (the conditions of the encoder are shared: what does not depend on the
-noisy coordinates is computed once, vmap does not batch it).
+It works on a batch of noisy samples of one structure, x [B, N_atom, 3], as PhysDock's: what does not depend on the noisy coordinates is computed once per structure and shared by
+the samples, above all the logit biases of every block (PairBias, from the atom pairs ap and the token pairs z), and every attention is one call of the memory-efficient kernel with
+that shared bias (SharedBiasAttention): the memory of a sample is O(N), no [B, H, N, N] tensor exists.
 
 The conditions (pomelo.models.encoders.EncoderTrunk): the vectors of a and s are in the frame of the reference of their conformer; the transport T_k of every conformer (a function of the
-noisy structure, pomelo.models.primitives.frames) moves them into the frame of the noisy structure. det(T_k) is an even scalar (T_k -> Q T_k P_k^T with det Q = det P_k): about +1 when
+noisy structure, pomelo.models.primitives.frames) moves them into the frame of the noisy sample. det(T_k) is an even scalar (T_k -> Q T_k P_k^T with det Q = det P_k): about +1 when
 the noisy conformer has the hand of its reference, -1 when it is the mirror image of it.
 
-The noisy coordinates x (centred, times c_in, in units of 4 Angstrom):
-    atoms        1o  x - conformer centre, x - centroid, x - mean of the bonded neighbours (in the conformer);  1e  the cross products of the last with the first two;  0e  det(T_k)
-    atom pairs   0e  RBF(|x_i - x_j|)
-    tokens       the pooled atoms;  token pairs  0e  RBF(|c_i - c_j|) of the token centres (the mean of their atoms): the token pair representation sees the structure too
+The noisy coordinates x (centred, times c_in, in units of 4 Angstrom; PhysDock: linear_x(x_in), a vector, here the vectors of the kinds):
+    atoms   1o  x - conformer centre, x - centroid, x - mean of the bonded neighbours (in the conformer);  1e  the cross products of the last with the first two;  0e  det(T_k)
+    the positions also enter every attention (the direction messages); the pair biases are those of the structure (as PhysDock: no distance of the noisy sample in the bias)
 """
 import math
 from typing import Dict
@@ -23,9 +23,9 @@ import torch.nn.functional as F
 from pomelo.configs import Config
 from pomelo.models.primitives import frames as Fr
 from pomelo.models.primitives import geometry as G
-from pomelo.models.primitives.irreps import Feats, GeometricProduct, Mult, NormLinear, TypedLinear, TypedNorm, TypedPool, add, mask_rows
-from pomelo.models.primitives.transformers import SingleBlock
-from pomelo.utils.tensor_utils import N_RBF, rbf
+from pomelo.models.primitives.attentions import PairBias, SharedBiasAttention
+from pomelo.models.primitives.irreps import Feats, GeometricProduct, Mult, NormLinear, TypedLinear, TypedNorm, add
+from pomelo.models.primitives.transformers import TypedTransition
 
 GEOM = 4.0                      # the scaled coordinates are in units of 4 Angstrom (sigma_data = 16 Angstrom) so that vectors and distances are of order 1
 
@@ -42,16 +42,18 @@ class TimeEmbedding(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """A SingleBlock (products, attention, transition) conditioned on the noise level by a typed AdaLN, as PhysDock's DiT blocks: before each of the three updates the stream is
-    normalised (TypedNorm without affine), scaled per channel by (1 + scale) (every kind: an even number keeps the kind), shifted on 0e only (the only kind that may be shifted), and the
-    update is multiplied per channel by a gate. scale, shift and gate are linear in the time embedding. The stream itself is never shifted."""
+    """One block of a DiT stack for a batch of noisy samples: s += geometric products (the exchange between the kinds), s += attention with the shared bias, s += transition, each
+    behind a typed AdaLN (PhysDock's AdaLayerNormZero): the stream normalised (TypedNorm without affine), scaled per channel by (1 + scale) (every kind: an even number keeps the kind),
+    shifted on 0e only (the only kind that may be shifted), and the update multiplied per channel by a gate; scale, shift and gate are linear in the time embedding of the sample."""
 
-    def __init__(self, mult_s: Mult, mult_z: Mult, heads: int, t_dim: int, product_channels: int) -> None:
+    def __init__(self, mult_s: Mult, heads: int, t_dim: int, product_channels: int) -> None:
         super().__init__()
-        self.block = SingleBlock(mult_s, mult_z, heads, product_channels)
-        for layer in (self.block.product, self.block.attention, self.block.transition):
-            layer.norm = None                                                                   # replaced by the AdaLN below (the layers are called with normed=True)
         self.mult_s = {k: c for k, c in mult_s.items() if c}
+        self.product = GeometricProduct(self.mult_s, self.mult_s, product_channels)
+        self.product.norm = None                                                                 # the AdaLN below normalises (the layers are called normed)
+        self.attention = SharedBiasAttention(self.mult_s, heads)
+        self.transition = TypedTransition(self.mult_s)
+        self.transition.norm = None
         self.norm = TypedNorm(self.mult_s, affine=False)
         self.width = sum(self.mult_s.values())
         self.mod = nn.Linear(t_dim, 3 * (self.mult_s["0e"] + 2 * self.width))
@@ -69,19 +71,27 @@ class DiTBlock(nn.Module):
     def _per_kind(self, v: torch.Tensor) -> Dict[str, torch.Tensor]:
         return dict(zip(self.mult_s, v.split(list(self.mult_s.values()), dim=-1)))
 
-    def forward(self, s: Feats, z: Feats, centers: torch.Tensor, mask: torch.Tensor, t: torch.Tensor) -> Feats:
-        valid = mask > 0
-        m = self.mod(F.silu(t))
-        s = mask_rows(s, valid)
-        updates = (lambda x: self.block.product(x, normed=True), lambda x: self.block.attention(x, z, centers, mask, normed=True),
-                   lambda x: self.block.transition(x, normed=True))
+    def forward(self, s: Feats, bias: torch.Tensor, centers: torch.Tensor, t: torch.Tensor) -> Feats:
+        """s {kind: [B, N, C(, 3)]}, bias [H, N, N] (shared), centers [B, N, 3], t [B, t_dim]"""
+        m = self.mod(F.silu(t))[:, None]                                                         # [B, 1, ...]: per sample, the same for all atoms
+        updates = (lambda x: self.product(x, normed=True), lambda x: self.attention(x, bias, centers), lambda x: self.transition(x, normed=True))
         for i, update in enumerate(updates):
-            sh, sc, ga = (m[sl] for sl in self._slices(i))
+            sh, sc, ga = (m[..., sl] for sl in self._slices(i))
             sc, ga = self._per_kind(sc), self._per_kind(ga)
-            x = {k: G.scale(v, k, 1 + sc[k][None], "0e")[0] for k, v in self.norm(s).items()}
-            x = mask_rows({**x, "0e": x["0e"] + sh}, valid)
-            s = mask_rows(add(s, {k: G.scale(v, k, ga[k][None], "0e")[0] for k, v in update(x).items()}), valid)
+            x = {k: G.scale(v, k, 1 + sc[k], "0e")[0] for k, v in self.norm(s).items()}
+            x = {**x, "0e": x["0e"] + sh}
+            s = add(s, {k: G.scale(v, k, ga[k], "0e")[0] for k, v in update(x).items()})
         return s
+
+
+def move(v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """v [N, C, 3] (shared) times the matrix t [B, N, 3, 3] of every sample and row -> [B, N, C, 3]"""
+    return torch.einsum("bnij,ncj->bnci", t, v)
+
+
+def pool_tokens(pool: torch.Tensor, h: Feats) -> Feats:
+    """the mean over the atoms of every token: pool [Nt, Na], h {kind: [B, Na, ...]} -> [B, Nt, ...]"""
+    return {k: torch.einsum("ta,ba...->bt...", pool, v) for k, v in h.items()}
 
 
 class PomeloDiT(nn.Module):
@@ -94,52 +104,63 @@ class PomeloDiT(nn.Module):
         self.norm_a_enc, self.norm_s_enc = TypedNorm(ma), TypedNorm(ms)
         self.cond_a = TypedLinear({k: ma[k] + ms[k] for k in G.KINDS}, ma)                                       # [a_enc, s_enc broadcast to the atoms], every kind
         self.cond_ap = NormLinear(mp, mp)                                                                          # ap_enc
-        self.cond_ap_z = NormLinear(mz, mp, bias=False)                                                            # + z_enc broadcast to the atom pairs
+        self.cond_ap_z = NormLinear(mz, mp, bias=False)                                                            # + z_enc broadcast to the atom pairs (PhysDock's linear_z)
         self.noisy_in = TypedLinear({"0e": 1, "1o": 3, "1e": 2}, {k: ma[k] for k in ("0e", "1o", "1e")}, bias=False)
-        self.ap_rbf = nn.Linear(N_RBF, mp["0e"], bias=False)
-        self.atom_enc = nn.ModuleList([DiTBlock(ma, mp, cfg.heads, cfg.t_dim, cfg.product_channels) for _ in range(cfg.n_atom_blocks)])
-        self.pool = TypedPool(ma, ms)
+        self.bias_atom_enc = PairBias(mp, cfg.heads_atom, cfg.n_atom_blocks)
+        self.bias_token = PairBias(mz, cfg.heads_token, cfg.n_token_blocks)
+        self.bias_atom_dec = PairBias(mp, cfg.heads_atom, cfg.n_atom_blocks)
+        self.atom_enc = nn.ModuleList([DiTBlock(ma, cfg.heads_atom, cfg.t_dim, cfg.product_channels) for _ in range(cfg.n_atom_blocks)])
+        self.pool_norm, self.pool_lin = TypedNorm(ma), TypedLinear(ma, ms)                                       # PhysDock: silu(linear_downscale(x)), mean over the token
         self.cond_s = TypedLinear(ms, ms)                                                                          # s_enc (normalised), its vectors moved
         self.cond_z = NormLinear(mz, mz)
-        self.z_rbf = nn.Linear(N_RBF, mz["0e"], bias=False)
-        self.token_blocks = nn.ModuleList([DiTBlock(ms, mz, cfg.heads, cfg.t_dim, cfg.product_channels) for _ in range(cfg.n_token_blocks)])
+        self.token_blocks = nn.ModuleList([DiTBlock(ms, cfg.heads_token, cfg.t_dim, cfg.product_channels) for _ in range(cfg.n_token_blocks)])
         self.unpool = NormLinear(ms, ma)
-        self.atom_dec = nn.ModuleList([DiTBlock(ma, mp, cfg.heads, cfg.t_dim, cfg.product_channels) for _ in range(cfg.n_atom_blocks)])
+        self.atom_dec = nn.ModuleList([DiTBlock(ma, cfg.heads_atom, cfg.t_dim, cfg.product_channels) for _ in range(cfg.n_atom_blocks)])
         self.head_product = GeometricProduct(ma, {"1o": 8}, channels=8)
         self.head_atom = TypedLinear({"1o": 8}, {"1o": 1}, bias=False)
         self.head_token = NormLinear({"1o": ms["1o"]}, {"1o": 1}, bias=False)                                   # PhysDock's token_out: RMSNorm + Linear
 
+    def biases(self, enc: Dict[str, object]):
+        """the logit biases of the three stacks, once per structure"""
+        a2t = enc["atom_to_token"]
+        zp = self.cond_ap_z(enc["z"])
+        ap = add(self.cond_ap(enc["ap"]), {k: v[a2t][:, a2t] for k, v in zp.items()})
+        return self.bias_atom_enc(ap), self.bias_token(self.cond_z(enc["z"])), self.bias_atom_dec(ap)
+
     def forward(self, x: torch.Tensor, c_noise: torch.Tensor, enc: Dict[str, object]) -> torch.Tensor:
-        """x [Na, 3]: the centred noisy coordinates times c_in (EDM); c_noise: ln(sigma) / 4 (a scalar); enc: the output of the EncoderTrunk -> the raw output F [Na, 3] (a polar
+        """x [B, Na, 3]: the centred noisy coordinates times c_in (EDM); c_noise [B]: ln(sigma) / 4; enc: the output of the EncoderTrunk -> the raw output F [B, Na, 3] (a polar
         vector per atom)"""
-        n, nt, nc = enc["n_atoms"], enc["n_tokens"], enc["n_conformers"]
-        pool, a2t, conf, fr = enc["pool"].to(x.dtype), enc["atom_to_token"], enc["atom_to_conformer"], enc["frames"]
-        mask_a, mask_t = torch.ones(n, dtype=x.dtype, device=x.device), torch.ones(nt, dtype=x.dtype, device=x.device)
+        nc = enc["n_conformers"]
+        pool, a2t, conf, t2c, fr = enc["pool"].to(x.dtype), enc["atom_to_token"], enc["atom_to_conformer"], enc["token_to_conformer"], enc["frames"]
+        b_enc, b_tok, b_dec = enc["biases"] if "biases" in enc else self.biases(enc)
         t = self.time(c_noise)
         xg = x * GEOM
-        x_conf = Fr.conformer_centred(xg, conf, nc)
-        transport = Fr.transport(x_conf, fr["ref_rel"], conf, fr["inv"], fr["null"])                            # [n_conf, 3, 3]
+        x_conf = torch.vmap(lambda xb: Fr.conformer_centred(xb, conf, nc))(xg)                                    # [B, Na, 3]
+        transport = torch.vmap(lambda xb: Fr.transport(xb, fr["ref_rel"], conf, fr["inv"], fr["null"]))(x_conf)     # [B, n_conf, 3, 3]
         hand = torch.linalg.det(transport)                                                                         # even: does the noisy conformer have the hand of its reference?
-        a_enc = {k: (Fr.move(v, transport[conf]) if k in G.VECTOR_KINDS else v) for k, v in self.norm_a_enc(enc["a"]).items()}
-        s_enc = {k: (Fr.move(v, transport[enc["token_to_conformer"]]) if k in G.VECTOR_KINDS else v) for k, v in self.norm_s_enc(enc["s"]).items()}
+        a_enc, s_enc = self.norm_a_enc(enc["a"]), self.norm_s_enc(enc["s"])
+        cat = {}
+        for k in G.KINDS:
+            if k in G.SCALAR_KINDS:
+                cat[k] = torch.cat([a_enc[k], s_enc[k][a2t]], -1)
+            else:
+                cat[k] = torch.cat([move(a_enc[k], transport[:, conf]), move(s_enc[k], transport[:, t2c])[:, a2t]], -2)
+        a = self.cond_a({k: (v.expand(x.shape[0], *v.shape) if k in G.SCALAR_KINDS else v) for k, v in cat.items()})
         nbr = enc["neighbour_mean"].to(x.dtype)
         v_nbr = torch.where(nbr.sum(1, keepdim=True) > 0, xg - nbr @ xg, torch.zeros_like(xg))
-        vec = torch.stack([G.squash(x_conf, 1.0), G.squash(xg - xg.mean(0), 4.0), G.squash(v_nbr, 1.0)], dim=-2)          # [Na, 3, 3]  1o, relative, bounded
-        axial = torch.stack([torch.linalg.cross(vec[:, 0], vec[:, 2], dim=-1), torch.linalg.cross(vec[:, 1], vec[:, 2], dim=-1) / 4.0], dim=-2)
-        a = self.cond_a({k: torch.cat([a_enc[k], s_enc[k][a2t]], dim=-1 if k in G.SCALAR_KINDS else -2) for k in G.KINDS})
-        a = add(a, self.noisy_in({"0e": hand[conf][:, None], "1o": vec, "1e": axial}))
-        zp = self.cond_ap_z(enc["z"])
-        ap = add(self.cond_ap(enc["ap"]), {k: v[a2t][:, a2t] for k, v in zp.items()})                            # does not depend on x: computed once under vmap
-        ap = {**ap, "0e": ap["0e"] + self.ap_rbf(rbf(torch.cdist(xg, xg)))}
-        for blk in self.atom_enc:
-            a = blk(a, ap, xg, mask_a, t)
-        s = add(self.pool(a, pool), self.cond_s(s_enc))
-        centre_t = pool @ xg
-        z = self.cond_z(enc["z"])
-        z = {**z, "0e": z["0e"] + self.z_rbf(rbf(torch.cdist(centre_t, centre_t)))}
-        for blk in self.token_blocks:
-            s = blk(s, z, centre_t, mask_t, t)
-        a = add(a, {k: v[a2t] for k, v in self.unpool(s).items()})
-        for blk in self.atom_dec:
-            a = blk(a, ap, xg, mask_a, t)
-        return self.head_atom(self.head_product(a))["1o"][:, 0] + self.head_token({"1o": s["1o"]})["1o"][:, 0][a2t]
+        vec = torch.stack([G.squash(x_conf, 1.0), G.squash(xg - xg.mean(-2, keepdim=True), 4.0), G.squash(v_nbr, 1.0)], dim=-2)          # [B, Na, 3, 3]  1o, relative
+        axial = torch.stack([torch.linalg.cross(vec[..., 0, :], vec[..., 2, :], dim=-1), torch.linalg.cross(vec[..., 1, :], vec[..., 2, :], dim=-1) / 4.0], dim=-2)
+        a = add(a, self.noisy_in({"0e": hand[:, conf][..., None], "1o": vec, "1e": axial}))
+        for blk, bias in zip(self.atom_enc, b_enc):
+            a = blk(a, bias, xg, t)
+        h = self.pool_lin(self.pool_norm(a))
+        s = pool_tokens(pool, {**h, "0e": F.silu(h["0e"])})
+        s_cond = {k: (v.expand(x.shape[0], *v.shape) if k in G.SCALAR_KINDS else move(v, transport[:, t2c])) for k, v in s_enc.items()}
+        s = add(s, self.cond_s(s_cond))
+        centre_t = torch.einsum("ta,bac->btc", pool, xg)
+        for blk, bias in zip(self.token_blocks, b_tok):
+            s = blk(s, bias, centre_t, t)
+        a = add(a, {k: v[:, a2t] for k, v in self.unpool(s).items()})
+        for blk, bias in zip(self.atom_dec, b_dec):
+            a = blk(a, bias, xg, t)
+        return self.head_atom(self.head_product(a))["1o"][..., 0, :] + self.head_token({"1o": s["1o"]})["1o"][..., 0, :][:, a2t]

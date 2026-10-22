@@ -2,7 +2,7 @@
 (pomelo.models.decoders.PomeloDiT, conditioned on the 12 outputs of the encoder), wrapped in the EDM preconditioning.
 
 D(mol, x_t [B, Na, 3], sigma [B]) -> [B, Na, 3] in coordinates normalised by sigma_data (16 Angstrom). The noisy structure is centred, the network sees  c_in * (x_t - mean),
-the denoised structure is  mean + c_skip * x_c + c_out * F(...). The encoder runs once per structure, the decoder is vmapped over the B noisy samples.
+the denoised structure is  mean + c_skip * x_c + c_out * F(...). The encoder runs once per structure, the decoder on the B noisy samples at once (PhysDock's layout).
 """
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ def edm_denoise(dit: PomeloDiT, enc, x_t: torch.Tensor, sigma: torch.Tensor) -> 
     xc = x_t - xbar
     s = sigma[:, None, None]
     c_in, c_skip, c_out = (s ** 2 + 1) ** -0.5, 1 / (1 + s ** 2), s * (s ** 2 + 1) ** -0.5
-    raw = torch.vmap(lambda x, c: dit(x, c, enc))(c_in * xc, torch.log(sigma) / 4)
+    raw = dit(c_in * xc, torch.log(sigma) / 4, enc)                     # the decoder takes the batch of noisy samples (shared biases)
     return xbar + c_skip * xc + c_out * raw
 
 

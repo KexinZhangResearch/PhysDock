@@ -91,3 +91,26 @@ class TrunkBlock(nn.Module):
         """same [N, N] (bool): the pairs of units in the same frame (the same conformer); None: all in one frame"""
         z = self.pair(s, z, centers, mask, same)
         return self.single(s, z, centers, mask, same), z
+
+
+class TemplateBlock(nn.Module):
+    """One block of the template stack (PhysDock's TriangleBlock): z += triangle multiplication (outgoing, incoming; the out-of-plane directions u_k are the template's), z +=
+    triangle attention (starting, ending node), z += transition, all on the edges of pair_mask. As in PhysDock the edges outside the mask keep their value and get no gradient
+    (a row with no valid key would amplify the gradient that reaches it in every block)."""
+
+    def __init__(self, mult_z: Mult, mult_u: Mult, heads: int, channels: int = 16, length_scale: float = 8.0, expansion: float = 8 / 3) -> None:
+        super().__init__()
+        self.mul_out = TypedTriangleMultiplication(mult_u, mult_z, True, channels, length_scale)
+        self.mul_in = TypedTriangleMultiplication(mult_u, mult_z, False, channels, length_scale)
+        self.att_start = TypedTriangleAttention(mult_z, heads, True)
+        self.att_end = TypedTriangleAttention(mult_z, heads, False)
+        self.transition = TypedTransition(mult_z, expansion)
+
+    def forward(self, u: Feats, z: Feats, centers: torch.Tensor, mask: torch.Tensor, same: torch.Tensor, pair_mask: torch.Tensor) -> Feats:
+        y = add(z, self.mul_out(u, z, centers, mask, same, pair_mask))
+        y = add(y, self.mul_in(u, y, centers, mask, same, pair_mask))
+        y = add(y, self.att_start(y, mask, pair_mask))
+        y = add(y, self.att_end(y, mask, pair_mask))
+        y = add(y, self.transition(y))
+        keep = pair_mask[..., None]
+        return {k: torch.where(keep, v, z[k].detach()) for k, v in y.items()}

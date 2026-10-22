@@ -78,8 +78,10 @@ class TypedTriangleMultiplication(nn.Module):
     triangle with the direction of the unit k: the handedness of the triangle."""
 
     def __init__(self, mult_s: Mult, mult_z: Mult, outgoing: bool, channels: int = 16, length_scale: float = 8.0, zero_init: bool = False) -> None:
+        """mult_s: only its "1o" is read (the out-of-plane directions u_k: of the single representation, or of a template)"""
         super().__init__()
-        _need(mult_s, mult_z)
+        if not mult_s.get("1o") or set(mult_z) != {"0e", "0o"}:
+            raise ValueError("the triangle multiplication needs polar vectors of the nodes and the pair kinds 0e, 0o")
         c, self.outgoing, self.length_scale = channels, outgoing, length_scale
         sc = {"0e": c, "0o": c}
         self.norm_z, self.norm_u = TypedNorm(mult_z), TypedNorm({"1o": mult_s["1o"]})          # of s only the polar vectors are read
@@ -95,15 +97,16 @@ class TypedTriangleMultiplication(nn.Module):
         self.gate_out = nn.Linear(mult_z["0e"], sum(mult_z.values()))
         self.split = list(mult_z.values())
 
-    def forward(self, s: Feats, z: Feats, centers: torch.Tensor, mask: torch.Tensor, same: torch.Tensor = None) -> Feats:
+    def forward(self, s: Feats, z: Feats, centers: torch.Tensor, mask: torch.Tensor, same: torch.Tensor = None, pair_mask: torch.Tensor = None) -> Feats:
+        """pair_mask [N, N] (bool, None: all): the edges that take part (PhysDock's z_mask of the template stack); the others give and get nothing"""
         valid = mask > 0
-        pair = pair_valid(valid)
+        pair = pair_valid(valid) if pair_mask is None else pair_valid(valid) & pair_mask
         zn = mask_pairs(self.norm_z(mask_pairs(z, valid)), valid)
         z_out = zn["0e"]                                                                       # the gate of the output reads z_ij itself
         wh = directions(centers, valid, self.length_scale, same)                                # [N, N, 3]: zero between two frames, so a triangle has vector terms only inside one
         u = self.proj_u(mask_rows(self.norm_u(mask_rows({"1o": s["1o"]}, valid)), valid))["1o"]       # [N, c, 3]
         if not self.outgoing:                                                                  # the incoming update is the outgoing one on the transposed edges
-            zn, wh = {k: v.transpose(0, 1) for k, v in zn.items()}, wh.transpose(0, 1)
+            zn, wh, pair = {k: v.transpose(0, 1) for k, v in zn.items()}, wh.transpose(0, 1), pair.transpose(0, 1)
         wv = wh[:, :, None, :]                                                                  # [N, N, 1, 3]
         pm = pair[..., None]
 
@@ -124,4 +127,4 @@ class TypedTriangleMultiplication(nn.Module):
         y = self.lin_out(self.norm_out(cat))
         gates = torch.sigmoid(self.gate_out(z_out)).split(self.split, dim=-1)
         y = {k: G.scale(v, k, g, "0e")[0] for (k, v), g in zip(y.items(), gates)}
-        return mask_pairs(y, valid)
+        return {k: torch.where(pair[..., None] if self.outgoing else pair.transpose(0, 1)[..., None], v, torch.zeros_like(v)) for k, v in y.items()}

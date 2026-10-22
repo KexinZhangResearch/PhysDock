@@ -10,14 +10,14 @@ class Config:
     mult_s: Mult = None          # token stream
     mult_ap: Mult = None         # atom pair features read by the atom attention (0e, 0o)
     mult_z: Mult = None          # token pair features (0e, 0o)
-    heads: int = 4
+    heads_atom: int = 4          # attention heads of the atom and of the token streams (PhysDock: channels / 32)
+    heads_token: int = 4
     n_atom_blocks: int = 1       # decoder: atom blocks before and after the token blocks
     n_token_blocks: int = 2      # decoder: token blocks
     n_encoder_atom_blocks: int = 1
+    n_template_blocks: int = 1   # encoder: template stack
     n_encoder_blocks: int = 2    # encoder: Pairformer (TrunkBlock) blocks on the tokens
     t_dim: int = 64
-    atom_static: int = 32        # width of the static atom features (InputEmbedder)
-    pair_static: int = 16        # width of the static atom pair features
     product_channels: int = 8
 
     def __post_init__(self):
@@ -25,3 +25,11 @@ class Config:
         self.mult_s = self.mult_s or {"0e": 128, "0o": 32, "1o": 32, "1e": 16}
         self.mult_ap = self.mult_ap or {"0e": 16, "0o": 8}
         self.mult_z = self.mult_z or {"0e": 32, "0o": 8}
+
+
+def mini_p2() -> Config:
+    """the scale of PhysDock's configs/model/mini_p2.yaml (the network of the smoke tests of scripts/p2align): atom blocks 3 (encoder) and 3 + 3 (decoder), template 2, Pairformer 8,
+    token DiT 6; the even channels of PhysDock (c_a 128, c_ap 16, c_s 512 -> 384 here, c_z 128) and the odd and vector ones beside them, heads of 32 channels"""
+    return Config(mult_a={"0e": 128, "0o": 32, "1o": 32, "1e": 16}, mult_ap={"0e": 16, "0o": 8}, mult_s={"0e": 384, "0o": 64, "1o": 64, "1e": 32},
+                  mult_z={"0e": 128, "0o": 32}, heads_atom=4, heads_token=16, n_atom_blocks=3, n_token_blocks=6, n_encoder_atom_blocks=3, n_template_blocks=2,
+                  n_encoder_blocks=8, t_dim=256)

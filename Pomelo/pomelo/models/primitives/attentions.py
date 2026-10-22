@@ -21,9 +21,11 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from pomelo.models.primitives import geometry as G
-from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear, TypedNorm, mask_pairs
+from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear, TypedNorm, mask_pairs, pair_valid
 
 KINDS = G.KINDS
 FLIP = {"0e": "0o", "0o": "0e", "1o": "1e", "1e": "1o"}
@@ -180,12 +182,15 @@ class TypedTriangleAttention(nn.Module):
         self.gate = nn.Linear(c0, sum(self.mult_cat.values()))
         self.out = TypedLinear(self.mult_cat, mult_z, bias=False, zero_init=zero_init)
 
-    def forward(self, z: Feats, mask: torch.Tensor) -> Feats:
+    def forward(self, z: Feats, mask: torch.Tensor, pair_mask: torch.Tensor = None) -> Feats:
+        """pair_mask [N, N] (bool, None: all): the edges that may be keys and that get an update (PhysDock's z_mask of the template stack)"""
         H, N = self.heads, mask.shape[0]
         valid = mask > 0
+        pm = pair_valid(valid) if pair_mask is None else pair_valid(valid) & pair_mask
         z = mask_pairs(z, valid)
         if not self.starting:
             z = {k: v.transpose(0, 1) for k, v in z.items()}
+            pm = pm.transpose(0, 1)
         x = mask_pairs(self.norm(z), valid)
         heads = lambda t: t.reshape(N, N, H, -1)
         q, k = self.q(x), self.k(x)
@@ -196,7 +201,7 @@ class TypedTriangleAttention(nn.Module):
         logit = (torch.einsum("ijhd,ikhd->hijk", q_cat, k_cat) * self.dim ** -0.5
                  + self.bias_e(x["0e"]).permute(2, 0, 1)[:, None]                                # the bias of the edge jk
                  + torch.einsum("ijhd,jkhd->hijk", q["0o"], self.key_o(x["0o"]).reshape(N, N, H, self.d_o)))
-        ok = (valid[:, None, None] & valid[None, :, None] & valid[None, None, :])[None]
+        ok = (valid[:, None, None] & valid[None, :, None] & valid[None, None, :] & pm[:, None, :])[None]        # [1, i, j, k]: the key edge ik
         alpha = torch.where(ok, torch.softmax(logit.masked_fill(~ok, MASKED), -1), torch.zeros_like(logit))
         beta_e = alpha * torch.sigmoid(self.gate_e(x["0e"])).permute(2, 0, 1)[:, None]
         beta_o = alpha * torch.tanh(self.gate_o(x["0o"])).permute(2, 0, 1)[:, None]
@@ -206,6 +211,80 @@ class TypedTriangleAttention(nn.Module):
         cat = {kind: torch.cat([agg(alpha, v0[kind]), agg(beta_e, ve[kind]), agg(beta_o, vo[flip[kind]])], -1) for kind in ("0e", "0o")}
         gates = torch.sigmoid(self.gate(x["0e"])).split(list(self.mult_cat.values()), dim=-1)
         y = self.out({kind: G.scale(cat[kind], kind, g, "0e")[0] for (kind, g) in zip(self.mult_cat, gates)})
+        y = {kind: torch.where(pm[..., None], v, torch.zeros_like(v)) for kind, v in y.items()}
         if not self.starting:
             y = {kind: v.transpose(0, 1) for kind, v in y.items()}
         return mask_pairs(y, valid)
+
+
+# ---------------------------------------------------------------------------------------------------------------- the attention of the DiT: one shared bias, one fused kernel
+class PairBias(nn.Module):
+    """The logit biases of every block of a DiT stack from its pair representation, computed once per structure and shared by all noisy samples (PhysDock's LayerNormPairBias):
+    bias[b] = linear_b[ LN(z_0e), RMS(z_0o)^2 ] -> [num_blocks, H, N, N]. A logit must be even: z_0o enters through its square (an even function of a pseudoscalar); its sign, the
+    hand, reaches the decoder through the 0o channels of the atoms and tokens (q . k)."""
+
+    def __init__(self, mult_z: Mult, heads: int, num_blocks: int) -> None:
+        super().__init__()
+        self.heads, self.num_blocks = heads, num_blocks
+        self.norm = TypedNorm({k: mult_z[k] for k in ("0e", "0o")}, affine=False)
+        self.linear = nn.Linear(mult_z["0e"] + mult_z["0o"], num_blocks * heads)
+
+    def forward(self, z: Feats) -> torch.Tensor:
+        n = self.norm({k: z[k] for k in ("0e", "0o")})
+        b = self.linear(torch.cat([n["0e"], n["0o"].square()], -1))                          # [N, N, blocks * H]
+        return b.permute(2, 0, 1).reshape(self.num_blocks, self.heads, *b.shape[:2]).contiguous()
+
+
+def _pad8(x: torch.Tensor) -> torch.Tensor:
+    return F.pad(x, (0, (-x.shape[-1]) % 8))
+
+
+class SharedBiasAttention(nn.Module):
+    """The typed attention of a DiT block, for a batch of noisy samples [B, N, ...] that share the logit bias [H, N, N] of the structure (PhysDock's DiTAttention): one softmax
+    of  q . k / sqrt(D) + bias,  q . k the sum of the dot products within every kind (the vectors flattened: three components, the same weights), RMS-normalised per head and
+    part (scalars, vectors); the weights (even) aggregate the values of every kind and the positions c_j, so the direction message sum_j alpha_ij c_j - c_i (a polar vector,
+    squashed) comes from the same call. Everything is one call of the memory-efficient kernel: no [B, H, N, N] tensor exists. All tokens / atoms are in one frame (the noisy
+    structure). The parity of the kinds is kept (the weights are even); the kinds exchange information in the products of the block (GeometricProduct), not here.
+    forward(x, bias, centers) is the update; x is normalised already (the AdaLN of the block)."""
+
+    def __init__(self, mult: Mult, heads: int, zero_init: bool = False) -> None:
+        super().__init__()
+        if set(mult) != set(KINDS) or any(c % heads for c in mult.values()):
+            raise ValueError(f"the stream needs the four kinds with channels {dict(mult)} divisible by the heads {heads}")
+        self.mult, self.heads = dict(mult), heads
+        self.q, self.k = TypedLinear(self.mult, self.mult, bias=False), TypedLinear(self.mult, self.mult, bias=False)
+        self.v = TypedLinear(self.mult, self.mult)
+        self.q_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in self.mult.items()})
+        self.k_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in self.mult.items()})
+        self.dim = sum(c // heads * (1 if k in G.SCALAR_KINDS else 3) for k, c in self.mult.items())
+        self.mult_cat = {k: c + (heads if k == "1o" else 0) for k, c in self.mult.items()}
+        self.gate = nn.Linear(self.mult["0e"], sum(self.mult_cat.values()))
+        self.out = TypedLinear(self.mult_cat, self.mult, zero_init=zero_init)
+
+    def flat(self, h: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """{kind: [B, N, H, d(, 3)]} -> [B, H, N, D]"""
+        return torch.cat([h[k] if k in G.SCALAR_KINDS else h[k].flatten(-2) for k in KINDS], -1).transpose(1, 2)
+
+    def forward(self, x: Feats, bias: torch.Tensor, centers: torch.Tensor) -> Feats:
+        """x {kind: [B, N, C(, 3)]}, bias [H, N, N], centers [B, N, 3] -> the update"""
+        H = self.heads
+        b, n = x["0e"].shape[:2]
+        heads = lambda t: {k: split_heads(v, k, H) for k, v in t.items()}
+        q, k = head_norm(heads(self.q(x)), self.q_norm), head_norm(heads(self.k(x)), self.k_norm)
+        v = heads(self.v(x))
+        qf, kf = self.flat(q), self.flat(k)
+        vf = torch.cat([self.flat(v), centers[:, None].expand(b, H, n, 3)], -1)
+        dv = vf.shape[-1]
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            o = F.scaled_dot_product_attention(_pad8(qf), _pad8(kf), _pad8(vf), attn_mask=bias[None].expand(b, -1, -1, -1).to(qf.dtype), scale=self.dim ** -0.5)
+        o = o[..., :dv].transpose(1, 2)                                                               # [B, N, H, Dv]
+        parts, i = {}, 0
+        for kind in KINDS:
+            d = self.mult[kind] // H
+            w = d if kind in G.SCALAR_KINDS else 3 * d
+            parts[kind] = merge_heads(o[..., i:i + w] if kind in G.SCALAR_KINDS else o[..., i:i + w].unflatten(-1, (d, 3)), kind)
+            i += w
+        direction = G.squash(o[..., i:i + 3] - centers[:, :, None], DIRECTION_LENGTH)                  # [B, N, H, 3]: sum_j alpha_ij c_j - c_i, polar
+        parts["1o"] = torch.cat([parts["1o"], direction], -2)
+        gates = torch.sigmoid(self.gate(x["0e"])).split(list(self.mult_cat.values()), dim=-1)
+        return self.out({kind: G.scale(parts[kind], kind, g, "0e")[0] for kind, g in zip(self.mult_cat, gates)})
