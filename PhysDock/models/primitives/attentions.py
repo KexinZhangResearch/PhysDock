@@ -1,5 +1,10 @@
 """Attention layers, built from the kernel-level modules of PhysDock.models.primitives. Every head has 32 channels; masks become
-additive -inf biases. Pair masks are symmetric. Every layer returns the residual-added stream, x + update."""
+additive -inf biases. Pair masks are symmetric. Every layer returns the residual-added stream, x + update.
+
+The output gate has two forms (set_attention_gate, model config `attention_gate`):
+  legacy (the released parameters)  x + linear_o(attention) * g          g: the raw linear output, unbounded, after the output projection
+  sigmoid                           x + linear_o(attention * sigmoid(g)) per head and channel, before the output projection, in (0, 1)
+The parameters are the same (the DiT attention gets one more matrix, `linear_g`, with the sigmoid gate)."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,7 +20,19 @@ def _heads(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(*x.shape[:-1], -1, HEAD_DIM).transpose(-2, -3)
 
 
-class AttentionWithBias(nn.Module):
+class _GatedOutput:
+    """Mixin of the attention layers with a projection gate g from the merged q, k, v, g projection: legacy_gate = True (the released
+    parameters) multiplies the projected output by the raw g, False gates the attention output per head with sigmoid(g) first."""
+    sigmoid_gate = False
+
+    def finish(self, x: torch.Tensor, o: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """x [..., N, c] stream, o [..., H, N, 32] attention output, g [..., N, c] -> x + update"""
+        if self.sigmoid_gate:
+            return self.out(x, o * torch.sigmoid(_heads(g)).to(o.dtype))
+        return self.out(x, o, g)
+
+
+class AttentionWithBias(_GatedOutput, nn.Module):
     """Gated self-attention over N positions (the single representation of the Pairformer, the atoms of the AtomTransformer) with a
     per-head logit bias from the pair representation."""
 
@@ -39,10 +56,10 @@ class AttentionWithBias(nn.Module):
         q, k, v, g = self.qkvg(s).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
         o = self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask))
-        return self.out(s, o, g)
+        return self.finish(s, o, g)
 
 
-class MSARowAttentionWithBias(nn.Module):
+class MSARowAttentionWithBias(_GatedOutput, nn.Module):
     """Gated attention along the tokens of every MSA row, with a logit bias from the pair representation."""
 
     def __init__(self, c_m: int, c_z: int, inf: float, eps: float) -> None:
@@ -64,10 +81,10 @@ class MSARowAttentionWithBias(nn.Module):
         """
         q, k, v, g = self.qkvg(m).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        return self.out(m, self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask)), g)
+        return self.finish(m, self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask)), g)
 
 
-class MSAColumnAttention(nn.Module):
+class MSAColumnAttention(_GatedOutput, nn.Module):
     """Gated attention along the MSA rows of every token (no mask, no bias)."""
 
     def __init__(self, c_m: int, eps: float) -> None:
@@ -80,10 +97,10 @@ class MSAColumnAttention(nn.Module):
         m = m.transpose(-2, -3)
         q, k, v, g = self.qkvg(m).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        return self.out(m, F.scaled_dot_product_attention(q, k, v), g).transpose(-2, -3)
+        return self.finish(m, F.scaled_dot_product_attention(q, k, v), g).transpose(-2, -3)
 
 
-class TriangleAttention(nn.Module):
+class TriangleAttention(_GatedOutput, nn.Module):
     """Gated attention along the rows of z with a bias from z (starting node); starting_node=False attends along the columns (ending
     node). The bias is the pair bias of z (its own RMSNorm; checkpoints from before it have the bias from the norm of the q, k, v, g
     projection, see PhysDock.utils.import_old_weights)."""
@@ -109,7 +126,7 @@ class TriangleAttention(nn.Module):
             z = z.transpose(-2, -3)
         q, k, v, g = self.qkvg(z).chunk(4, dim=-1)
         q, k, v = _heads(q), _heads(k), _heads(v)
-        z = self.out(z, self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask)), g)
+        z = self.finish(z, self.attend(q, k, v, self.pair_bias(z, z_mask, q), self.attend.valid_length(z_mask)), g)
         return z if self.starting_node else z.transpose(-2, -3)
 
 
@@ -127,6 +144,13 @@ class DiTAttention(nn.Module):
         self.attend = SharedBiasAttention()
         self.out = LinearGateResidual(c_s)
 
+    def set_head_gate(self, on: bool) -> None:
+        """Per-head sigmoid gate of the attention output (an extra matrix `linear_g`, from the AdaLN-modulated input) on top of the AdaLN gate"""
+        if on and not hasattr(self, "linear_g"):
+            self.linear_g = Linear(self.out.linear.in_features, self.out.linear.in_features)
+        if not on and hasattr(self, "linear_g"):
+            del self.linear_g
+
     def forward(self, x: torch.Tensor, bias: torch.Tensor, mod: torch.Tensor, n_valid: torch.Tensor = None,
                 pos: torch.Tensor = None, radius: torch.Tensor = None) -> torch.Tensor:
         """
@@ -140,15 +164,26 @@ class DiTAttention(nn.Module):
         Returns:
             [B, N, c_s] x + update
         """
-        q, k, v, gate = self.project(x, mod)
-        return self.output(x, self.attend(q, k, v, bias, n_valid, pos, radius), gate)
+        q, k, v, gate, g = self.project(x, mod)
+        return self.output(x, self.attend(q, k, v, bias, n_valid, pos, radius), gate, g)
 
     def project(self, x: torch.Tensor, mod: torch.Tensor):
-        """Attention inputs: q, k, v [B, H, N, 32] and the output gate [B, 1, c_s]"""
+        """Attention inputs: q, k, v [B, H, N, 32], the AdaLN output gate [B, 1, c_s] and the per-head sigmoid gate [B, H, N, 32] (None without it)"""
         h, gate = self.norm_s(x, mod)
         q, k, v = self.linear_qkv(h).split(h.shape[-1], dim=-1)
-        return self.norm_q(_heads(q)), self.norm_k(_heads(k)), _heads(v), gate
+        g = _heads(torch.sigmoid(self.linear_g(h))) if hasattr(self, "linear_g") else None
+        return self.norm_q(_heads(q)), self.norm_k(_heads(k)), _heads(v), gate, g
 
-    def output(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def output(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor, g: torch.Tensor = None) -> torch.Tensor:
         """Attention output o [B, H, N, 32] -> x + gated update [B, N, c_s]"""
-        return self.out(x, o, gate)
+        return self.out(x, o if g is None else o * g.to(o.dtype), gate)
+
+
+def set_attention_gate(model: nn.Module, sigmoid: bool) -> None:
+    """Form of the output gate of every attention of `model`: sigmoid (per head, before the output projection) or legacy (the released
+    parameters: the raw gate after it). The DiT attentions get / lose their extra matrix `linear_g`; call it before the model is moved to a device."""
+    for module in model.modules():
+        if isinstance(module, _GatedOutput):
+            module.sigmoid_gate = sigmoid
+        elif isinstance(module, DiTAttention):
+            module.set_head_gate(sigmoid)

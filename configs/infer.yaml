@@ -5,7 +5,7 @@
 #       sampling.physics_correction=true features.use_pocket=true features.use_key_res=true features.crop_size=256
 # Output: ligand/receptor/system _gt and _pred_<k> files and summary.json in output_dir (plus .hydra/ with the config).
 defaults:
-  - model: medium                 # model/*.yaml (released: medium)
+  - model: released               # model/*.yaml; the structure of the released parameters (the current structure: medium)
   - model@features: features      # featurisation, see model/features.yaml
   - _self_
 

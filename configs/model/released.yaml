@@ -1,0 +1,19 @@
+# The structure of the released parameters (data/params/params.pt): `model=released` for inference with them and for fine-tuning them. The current
+# structure (medium.yaml and the sizes derived from it) differs in the places set back here; nothing else.
+defaults:
+  - medium
+  - _self_
+
+attention_gate: false           # the raw gate after the output projection
+encoder:
+  eps: 1.0e-8
+  local_atom_attention: false   # the encoder atoms attend to all atoms
+  same_conformer_bias: true     # linear_v
+  outer_product: false          # Pairformer without s -> z
+decoder:
+  eps: 1.0e-8
+  norm_s: false
+  norm_z: false
+  token_output: false
+diffusion:
+  noise_conditioning: legacy    # t_A * ln(t) / 4

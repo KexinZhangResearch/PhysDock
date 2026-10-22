@@ -314,11 +314,14 @@ class LinearGateResidual(KernelModule):
         super().__init__()
         self.linear = Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """x [..., N, dim], o [..., H, N, 32], gate broadcastable to x -> [..., N, dim]"""
+    def forward(self, x: torch.Tensor, o: torch.Tensor, gate: torch.Tensor = None) -> torch.Tensor:
+        """x [..., N, dim], o [..., H, N, 32], gate broadcastable to x (None: no gate, x + linear(o)) -> [..., N, dim]"""
         if self.backend == "triton" and kernels.linear_gate_residual.can_fuse(x, o):
+            if gate is None:                                  # the kernel always multiplies: by a broadcast 1 (stride 0, nothing is read per row)
+                gate = x.new_ones(x.shape[-1])
             return kernels.linear_gate_residual.linear_gate_residual(x, o, gate, self.linear.weight, self.linear.bias)
-        return x + self.linear(merge_heads(o)) * gate
+        y = self.linear(merge_heads(o))
+        return x + y if gate is None else x + y * gate
 
 
 class LayerNormPairBias(KernelModule):
@@ -463,7 +466,7 @@ class TriangleMultiplication(KernelModule):
 
 # the blocks use the layers above, so they are imported last
 from .attentions import (AttentionWithBias, MSARowAttentionWithBias, MSAColumnAttention,  # noqa: E402
-                         TriangleAttention, DiTAttention)
+                         TriangleAttention, DiTAttention, set_attention_gate)
 from .timestep_embeddings import TimestepEmbeddings  # noqa: E402
 from .transformers import (Stack, AtomTransformer, Triangleformer, Evoformer, Pairformer, DiT,  # noqa: E402
                            set_checkpointing)

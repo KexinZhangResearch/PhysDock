@@ -31,7 +31,7 @@ def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = Tru
 
     Args:
         ckpt_path: params.pt, a Lightning or a Uni-Core checkpoint
-        config: model config (configs/model/*.yaml; default: "medium"); every parameter of the model must be in the checkpoint, but its
+        config: model config (configs/model/*.yaml; default: "released", the structure of the released parameters); every parameter of the model must be in the checkpoint, but its
             non-persistent buffers (settings such as a fixed distance-decay strength) are rebuilt from the config
         device: target device
         eval_mode: return the model in eval mode
@@ -42,7 +42,7 @@ def load_pretrained(ckpt_path, config=None, device="cuda", eval_mode: bool = Tru
 
     device = torch.device(device)
     with skip_weight_init(), torch.device("meta"):
-        model = PhysDock.from_config(config if config is not None else model_config("medium"))
+        model = PhysDock.from_config(config if config is not None else model_config("released"))
     params = load_checkpoint_state_dict(ckpt_path, mmap=True)
     expected = model.state_dict()
     missing, unexpected = sorted(set(expected) - set(params)), sorted(set(params) - set(expected))

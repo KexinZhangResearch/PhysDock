@@ -31,6 +31,10 @@ MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 MAX_STEPS=${MAX_STEPS:-100000}
 BACKEND=${BACKEND:-triton}                    # triton | torch
+PRECISION=${PRECISION:-bf16-mixed}            # bf16-mixed | 32 (float32 with TF32 matmuls)
+CKPT=${CKPT:-none}                            # activation checkpointing of every stack: none | default (the setting of configs/train.yaml: same values, less memory)
+CKPT_ARGS="checkpointing.AtomTransformer=none checkpointing.Triangleformer=none checkpointing.Evoformer=none checkpointing.Pairformer=none checkpointing.DiT=none"
+[ "$CKPT" = default ] && CKPT_ARGS=""
 COMPILE=${COMPILE:-true}
 SEED=${SEED:-42}
 NUM_WORKERS=${NUM_WORKERS:-32}                # featurisation workers per GPU
@@ -58,8 +62,8 @@ exec "$PYTHON" -m torch.distributed.run $RDZV --nnodes="$NNODES" --nproc_per_nod
   "$ROOT/scripts/train/train.py" \
   hydra.run.dir="$RUN_DIR" \
   trainer.num_nodes="$NNODES" trainer.devices="$GPUS_PER_NODE" trainer.strategy=$STRATEGY \
-  trainer.max_steps="$MAX_STEPS" trainer.precision=bf16-mixed compile="$COMPILE" model.backend="$BACKEND" seed="$SEED" \
+  trainer.max_steps="$MAX_STEPS" trainer.precision=$PRECISION compile="$COMPILE" model.backend="$BACKEND" seed="$SEED" \
   model.diffusion.noise_conditioning=af3 \
-  checkpointing.AtomTransformer=none checkpointing.Triangleformer=none checkpointing.Evoformer=none checkpointing.Pairformer=none checkpointing.DiT=none \
+  $CKPT_ARGS \
   data.num_workers="$NUM_WORKERS" grad_stats=module logger.name="$RUN_NAME" \
   "$@" 2>&1 | tee -a "$RUN_DIR/train_node$NODE_RANK.log"

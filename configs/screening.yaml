@@ -3,7 +3,7 @@
 #       features_dir=data/demo/screening/features
 # Output: <output_dir>/<md5(smiles)>/tmp/... and <name>_smi_md5_meta_data.json (SMILES -> folder).
 defaults:
-  - model: medium                 # model/*.yaml (released: medium)
+  - model: released               # model/*.yaml; the structure of the released parameters (the current structure: medium)
   - model@features: features      # featurisation, see model/features.yaml
   - _self_
 

@@ -2,10 +2,10 @@
 sigma_data: ${global.sigma_data}         # model outputs are normalised; lDDT / distogram use Angstrom
 weights:
   x_mse: 4.0                    # aligned MSE of all atoms (EDM weighted)
-  ligand_mse: 0.5               # MSE of the ligand superposed on the ligand (EDM weighted)
+  ligand_mse: 0.0               # MSE of the ligand superposed on the ligand (EDM weighted); off by default (PhysDock2: 0.5)
   smooth_lddt: 4.0              # smooth lDDT of all atom pairs closer than max_clamp_distance
-  within_smooth_lddt: 0.5       # smooth lDDT of the pairs inside each residue / ligand
-  distogram: 0.03
+  within_smooth_lddt: 0.0       # smooth lDDT of the pairs inside each residue / ligand; off by default (PhysDock2: 0.5)
+  distogram: 0.0                # distogram cross-entropy; off by default (the released parameters used 0.03; its head stays in the model)
 alpha_ligand: 10.0              # ligand weight in the x_mse superposition (1 + alpha_ligand)
 ligand_align_weight: 1000.0     # ligand_mse superposition: ligand atoms x, other atoms 1 / x
 max_clamp_distance: 15.0

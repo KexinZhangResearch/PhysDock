@@ -7,3 +7,4 @@ num_val_systems: 32               # validation systems (fixed subset, seed ${see
 val_num_workers: 4
 ccd: ${ccd}
 seed: ${seed}
+systems: null                    # text file with system names: train on these only (uniformly) and validate on the first num_val_systems (overfitting tests)

@@ -13,7 +13,7 @@ from PhysDock.models.decoders import AllAtomDecoder
 from PhysDock.models.diffusion import build_diffuser, replace
 from PhysDock.models.encoders import MSATemplEncoder
 from PhysDock.models.guidance import LigandGuidance
-from PhysDock.models.primitives import Linear, SharedBiasAttention, set_backend
+from PhysDock.models.primitives import Linear, SharedBiasAttention, set_attention_gate, set_backend
 
 
 class PhysDock(nn.Module):
@@ -30,12 +30,14 @@ class PhysDock(nn.Module):
         distogram_bins: distogram head bins
         skip_padding: the Triton attentions skip the padding at the end of a padded crop (see SharedBiasAttention.valid_length; only pays
             on a single GPU or batched padded inference, not in data-parallel training where the fullest crop sets the speed)
+        attention_gate: output gate of every attention: True = sigmoid per head before the output projection (the DiT attentions get a head
+            gate matrix `linear_g`), False = the raw gate after it (the released parameters; see PhysDock.models.primitives.attentions)
         backend: "torch" or "triton" for every kernel-level module (attention, triangle update, SwiGLU feed-forwards, pair bias; see
             PhysDock.models.primitives and PhysDock.models.kernels)
     """
 
     def __init__(self, c_z: int, num_augmentation_sample: int, encoder, decoder, diffusion, sigma_data: float,
-                 distogram_bins: int, backend: str = "torch", skip_padding: bool = False) -> None:
+                 distogram_bins: int, backend: str = "torch", skip_padding: bool = False, attention_gate: bool = False) -> None:
         super().__init__()
         self.num_augmentation_sample = num_augmentation_sample
         self.sigma_data = sigma_data
@@ -43,6 +45,7 @@ class PhysDock(nn.Module):
         self.diffusion_conditioning = MSATemplEncoder(**encoder)
         self.dit = AllAtomDecoder(**decoder)
         self.linear_distogram = Linear(c_z, distogram_bins, init="final")
+        set_attention_gate(self, attention_gate)
         set_backend(self, backend)
         for module in self.modules():
             if isinstance(module, SharedBiasAttention):

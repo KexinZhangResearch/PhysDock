@@ -24,25 +24,34 @@ class PhysDockDataModule(L.LightningDataModule):
         val_num_workers: validation dataloader workers
         ccd: CCD library path
         seed: seed of the validation subset and the training sampler
+        systems: text file with system names (one per line, in root/train_val): train on these systems only, drawn uniformly, and validate on the first
+            num_val_systems of them (overfitting tests); null = all systems, weighted
     """
 
     def __init__(self, features: dict, val_features: dict, root: str, samples_per_epoch: int, num_workers: int,
-                 num_val_systems: int = 32, val_num_workers: int = 2, ccd: str = None, seed: int = 0) -> None:
+                 num_val_systems: int = 32, val_num_workers: int = 2, ccd: str = None, seed: int = 0, systems: str = None) -> None:
         super().__init__()
         self.features, self.val_features = FeatureConfig(**features), FeatureConfig(**val_features)
         self.root, self.samples_per_epoch, self.num_workers = Path(root), samples_per_epoch, num_workers
         self.num_val_systems, self.val_num_workers = num_val_systems, val_num_workers
-        self.ccd_path, self.seed = ccd, seed
+        self.ccd_path, self.seed, self.systems = ccd, seed, systems
         self.train_set = self.val_set = None
 
     def setup(self, stage: str = None) -> None:
         if self.train_set is not None:
             return
         ccd = CCDLibrary(self.ccd_path)           # loaded once, shared with the (forked) workers
-        self.train_set = PhysDockDataset.from_train_val(self.root, config=self.features, ccd=ccd)
-        entries = self.train_set.entries
-        if self.num_val_systems is not None and self.num_val_systems < len(entries):
-            entries = sorted(random.Random(self.seed).sample(entries, self.num_val_systems), key=lambda e: e.path)
+        if self.systems is None:
+            self.train_set = PhysDockDataset.from_train_val(self.root, config=self.features, ccd=ccd)
+            entries = self.train_set.entries
+            if self.num_val_systems is not None and self.num_val_systems < len(entries):
+                entries = sorted(random.Random(self.seed).sample(entries, self.num_val_systems), key=lambda e: e.path)
+        else:
+            paths = [str(self.root / "train_val" / f"{name}.pkl.gz") for name in Path(self.systems).read_text().split()]
+            self.train_set = PhysDockDataset(paths, self.root / "msa_features", self.root / "uniprot_msa_features", ccd=ccd,
+                                             config=self.features, training=True, sample_weights=torch.ones(len(paths)),
+                                             on_error="resample")
+            entries = self.train_set.entries[:self.num_val_systems]
         self.val_set = PhysDockDataset(entries, self.root / "msa_features", self.root / "uniprot_msa_features",
                                        ccd=ccd, config=self.val_features, on_error="skip")
 

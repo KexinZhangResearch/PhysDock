@@ -1,0 +1,17 @@
+# The size of PhysDock2's "mini" (62.5M parameters; Pairformer 8, atom DiTs 3 + 3, token DiT 6) and its inputs (no MSA, one-hot restype, 15-d pocket feature), in the current
+# structure (medium.yaml). scripts/p2align trains it behind PhysDock2's data, noising, losses and loop (bridge.py). Not the released parameters.
+defaults:
+  - medium
+  - _self_
+
+encoder:
+  inf: 1.0e8
+  no_blocks_atom: 3
+  no_blocks_pairformer: 8
+  target_dim: 21                # one-hot of restype
+  use_msa: false
+  pocket_dim: 15
+decoder:
+  inf: 1.0e8
+  no_blocks_atom: 3
+  no_blocks_dit: 6

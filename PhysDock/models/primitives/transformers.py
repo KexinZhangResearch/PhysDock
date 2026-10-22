@@ -182,13 +182,22 @@ class Evoformer(Stack):
 
 
 class PairFormerBlock(PairUpdate, nn.Module):
-    def __init__(self, c_s: int, c_z: int, inf: float, eps: float) -> None:
+    """outer_product: the single stream writes to the pair stream at the start of every block (z + the outer product of two projections of s,
+    OuterProductMean over a one-row "MSA"), so that what s learns from z in one block reaches z in the next; without it (the released
+    parameters) the information flows from z to s only (the attention bias)."""
+
+    def __init__(self, c_s: int, c_z: int, inf: float, eps: float, outer_product: bool = False) -> None:
         super().__init__()
+        if outer_product:
+            self.outer_product = OuterProductMean(c_s, c_z, eps)
         self.build_pair(c_z, inf, eps)
         self.attention = AttentionWithBias(c_s, c_z, inf, eps)
         self.transition = RMSNormSwiGLUFFN(c_s, eps)
 
     def forward(self, s, z, z_mask):
+        if hasattr(self, "outer_product"):
+            # the padding pairs keep z and get no gradient (as in TriangleBlock): the padded s rows must not reach the real pairs or the loss
+            z = torch.where(z_mask[..., None] != 0, self.outer_product(s[None], z), z)
         z = self.update_pair(z, z_mask)
         s = self.attention(s, z, z_mask)
         return self.transition(s), z
@@ -200,8 +209,8 @@ class Pairformer(Stack):
     s: [N_token, c_s], z: [N_token, N_token, c_z], z_mask: [N_token, N_token] -> (s, z)
     """
 
-    def __init__(self, c_s: int, c_z: int, inf: float, eps: float, no_blocks: int = 24) -> None:
-        super().__init__(PairFormerBlock, no_blocks, c_s, c_z, inf, eps, n_state=2)
+    def __init__(self, c_s: int, c_z: int, inf: float, eps: float, no_blocks: int = 24, outer_product: bool = False) -> None:
+        super().__init__(PairFormerBlock, no_blocks, c_s, c_z, inf, eps, n_state=2, outer_product=outer_product)
 
 
 class DiTBlock(nn.Module):
@@ -219,8 +228,8 @@ def _dit_attention_inputs(block: DiTBlock, x, mod):
     return block.attention.project(x, mod[:, :1])
 
 
-def _dit_block_output(block: DiTBlock, x, o, gate, mod):
-    x = block.attention.output(x, o, gate)
+def _dit_block_output(block: DiTBlock, x, o, gate, g, mod):
+    x = block.attention.output(x, o, gate, g)
     return block.transition(x, mod[:, 1:])
 
 
@@ -251,9 +260,9 @@ class DiT(Stack):
     def forward(self, x, bias, t, n_valid=None, pos=None, radius=None):
         for i, (block, b, mod) in enumerate(zip(self.blocks, bias, self.time_mod(t), strict=True)):
             if self.checkpoint == "attention" and torch.is_grad_enabled():
-                q, k, v, gate = self.checkpointed(_dit_attention_inputs, block, x, mod)
+                q, k, v, gate, g = self.checkpointed(_dit_attention_inputs, block, x, mod)
                 o = block.attention.attend(q, k, v, b, n_valid, pos, radius)
-                x = self.checkpointed(_dit_block_output, block, x, o, gate, mod)
+                x = self.checkpointed(_dit_block_output, block, x, o, gate, g, mod)
             else:
                 x = self.run_block(block, x, b, mod, n_valid, pos, radius, index=i)
         return x

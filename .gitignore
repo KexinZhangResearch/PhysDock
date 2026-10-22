@@ -219,3 +219,7 @@ logs/
 
 todo.txt
 tests/*
+scripts/diagnose/*
+scripts/overfit/*
+scripts/physdock2/*
+scripts/p2align/*

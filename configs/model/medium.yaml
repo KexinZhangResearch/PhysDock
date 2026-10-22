@@ -1,5 +1,6 @@
-# Released PhysDock model (data/params/params.pt). Other sizes (toy / tiny / small / full) override the block counts.
-# Channels, inf / eps and sigma_data come from model/global.yaml (config root `global`).
+# The PhysDock model, current structure (train from scratch). The released parameters (data/params/params.pt) have the older structure: use
+# `model=released` for them (configs/model/released.yaml sets every difference listed here back). Other sizes (toy / tiny / small / full) override
+# the block counts. Channels, inf / eps and sigma_data come from model/global.yaml (config root `global`).
 defaults:
   - global@_global_.global
   - _self_
@@ -10,6 +11,8 @@ num_augmentation_sample: 48     # noisy samples per structure in training
 distogram_bins: ${global.distogram_bins}
 backend: torch                  # attention, triangle update, SwiGLU feed-forwards, pair bias: torch | triton (PhysDock.models.kernels;
                                 # same matmul precision as torch: bfloat16 under autocast, TF32 for float32)
+attention_gate: true            # output gate of every attention: true = sigmoid per head before the output projection (the DiT attentions get a head gate
+                                # matrix); false = the raw gate after it (released parameters)
 skip_padding: false             # triton attentions skip the padding of padded crops: ~12% faster on one GPU (mean crop 80% full), nothing in
                                 # data-parallel training (the fullest crop of the ranks sets the speed)
 
@@ -20,6 +23,11 @@ encoder:                        # MSATemplEncoder (DiffusionConditioning)
   templ_dim: 40                 # template features [distogram 39, mask 1]
   key_res_dim: 7                # key-residue (PLIP) flags
   ligand_pair_dim: 42           # ligand pair features
+  local_atom_attention: true    # the atoms of the encoder attend only within their own conformer (residue / ligand); false (released): all atoms
+  same_conformer_bias: false    # a learned constant vector (linear_v) for the atom pairs of one conformer; true in the released parameters, redundant with the other pair features
+  outer_product: true           # every Pairformer block starts with the single representation writing to the pair representation (outer product); false (released): z -> s only
+  pocket_dim: 1                 # 1: is_pocket flag per token; 15 (PhysDock2): the feature `pocket_feat` [N_token, 15]
+  use_msa: true                 # true: the released structure (MSA features, Evoformer, template after it); false: PhysDock2's (no MSA, template before the Pairformer)
   c_a: ${global.c_a}
   c_ap: ${global.c_ap}
   c_s: ${global.c_s}
@@ -44,6 +52,9 @@ decoder:                        # AllAtomDecoder (DiffusionModule)
   no_blocks_atom: 3             # atom DiT encoder and decoder
   no_blocks_dit: 12             # token DiT
   sigma_data: ${global.sigma_data}
+  norm_s: true                  # RMSNorm + linear on the single representation before the token DiT (the raw s of the released parameters has rms ~3e3 and grows in training)
+  norm_z: true                  # the same interface for the pair representation of the token DiT
+  token_output: true            # the token stream also predicts a displacement (copied to its atoms) on top of the atom stream's
   atom_decay: null              # distance decay of the two atom DiTs (see PhysDock.models.decoders.AllAtomDecoder); changes the function, train
                                 # from scratch. {radius: 12.0, strength: 10.0, learnable: false}: the attention of a pair is multiplied by
                                 # 1.0 up to 12 A, 0.94 at 13 A, 0.75 at 14 A, 0.54 at 15 A; learnable: true makes the strength a parameter per head
@@ -52,7 +63,7 @@ diffusion:
   # EDM variance exploding: z = x + t * e on normalised coordinates; lengths and noise levels in units of sigma_data
   type: edm_ve
   trans_scale: ${div:1.0,${global.sigma_data}}  # random translation std of the training samples: 1 Angstrom
-  noise_conditioning: legacy      # released parameters: t_A * ln(t) / 4 (t_A = noise level in Angstrom); af3: ln(t) / 4
+  noise_conditioning: af3         # ln(t) / 4; legacy (released parameters): t_A * ln(t) / 4 (t_A = noise level in Angstrom)
   legacy_noise_scale: ${global.sigma_data}      # t_A = legacy_noise_scale * t (noise level in Angstrom)
   time_sampler:                   # training noise levels: ln(s) ~ N(mean, std^2)
     mean: -1.2

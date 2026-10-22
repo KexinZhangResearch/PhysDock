@@ -23,7 +23,7 @@ def compose(config_name: str, overrides=()) -> DictConfig:
 
 
 def model_config(name: str = "medium", overrides=()) -> DictConfig:
-    """configs/model/<name>.yaml ("medium" = released model); overrides e.g. ["model/diffusion=linear"]."""
+    """configs/model/<name>.yaml ("medium": the current structure, "released": the structure of the released parameters); overrides e.g. ["model/diffusion=linear"]."""
     return compose(f"model/{name}", overrides).model
 
 

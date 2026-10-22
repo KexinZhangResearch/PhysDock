@@ -2,7 +2,7 @@
 #   python scripts/infer/redocking.py input_dir=data/demo/redocking/Posebusters_subset features_dir=data/demo/redocking/features
 # Output: <output_dir>/<system>/tmp/{ligand,receptor,system}_{gt,pred_<k>}.* (ranked files with ranking=true).
 defaults:
-  - model: medium                 # model/*.yaml (released: medium)
+  - model: released               # model/*.yaml; the structure of the released parameters (the current structure: medium)
   - model@features: features      # featurisation, see model/features.yaml
   - _self_
 
