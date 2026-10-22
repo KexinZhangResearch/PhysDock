@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Train PhysDock with Lightning (config: configs/train.yaml; logs to wandb, run `wandb login` once).
 
-    python scripts/train/train.py                                   # released model size, 1 GPU
+    python scripts/train/train.py                                   # medium size (the current structure), 1 GPU
     python scripts/train/train.py trainer=ddp                       # all GPUs of the node
     python scripts/train/train.py model=toy data.samples_per_epoch=100 trainer.max_steps=200
-    python scripts/train/train.py init_from=data/params/params.pt   # fine-tune the released weights
+    python scripts/train/train.py model=released init_from=data/params/params.pt   # fine-tune the released weights (their structure)
     python scripts/train/train.py hydra.run.dir=logs/train/<run>   # a fixed run directory: started again, the run resumes from its newest checkpoint
     python scripts/train/train.py ckpt_path=<file>.ckpt             # resume this checkpoint
     python scripts/train/train.py compile=true logger.offline=true  # torch.compile, wandb offline (wandb sync later)

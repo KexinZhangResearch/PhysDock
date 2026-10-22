@@ -5,6 +5,7 @@ defaults:
   - _self_
 
 attention_gate: false           # the raw gate after the output projection
+dit_gate: false
 encoder:
   eps: 1.0e-8
   local_atom_attention: false   # the encoder atoms attend to all atoms

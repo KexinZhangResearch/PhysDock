@@ -271,7 +271,7 @@ python scripts/infer/redocking.py ... sampling.physics_correction=true sampling.
 sh scripts/train/train.sh                                       # quick test: toy model, 200 steps, wandb offline
 python scripts/train/train.py                                   # released model size, 1 GPU
 python scripts/train/train.py trainer=ddp                       # all GPUs of the node
-python scripts/train/train.py init_from=data/params/params.pt   # fine-tune the released weights
+python scripts/train/train.py model=released init_from=data/params/params.pt   # fine-tune the released weights (they need the structure of model/released.yaml)
 ```
 
 The released training set is fetched with `python scripts/download/download_dataset.py` (`data/v1`, about 145 GB).
@@ -357,7 +357,7 @@ tests/           32 tests: padding and mask invariance, gradients, distance deca
 assets/          the figures of this page (paper/: figures of the manuscript)
 ```
 
-Model sizes are `toy`, `tiny`, `small`, `medium` (released), `full` and `medium_linear` (the linear diffusion above) in `configs/model/`.
+Model sizes are `toy`, `tiny`, `small`, `medium`, `full` and `medium_linear` (the linear diffusion above) in `configs/model/`, all in the current structure (sigmoid attention gates, the single stream writing to the pair stream, RMS-normalised decoder inputs, atom attention within a conformer). `released` is the structure of the released parameters (`data/params/params.pt`), which is what inference loads.
 
 ```shell
 pytest tests -q          # needs a CUDA GPU, data/demo and data/params for the whole-model tests

@@ -11,8 +11,10 @@ num_augmentation_sample: 48     # noisy samples per structure in training
 distogram_bins: ${global.distogram_bins}
 backend: torch                  # attention, triangle update, SwiGLU feed-forwards, pair bias: torch | triton (PhysDock.models.kernels;
                                 # same matmul precision as torch: bfloat16 under autocast, TF32 for float32)
-attention_gate: true            # output gate of every attention: true = sigmoid per head before the output projection (the DiT attentions get a head gate
-                                # matrix); false = the raw gate after it (released parameters)
+attention_gate: true            # output gate of the attentions of the encoder: true = sigmoid per head before the output projection; false = the raw gate after it
+                                # (released parameters)
+zero_init: []                   # added paths that start as no-ops: outer_product, token_output
+dit_gate: true                  # the DiT attentions of the decoder: true = an extra sigmoid head gate (matrix linear_g) on top of the AdaLN gate
 skip_padding: false             # triton attentions skip the padding of padded crops: ~12% faster on one GPU (mean crop 80% full), nothing in
                                 # data-parallel training (the fullest crop of the ranks sets the speed)
 

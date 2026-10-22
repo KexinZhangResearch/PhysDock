@@ -1,11 +1,11 @@
 # python scripts/train/train.py [overrides], e.g.
 #   python scripts/train/train.py trainer=ddp                          # all GPUs of the node
 #   python scripts/train/train.py model=toy trainer.max_steps=200 data.samples_per_epoch=100     (quick test)
-#   python scripts/train/train.py init_from=data/params/params.pt      # fine-tune the released weights
+#   python scripts/train/train.py model=released init_from=data/params/params.pt   # fine-tune the released weights (their structure: model/released.yaml)
 #   python scripts/train/train.py hydra.run.dir=logs/train/<run>   (a fixed run directory resumes from its newest checkpoint)
 #   python scripts/train/train.py compile=true logger.offline=true
 defaults:
-  - model: medium                 # model/{toy,tiny,small,medium,full,medium_linear}.yaml
+  - model: medium                 # model/{toy,tiny,small,medium,full,medium_linear}.yaml (the current structure); released: the structure of the released parameters
   - model@features: features      # training featurisation
   - model@val_features: features  # validation featurisation (inference settings)
   - model@loss: loss
