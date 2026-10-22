@@ -1,8 +1,7 @@
-"""The decoder (DiT) of Pomelo, multi-scale as in AF3 / PhysDock (atoms -> units -> atoms), built from the typed layers; equivariant under rotations, reflections and translations, so
+"""The decoder of Pomelo (the DiT), multi-scale as in AF3 / PhysDock (atoms -> units -> atoms), built from the typed layers; equivariant under rotations, reflections and translations, so
 there is no augmentation of the coordinates, in training or in sampling. The stereo labels are pseudoscalars of the input: mirroring the structure and flipping the labels mirrors the output.
 
-One sample is processed by PomeloDiT.forward; Denoiser vmaps it over the noisy samples of a structure (the static features are shared) and applies the EDM preconditioning on the
-coordinates normalised by sigma_data and centred on their centroid (the noise is centred too: the translation is not part of the problem).
+One sample is processed by PomeloDiT.forward; the denoisers of models/model.py vmap it over the noisy samples of a structure (the static features are shared).
 """
 import math
 from dataclasses import dataclass
@@ -12,40 +11,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pomelo import geometry as G
-from pomelo.blocks import SingleBlock, add, mask_rows
-from pomelo.data import signed_volume
-from pomelo.embedder import Embedder
-from pomelo.irreps import Feats, GeometricProduct, Mult, TypedLinear
+from pomelo.configs import Config
+from pomelo.data.molecule import signed_volume
+from pomelo.models.primitives import geometry as G
+from pomelo.models.primitives.irreps import Feats, GeometricProduct, Mult, TypedLinear, TypedPool, add, mask_rows
+from pomelo.models.primitives.transformers import SingleBlock
+from pomelo.utils.tensor_utils import N_RBF, rbf
 
 GEOM = 4.0                      # the scaled coordinates are in units of 4 Angstrom (sigma_data = 16 Angstrom) so that vectors and distances are of order 1
-N_RBF = 8
-
-
-@dataclass
-class Config:
-    mult_a: Mult = None          # atom stream
-    mult_s: Mult = None          # unit stream (the stored features of the trunk)
-    mult_ap: Mult = None         # atom pair features read by the atom attention (0e, 0o)
-    mult_z: Mult = None          # unit pair features (0e, 0o)
-    heads: int = 4
-    n_atom_blocks: int = 1       # atom blocks before and after the unit blocks
-    n_unit_blocks: int = 2
-    t_dim: int = 64
-    atom_static: int = 32
-    pair_static: int = 16
-    product_channels: int = 8
-
-    def __post_init__(self):
-        self.mult_a = self.mult_a or {"0e": 64, "0o": 16, "1o": 16, "1e": 8}
-        self.mult_s = self.mult_s or {"0e": 128, "0o": 32, "1o": 32, "1e": 16}
-        self.mult_ap = self.mult_ap or {"0e": 16, "0o": 8}
-        self.mult_z = self.mult_z or {"0e": 32, "0o": 8}
-
-
-def rbf(d: torch.Tensor, n: int = N_RBF, hi: float = 8.0) -> torch.Tensor:
-    centers = torch.linspace(0, hi, n, device=d.device, dtype=d.dtype)
-    return torch.exp(-((d[..., None] - centers) / (hi / n)) ** 2)
 
 
 class TimeEmbedding(nn.Module):
@@ -57,19 +30,6 @@ class TimeEmbedding(nn.Module):
     def forward(self, c_noise: torch.Tensor) -> torch.Tensor:
         a = c_noise[..., None] * self.freqs.to(c_noise.dtype) * 100.0
         return self.mlp(torch.cat([torch.cos(a), torch.sin(a)], -1))
-
-
-class TypedPool(nn.Module):
-    """atoms -> units: a typed linear map (SiLU on the 0e part), then the mean over the atoms of a unit (the pool matrix [Nu, Na])"""
-
-    def __init__(self, mult_a: Mult, mult_s: Mult) -> None:
-        super().__init__()
-        self.lin = TypedLinear(mult_a, mult_s)
-
-    def forward(self, a: Feats, pool: torch.Tensor) -> Feats:
-        h = self.lin(a)
-        h["0e"] = F.silu(h["0e"])
-        return {k: torch.einsum("ua,a...->u...", pool, v) for k, v in h.items()}
 
 
 class DiTBlock(nn.Module):
@@ -148,22 +108,3 @@ class PomeloDiT(nn.Module):
             a = blk(a, ap, centres_a, mask_a, t)
         out = self.head_atom(self.head_product(a))["1o"][:, 0] + self.head_unit({"1o": s["1o"]})["1o"][:, 0][a2u]
         return out
-
-
-class Denoiser(nn.Module):
-    """EDM denoiser D(x_t, sigma) of a molecule: embedder + PomeloDiT, vmapped over the noisy samples; coordinates normalised by sigma_data, centred"""
-
-    def __init__(self, cfg: Config) -> None:
-        super().__init__()
-        self.embedder = Embedder(cfg.mult_s, cfg.mult_z, cfg.atom_static, cfg.pair_static)
-        self.dit = PomeloDiT(cfg)
-
-    def forward(self, mol: Dict[str, torch.Tensor], x_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        """x_t [B, Na, 3] (normalised, with noise of standard deviation sigma [B]) -> the denoised coordinates [B, Na, 3]"""
-        st = self.embedder(mol)
-        xbar = x_t.mean(1, keepdim=True)
-        xc = x_t - xbar
-        s = sigma[:, None, None]
-        c_in, c_skip, c_out = (s ** 2 + 1) ** -0.5, 1 / (1 + s ** 2), s * (s ** 2 + 1) ** -0.5
-        raw = torch.vmap(lambda x, c: self.dit(x, c, st))(c_in * xc, torch.log(sigma) / 4)
-        return xbar + c_skip * xc + c_out * raw

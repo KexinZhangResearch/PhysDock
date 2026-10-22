@@ -17,10 +17,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pomelo import geometry as G
+from pomelo.models.primitives import geometry as G
 
 Feats = Dict[str, torch.Tensor]
 Mult = Mapping[str, int]
+
+
+# ---------------------------------------------------------------------------------------------------------- helpers of feature sets
+def add(a: Feats, b: Feats) -> Feats:
+    """residual connection of two feature sets of the same kinds"""
+    return {k: v + b[k] for k, v in a.items()}
+
+
+def mask_rows(x: Feats, valid: torch.Tensor) -> Feats:
+    """the rows of padded units replaced by zeros (replaced, not multiplied: whatever they hold, nan included, is gone)"""
+    return {k: torch.where(valid.reshape(-1, *([1] * (v.dim() - 1))), v, torch.zeros_like(v)) for k, v in x.items()}
+
+
+def pair_valid(valid: torch.Tensor) -> torch.Tensor:
+    return valid[:, None] & valid[None, :]
+
+
+def mask_pairs(z: Feats, valid: torch.Tensor) -> Feats:
+    """the entries of padded units replaced by zeros (replaced, not multiplied)"""
+    p = pair_valid(valid)[..., None]
+    return {k: torch.where(p, v, torch.zeros_like(v)) for k, v in z.items()}
 
 
 def zeros(mult: Mult, shape, dtype=torch.float32, device=None) -> Feats:
@@ -130,7 +151,6 @@ TERMS = [
     ("1e", ("1o",), ("1o",), False, lambda a, b, c: G.cross(a["1o"], "1o", b["1o"], "1o")),                          # 1o x 1o = 1e
     ("1e", ("1e",), ("1e",), False, lambda a, b, c: G.cross(a["1e"], "1e", b["1e"], "1e")),                          # 1e x 1e = 1e
 ]
-# the order of the 0e-by-vector terms of the first version: the sum over TERMS is what GeometricProduct computes
 
 
 def select_terms(present, want):
@@ -154,12 +174,12 @@ class GeometricProduct(nn.Module):
     def __init__(self, mult_in: Mult, mult_out: Mult, channels: int = 32, zero_init: bool = False) -> None:
         super().__init__()
         self.mult_in = {k: c for k, c in mult_in.items() if c}
-        want = {k for k, c in mult_out.items() if c}
-        if not want <= producible(self.mult_in):
+        want = {k for k, c in mult_out.items() if c}                      # only used for membership: no iteration over a set below (its order changes with the hash seed of
+        if not want <= producible(self.mult_in):                          # the process, and with it the order in which the weights are created and so their random init)
             raise ValueError(f"the kinds {sorted(want - producible(self.mult_in))} cannot be made by products of the kinds {sorted(self.mult_in)}")
         self.terms = select_terms(self.mult_in, want)
-        used_a = {k for t in self.terms for k in t[1]}
-        used_b = {k for t in self.terms for k in t[2]}
+        used_a = [k for k in G.KINDS if any(k in t[1] for t in self.terms)]
+        used_b = [k for k in G.KINDS if any(k in t[2] for t in self.terms)]
         self.norm = TypedRMSNorm(self.mult_in)
         self.proj_a = TypedLinear(self.mult_in, {k: channels for k in used_a})
         self.proj_b = TypedLinear(self.mult_in, {k: channels for k in used_b})
@@ -180,3 +200,16 @@ class GeometricProduct(nn.Module):
             assert kind == t[0], (kind, t[0])
             cat.setdefault(kind, []).append(value)
         return self.out({k: torch.cat(v, dim=-1 if k in G.SCALAR_KINDS else -2) for k, v in cat.items()})
+
+
+class TypedPool(nn.Module):
+    """atoms -> units: a typed linear map (SiLU on the 0e part), then the mean over the atoms of a unit (the pool matrix [Nu, Na])"""
+
+    def __init__(self, mult_a: Mult, mult_s: Mult) -> None:
+        super().__init__()
+        self.lin = TypedLinear(mult_a, mult_s)
+
+    def forward(self, a: Feats, pool: torch.Tensor) -> Feats:
+        h = self.lin(a)
+        h["0e"] = F.silu(h["0e"])
+        return {k: torch.einsum("ua,a...->u...", pool, v) for k, v in h.items()}

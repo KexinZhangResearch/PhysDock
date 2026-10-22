@@ -1,8 +1,8 @@
 """The O(3) checks every layer of Pomelo has to pass (used by the tests, and usable on any new layer)."""
 import torch
 
-from pomelo import geometry as G
-from pomelo import irreps as I
+from pomelo.models.primitives import geometry as G
+from pomelo.models.primitives import irreps as I
 
 
 def check_layer(layer, mult_in, shape=(4, 5), trials=8, dtype=torch.float64, atol=1e-9, seed=0):

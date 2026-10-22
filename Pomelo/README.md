@@ -12,6 +12,16 @@ Layout follows PhysDock: `pomelo/` (package), `configs/`, `scripts/`, `tests/`.
 3. `pomelo/attention.py`: the typed attention of the single representation with pair messages (one softmax, three weight groups, direction messages). **done**
 4. `pomelo/blocks.py`: `TypedTransition` and `SingleBlock` (products, attention, transition); `pomelo/checks.py`: the O(3) checks. **done**
 5. `pomelo/pair.py`: the pair representation (`z_0e`, `z_0o`): `PairFromSingle`, `TypedTriangleMultiplication` (out / in), `TypedTriangleAttention` (start / end), `PairBlock`; `pomelo/trunk.py`: `TrunkBlock` (pair block, then single block). **done**
-6. data: units (residues, ligand fragments) and the stereo table
-7. typed geometric features (local frames, signed volumes), the input embedding of s and z, recycling
-8. the trunk (stack of blocks), the decoder
+6. `pomelo/data.py` (synthetic molecules with stereo labels and units), `pomelo/embedder.py` (the six stored features), `pomelo/dit.py` (the multi-scale DiT, atoms -> units -> atoms, no augmentation),
+   `pomelo/diffusion.py` (EDM noise, x_mse + smooth lDDT, sampler, metrics), `pomelo/baseline.py` (PhysDock-like models without symmetry, the same inputs and loss, random rotations as augmentation). **done**
+7. `pomelo/protein.py`: 10 real proteins (128-residue windows, `pomelo/proteins_10.json`), residue relative positions in the embedder. **running** (see below)
+8. `pomelo/encoder_trunk.py`: the **encoder trunk** with the reference positions as input: an atom stage per conformer (typed atom attention inside a conformer, the chirality from the
+   signed volumes of the reference conformers, no stereo label read), typed pooling, then `TrunkBlock`s (single -> pair, triangle multiplication out / in, triangle attention
+   start / end, transition; single block). Every conformer is in a frame of its own, so the vector terms of the attention, the single -> pair products and the triangles act between units of the
+   same conformer only (`same`); a residue is a conformer, a ligand is one conformer. `TrunkDenoiser` = encoder trunk + the multi-scale DiT. **done, tested; not yet compared in a run**
+   (smoke: it trains, 0.26 s/step against 0.15 for the DiT without the trunk on the small molecules)
+9. the full-size model, fragments as the conformers, the decoder side of the trunk (a structure in one frame)
+
+## Overfitting experiments
+`scripts/overfit_synth.py --model {equivariant,baseline,baseline_geom,basebaseline} --dataset {synthetic,protein}`; queues of runs on both GPUs: `scripts/run_queue.sh scripts/queue_*.txt 2`;
+the table of all runs: `python scripts/summarize.py logs/overfit_synth_*.log`. `pytest tests -q`: 150 tests (equivariance under rotations, reflections and translations, an independent frame per conformer, parity rules, padding, data).

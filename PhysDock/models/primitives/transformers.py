@@ -190,6 +190,7 @@ class PairFormerBlock(PairUpdate, nn.Module):
         super().__init__()
         if outer_product:
             self.outer_product = OuterProductMean(c_s, c_z, eps)
+            self.outer_product.linear_o.weight.data.zero_()      # starts as a no-op (the output is RMS-normalised: with eps 1e-5 the backward gain is 300)
         self.build_pair(c_z, inf, eps)
         self.attention = AttentionWithBias(c_s, c_z, inf, eps)
         self.transition = RMSNormSwiGLUFFN(c_s, eps)

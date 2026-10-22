@@ -55,6 +55,43 @@ def signed_volume(x: torch.Tensor, center: torch.Tensor, nbrs: torch.Tensor) -> 
     return (vecs[0] * torch.linalg.cross(vecs[1], vecs[2], dim=-1)).sum(-1)
 
 
+FAR = 9                      # graph distances 0 .. 8 and "far"
+
+
+def graph_distance(n: int, bonds: torch.Tensor) -> torch.Tensor:
+    """[n, n] shortest path length in bonds, FAR (9) beyond 8 and between disconnected atoms"""
+    adj = torch.zeros(n, n)
+    if len(bonds):
+        adj[bonds[:, 0], bonds[:, 1]] = 1
+        adj[bonds[:, 1], bonds[:, 0]] = 1
+    spd = torch.full((n, n), FAR, dtype=torch.long)
+    reach = torch.eye(n)
+    spd[reach > 0] = 0
+    for k in range(1, 9):
+        reach = (reach @ adj).clamp(max=1)
+        spd[(reach > 0) & (spd == FAR)] = k
+    return spd
+
+
+def unit_distance(spd: torch.Tensor, unit: torch.Tensor) -> torch.Tensor:
+    """[Nu, Nu] the smallest graph distance between an atom of one unit and an atom of the other (FAR beyond 8), by two scatter-min reductions (no [Nu, Nu, Na, Na] tensor)"""
+    nu = int(unit.max()) + 1
+    rows = torch.full((nu, spd.shape[1]), FAR, dtype=spd.dtype).scatter_reduce(0, unit[:, None].expand_as(spd), spd, "amin", include_self=True)
+    return torch.full((nu, nu), FAR, dtype=spd.dtype).scatter_reduce(1, unit[None, :].expand(nu, -1), rows, "amin", include_self=True)
+
+
+def add_graph_features(mol: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """the static graph features of a molecule, computed once: spd [Na, Na] (graph distance), bond [Na, Na] (bond type, 0 none), unit_spd [Nu, Nu]"""
+    n = mol["z"].shape[0]
+    spd = graph_distance(n, mol["bonds"])
+    bond = torch.zeros(n, n, dtype=torch.long)
+    if len(mol["bonds"]):
+        bond[mol["bonds"][:, 0], mol["bonds"][:, 1]] = mol["bonds"][:, 2]
+        bond[mol["bonds"][:, 1], mol["bonds"][:, 0]] = mol["bonds"][:, 2]
+    mol.update({"spd": spd, "bond": bond, "unit_spd": unit_distance(spd, mol["unit"])})
+    return mol
+
+
 def fragment(mol: Chem.Mol, stereo_atoms: set) -> np.ndarray:
     """unit index of every atom: union-find over the bonds that are not cut"""
     n = mol.GetNumAtoms()
@@ -87,6 +124,66 @@ def fragment(mol: Chem.Mol, stereo_atoms: set) -> np.ndarray:
     return np.array([roots.index(find(a)) for a in range(n)], dtype=np.int64)
 
 
+def random_frame(generator: torch.Generator, scale: float = 20.0):
+    """a random proper rotation [3, 3] and a translation [3]: the frame of one conformer"""
+    q, r = torch.linalg.qr(torch.randn(3, 3, generator=generator))
+    q = q * torch.sign(torch.diagonal(r))
+    q = q * torch.sign(torch.det(q))
+    return q, torch.randn(3, generator=generator) * scale
+
+
+def add_reference(mol: Dict[str, torch.Tensor], ref_pos: torch.Tensor, conformer: torch.Tensor, seed: int = 0) -> Dict[str, torch.Tensor]:
+    """the reference conformers of a molecule, as AF3 / PhysDock give them: ref_pos [Na, 3] (Angstrom, in any frame) and conformer [Na] (the conformer of every atom: the atoms of
+    a conformer share one frame). Every conformer is put into a frame of its own (a random rotation and translation), because nothing relates the frames of two conformers.
+    Adds ref_pos, conformer, and unit_conformer [Nu]."""
+    g = torch.Generator().manual_seed(1000 + seed)
+    ref = ref_pos.clone()
+    for c in conformer.unique():
+        sel = conformer == c
+        q, t = random_frame(g)
+        ref[sel] = (ref_pos[sel] - ref_pos[sel].mean(0)) @ q.T + t
+    nu = int(mol["unit"].max()) + 1
+    unit_conformer = torch.zeros(nu, dtype=torch.long).scatter_(0, mol["unit"], conformer)
+    assert torch.equal(unit_conformer[mol["unit"]], conformer), "the atoms of a unit must be in one conformer"
+    mol.update({"ref_pos": ref, "conformer": conformer, "unit_conformer": unit_conformer})
+    return mol
+
+
+def reference_conformer(smiles: str, seed: int) -> torch.Tensor:
+    """the heavy-atom positions of another RDKit conformer of the molecule (other seed, MMFF), the reference conformer: the stereochemistry is that of the SMILES, the coordinates are not
+    those of the structure"""
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    if AllChem.EmbedMolecule(mol, randomSeed=seed + 101) != 0:
+        raise RuntimeError(f"no reference conformer for {smiles}")
+    AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+    return torch.from_numpy(Chem.RemoveHs(mol).GetConformer().GetPositions().astype(np.float32))
+
+
+def combine(mols: List[Dict[str, torch.Tensor]], spacing: float = 12.0) -> Dict[str, torch.Tensor]:
+    """several molecules as one system: the atoms, bonds, units and stereo tables concatenated, every molecule one conformer (its own reference frame), the structures side by side
+    along x (the structure itself is one frame: the coordinates of the denoiser)"""
+    off_a = off_u = 0
+    out = {k: [] for k in ("z", "charge", "aromatic", "hyb", "degree", "n_h", "in_ring", "unit", "coords", "stereo_center", "stereo_nbrs", "stereo_sign", "ref_pos", "conformer")}
+    bonds = []
+    for i, m in enumerate(mols):
+        for k in ("z", "charge", "aromatic", "hyb", "degree", "n_h", "in_ring", "stereo_sign"):
+            out[k].append(m[k])
+        out["unit"].append(m["unit"] + off_u)
+        out["coords"].append(m["coords"] + torch.tensor([i * spacing, 0.0, 0.0]))
+        out["stereo_center"].append(m["stereo_center"] + off_a)
+        out["stereo_nbrs"].append(torch.where(m["stereo_nbrs"] >= 0, m["stereo_nbrs"] + off_a, m["stereo_nbrs"]))
+        out["ref_pos"].append(m["ref_pos"])
+        out["conformer"].append(m["conformer"] + (out["conformer"][-1].max() + 1 if out["conformer"] else 0))
+        bonds.append(m["bonds"] + torch.tensor([off_a, off_a, 0]))
+        off_a += m["z"].shape[0]
+        off_u += int(m["unit"].max()) + 1
+    mol = {k: torch.cat(v) for k, v in out.items()}
+    mol["bonds"] = torch.cat(bonds)
+    nu = int(mol["unit"].max()) + 1
+    mol["unit_conformer"] = torch.zeros(nu, dtype=torch.long).scatter_(0, mol["unit"], mol["conformer"])
+    return add_graph_features(mol)
+
+
 def build(smiles: str, seed: int = 0) -> Dict[str, torch.Tensor]:
     mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
     if AllChem.EmbedMolecule(mol, randomSeed=seed) != 0:
@@ -108,13 +205,17 @@ def build(smiles: str, seed: int = 0) -> Dict[str, torch.Tensor]:
     x = torch.from_numpy(coords)
     sign = torch.sign(signed_volume(x, center, nbrs_t)).to(torch.float32) if stereo else torch.zeros(0)
     unit = fragment(heavy, set(stereo))
-    return {
+    return _with_reference(add_graph_features({
         "z": torch.tensor([ELEMENTS.get(a.GetAtomicNum(), 9) for a in atoms]), "charge": torch.tensor([a.GetFormalCharge() for a in atoms]),
         "aromatic": torch.tensor([int(a.GetIsAromatic()) for a in atoms]), "hyb": torch.tensor([HYBRIDISATION.get(a.GetHybridization(), 3) for a in atoms]),
         "degree": torch.tensor([a.GetDegree() for a in atoms]), "n_h": torch.tensor([a.GetTotalNumHs() for a in atoms]), "in_ring": torch.from_numpy(ring).long(),
         "bonds": torch.tensor([[b.GetBeginAtomIdx(), b.GetEndAtomIdx(), BOND_TYPES.get(b.GetBondType(), 1)] for b in heavy.GetBonds()]),
         "unit": torch.from_numpy(unit), "coords": x, "stereo_center": center, "stereo_nbrs": nbrs_t, "stereo_sign": sign,
-    }
+    }), reference_conformer(smiles, seed))
+
+
+def _with_reference(mol, ref_pos):
+    return add_reference(mol, ref_pos, torch.zeros(mol["z"].shape[0], dtype=torch.long))
 
 
 def make_dataset(names=None, seed: int = 0) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -126,4 +227,6 @@ def mirror(mol: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     out = dict(mol)
     out["coords"] = mol["coords"] * torch.tensor([-1.0, 1.0, 1.0])
     out["stereo_sign"] = -mol["stereo_sign"]
+    if "ref_pos" in mol:                                                                  # the reference conformer of the enantiomer is the mirror image of it
+        out["ref_pos"] = mol["ref_pos"] * torch.tensor([-1.0, 1.0, 1.0])
     return out

@@ -43,7 +43,7 @@ class AllAtomDecoder(nn.Module):
 
     def __init__(self, c_a: int, c_ap: int, c_s: int, c_z: int, inf: float, eps: float, no_blocks_atom: int,
                  no_blocks_dit: int, sigma_data: float = 16.0, atom_decay: Optional[dict] = None,
-                 norm_s: bool = False, norm_z: bool = False, token_output: bool = False) -> None:
+                 legacy: bool = False) -> None:
         super().__init__()
         self.sigma_data, self.atom_decay = sigma_data, atom_decay
         self.linear_x = Linear(3, c_a)
@@ -55,15 +55,15 @@ class AllAtomDecoder(nn.Module):
         self.atom_dit_decoder = DiT(c_a, c_ap, inf, eps, no_blocks_atom)
         self.norm_r = nn.LayerNorm(c_a, eps)
         self.linear_r = Linear(c_a, 3, bias=False)
-        # PhysDock2's final_layer_s: RMSNorm + linear on the single representation before it enters the token DiT. The released parameters add the raw s
-        # (rms ~3e3); trained from scratch the raw s grows without bound (rms 16 -> 110 in 4500 steps) and its scale decides the token stream
-        self.cond_s = nn.Sequential(RMSNorm(c_s, eps), Linear(c_s, c_s, bias=False)) if norm_s else None
-        # the same interface for the pair representation of the token DiT (PhysDock2's final_layer_p); the atom streams get theirs in the encoder
-        # (broadcast: norm + linear of s and z)
-        self.cond_z = nn.Sequential(RMSNorm(c_z, eps), Linear(c_z, c_z, bias=False)) if norm_z else None
-        # token_output: the token stream also predicts a displacement (norm + linear, copied to the atoms of the token) on top of the atom stream's:
-        # a coarse (per token) and a fine (per atom) part, and a short path from the token DiT to the output
-        self.token_out = nn.Sequential(RMSNorm(c_s, eps), Linear(c_s, 3, bias=False)) if token_output else None
+        self.legacy = legacy
+        if not legacy:      # (the released parameters have none of the three)
+            # the token DiT reads s and z through a norm + linear, as the atom streams do in the encoder: the raw s of the released parameters has
+            # rms ~3e3 and grows in training (16 -> 110 in 4500 steps), and its scale decides the token stream
+            self.cond_s = nn.Sequential(RMSNorm(c_s, eps), Linear(c_s, c_s, bias=False))
+            self.cond_z = nn.Sequential(RMSNorm(c_z, eps), Linear(c_z, c_z, bias=False))
+            # the token stream also predicts a displacement (copied to the atoms of its token) on top of the atom stream's: a coarse and a fine part,
+            # and a short path from the token DiT to the output; it starts as a no-op
+            self.token_out = nn.Sequential(RMSNorm(c_s, eps), Linear(c_s, 3, bias=False, init="final"))
         if atom_decay is not None:
             unknown = set(atom_decay) - {"radius", "strength", "learnable"}
             if unknown:
@@ -83,10 +83,8 @@ class AllAtomDecoder(nn.Module):
             a, ap, s, z = (c.float() for c in conds)
             ap_mask, z_mask = pair_mask(batch["atom_mask"].float()), pair_mask(batch["token_mask"].float())
             attend = self.token_dit.blocks[0].attention.attend
-            if self.cond_s is not None:
-                s = self.cond_s(s)
-            if self.cond_z is not None:
-                z = self.cond_z(z)
+            if not self.legacy:
+                s, z = self.cond_s(s), self.cond_z(z)
             return DecoderConditions(a, s, self.atom_dit_encoder.pair_bias(ap, ap_mask),
                                      self.token_dit.pair_bias(z, z_mask), self.atom_dit_decoder.pair_bias(ap, ap_mask),
                                      attend.valid_length(ap_mask), attend.valid_length(z_mask))
@@ -115,6 +113,6 @@ class AllAtomDecoder(nn.Module):
             x = x + self.linear_upscale(xs)[:, batch["atom_to_token"]]                                     # to atoms
             x = self.atom_dit_decoder(x, cond.atom_bias_decoder, t, cond.atom_valid, pos, radius)
             out = self.linear_r(self.norm_r(x))
-            if self.token_out is not None:
+            if not self.legacy:
                 out = out + self.token_out(xs)[:, batch["atom_to_token"]]
             return out

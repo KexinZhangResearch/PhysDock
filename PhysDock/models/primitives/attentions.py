@@ -179,14 +179,12 @@ class DiTAttention(nn.Module):
         return self.out(x, o if g is None else o * g.to(o.dtype), gate)
 
 
-def set_attention_gate(model: nn.Module, sigmoid: bool, dit_sigmoid: bool = None) -> None:
-    """Form of the output gate of the attentions of `model`: sigmoid (per head, before the output projection) or legacy (the released
-    parameters: the raw gate after it). `sigmoid`: the attentions of the encoder (atom transformer, Pairformer, triangle attentions, MSA);
-    `dit_sigmoid` (default: the same): the DiT attentions of the decoder, which get / lose their extra head gate matrix `linear_g` (they always
-    have the AdaLN gate). Call it before the model is moved to a device."""
-    dit_sigmoid = sigmoid if dit_sigmoid is None else dit_sigmoid
+def set_attention_gate(model: nn.Module, sigmoid: bool) -> None:
+    """Form of the output gate of every attention of `model`: sigmoid (per head, before the output projection) or legacy (the released parameters:
+    the raw gate after it). The DiT attentions get / lose their extra head gate matrix `linear_g` (they always have the AdaLN gate). Call it before
+    the model is moved to a device."""
     for module in model.modules():
         if isinstance(module, _GatedOutput):
             module.sigmoid_gate = sigmoid
         elif isinstance(module, DiTAttention):
-            module.set_head_gate(dit_sigmoid)
+            module.set_head_gate(sigmoid)

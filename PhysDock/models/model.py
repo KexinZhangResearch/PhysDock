@@ -30,34 +30,23 @@ class PhysDock(nn.Module):
         distogram_bins: distogram head bins
         skip_padding: the Triton attentions skip the padding at the end of a padded crop (see SharedBiasAttention.valid_length; only pays
             on a single GPU or batched padded inference, not in data-parallel training where the fullest crop sets the speed)
-        attention_gate: output gate of the attentions of the encoder: True = sigmoid per head before the output projection, False = the raw gate
-            after it (the released parameters; see PhysDock.models.primitives.attentions)
-        zero_init: names of added paths to start as no-ops: outer_product, token_output
-        dit_gate: the DiT attentions of the decoder: True = an extra sigmoid head gate matrix on top of the AdaLN gate; None: as attention_gate
+        legacy: the structure of the released parameters (configs/model/released.yaml): the raw attention gate after the output projection, no
+            head gate in the DiT, atom attention of the encoder to all atoms, linear_v, no s -> z write in the Pairformer, no norm + linear of s and z
+            before the token DiT, no token output. The current structure (False) has the sigmoid head gates, the others as listed.
         backend: "torch" or "triton" for every kernel-level module (attention, triangle update, SwiGLU feed-forwards, pair bias; see
             PhysDock.models.primitives and PhysDock.models.kernels)
     """
 
     def __init__(self, c_z: int, num_augmentation_sample: int, encoder, decoder, diffusion, sigma_data: float,
-                 distogram_bins: int, backend: str = "torch", skip_padding: bool = False, attention_gate: bool = False,
-                 dit_gate: bool = None, zero_init: tuple = ()) -> None:
+                 distogram_bins: int, backend: str = "torch", skip_padding: bool = False, legacy: bool = False) -> None:
         super().__init__()
         self.num_augmentation_sample = num_augmentation_sample
         self.sigma_data = sigma_data
         self.diffuser = build_diffuser(diffusion)
-        self.diffusion_conditioning = MSATemplEncoder(**encoder)
-        self.dit = AllAtomDecoder(**decoder)
+        self.diffusion_conditioning = MSATemplEncoder(**encoder, legacy=legacy)
+        self.dit = AllAtomDecoder(**decoder, legacy=legacy)
         self.linear_distogram = Linear(c_z, distogram_bins, init="final")
-        set_attention_gate(self, attention_gate, dit_gate)
-        # the paths of the current structure that add to a stream, started as no-ops ("outer_product": the output layer of the s -> z write of
-        # every Pairformer block; "token_output": the token displacement head)
-        with torch.no_grad():
-            if "outer_product" in zero_init:
-                for n, p in self.named_parameters():
-                    if ".outer_product." in n and "linear_o" in n:
-                        p.zero_()
-            if "token_output" in zero_init and self.dit.token_out is not None:
-                self.dit.token_out[1].weight.zero_()
+        set_attention_gate(self, sigmoid=not legacy)
         set_backend(self, backend)
         for module in self.modules():
             if isinstance(module, SharedBiasAttention):
