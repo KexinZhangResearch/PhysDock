@@ -31,8 +31,8 @@ class PhysDock(nn.Module):
         skip_padding: the Triton attentions skip the padding at the end of a padded crop (see SharedBiasAttention.valid_length; only pays
             on a single GPU or batched padded inference, not in data-parallel training where the fullest crop sets the speed)
         legacy: the structure of the released parameters (configs/model/released.yaml): the raw attention gate after the output projection, no
-            head gate in the DiT, atom attention of the encoder to all atoms, linear_v, no s -> z write in the Pairformer, no norm + linear of s and z
-            before the token DiT, no token output. The current structure (False) has the sigmoid head gates, the others as listed.
+            head gate in the DiT, atom attention of the encoder to all atoms, linear_v, no norm + linear of s and z before the token DiT. The current
+            structure (False) has the sigmoid head gates, the others as listed.
         backend: "torch" or "triton" for every kernel-level module (attention, triangle update, SwiGLU feed-forwards, pair bias; see
             PhysDock.models.primitives and PhysDock.models.kernels)
     """

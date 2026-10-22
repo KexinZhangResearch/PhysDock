@@ -142,7 +142,7 @@ class TokenEmbedder(nn.Module):
 
     def __init__(self, target_dim: int, msa_dim: int, c_a: int, c_s: int, c_m: int, c_z: int, inf: float, eps: float,
                  no_blocks_evoformer: int, no_blocks_pairformer: int, no_blocks_template: int, templ_dim: int,
-                 key_res_dim: int, r_max: int, s_max: int, ligand_pair_dim: int, legacy: bool = False) -> None:
+                 key_res_dim: int, r_max: int, s_max: int, ligand_pair_dim: int, legacy: bool = False, outer_product: bool = False) -> None:
         super().__init__()
         self.linear_a = Linear(c_a, c_s)
         self.linear_target_feat = Linear(target_dim, c_s, bias=False)
@@ -154,7 +154,7 @@ class TokenEmbedder(nn.Module):
         self.linear_bonds = Linear(1, c_z, bias=False)
         self.template_pair_embedder = TemplatePairEmbedder(
             templ_dim, c_z, inf, eps, no_blocks_template)
-        self.pairformer = Pairformer(c_s, c_z, inf, eps, no_blocks_pairformer, outer_product=not legacy)
+        self.pairformer = Pairformer(c_s, c_z, inf, eps, no_blocks_pairformer, outer_product)
         self.linear_msa_feat = Linear(msa_dim, c_m, bias=False)
         self.linear_s_input = Linear(c_s, c_m)
         self.evoformer = Evoformer(c_m, c_z, inf, eps, no_blocks_evoformer)
@@ -192,18 +192,18 @@ class MSATemplEncoder(nn.Module):
     """Encoder of one structure; its output conditions every sample and denoising step of the decoder. (Nature Communications DiffusionConditioning)
 
     legacy=True is the structure of the released parameters; the current one differs in the atom attention of the encoder (within a conformer, no
-    linear_v) and in the Pairformer (the single stream writes to the pair stream, an outer product)."""
+    linear_v). outer_product (optional, default off): the single stream writes to the pair stream in every Pairformer block."""
 
     def __init__(self, ref_dim: int, target_dim: int, msa_dim: int, c_a: int, c_ap: int, c_s: int, c_m: int, c_z: int,
                  inf: float, eps: float, no_blocks_atom: int, no_blocks_evoformer: int, no_blocks_pairformer: int,
                  no_blocks_template: int, templ_dim: int, key_res_dim: int, r_max: int, s_max: int,
-                 ligand_pair_dim: int, legacy: bool = False) -> None:
+                 ligand_pair_dim: int, legacy: bool = False, outer_product: bool = False) -> None:
         super().__init__()
         self.atom_embedder = AtomEmbedder(
             ref_dim, c_a, c_ap, inf, eps, no_blocks_atom, legacy)
         self.token_embedder = TokenEmbedder(target_dim, msa_dim, c_a, c_s, c_m, c_z, inf, eps, no_blocks_evoformer,
                                             no_blocks_pairformer, no_blocks_template, templ_dim, key_res_dim,
-                                            r_max, s_max, ligand_pair_dim, legacy)
+                                            r_max, s_max, ligand_pair_dim, legacy, outer_product)
         self.norm_s = RMSNorm(c_s, eps=eps)
         self.linear_s = Linear(c_s, c_a, bias=False)
         self.norm_z = RMSNorm(c_z, eps=eps)

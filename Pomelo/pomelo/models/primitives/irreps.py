@@ -8,7 +8,7 @@ A feature set is a dict {kind: tensor} with the kinds of geometry.py ("0e", "0o"
 * only the "0e" channels have a bias, and only they, together with the function of the length of a vector, go through a non-linearity or a softmax;
 * the other kinds are scaled by a "0e" gate (the kind is kept), or multiplied with each other by the products of geometry.py (the kinds combine by
   the parity rule), so that information moves between kinds only through products;
-* the scales of the normalisation are "0e" numbers (the RMS of a pseudoscalar or of the lengths of vectors is even).
+* the scales of the normalisation are "0e" numbers (the RMS of a pseudoscalar or of the lengths of vectors is even); see TypedNorm.
 """
 import math
 from typing import Dict, Mapping
@@ -25,8 +25,8 @@ Mult = Mapping[str, int]
 
 # ---------------------------------------------------------------------------------------------------------- helpers of feature sets
 def add(a: Feats, b: Feats) -> Feats:
-    """residual connection of two feature sets of the same kinds"""
-    return {k: v + b[k] for k, v in a.items()}
+    """residual connection of two feature sets: the kinds of a, plus those of them that b has"""
+    return {k: v + b[k] if k in b else v for k, v in a.items()}
 
 
 def mask_rows(x: Feats, valid: torch.Tensor) -> Feats:
@@ -90,28 +90,51 @@ class TypedLinear(nn.Module):
         return out
 
 
-class TypedRMSNorm(nn.Module):
-    """RMS normalisation of every kind with a learned per-channel scale (an even number): "0e" by the RMS of the channels, "0o" the same, the vectors by the
-    root of the mean over the channels of the squared lengths. No mean is subtracted and there is no shift. `eps_odd` (for 0o, 1o, 1e) is large on purpose: the vectors
-    are all zero before the first structure is available, and the gradient of x / sqrt(mean(x^2) + eps) at 0 is 1 / sqrt(eps)."""
+class TypedNorm(nn.Module):
+    """The normalisation of a feature set, every kind on its own, with a learned per-channel scale (an even number; affine=False: none):
 
-    def __init__(self, mult: Mult, eps_0e: float = 1e-5, eps_odd: float = 1e-3) -> None:
+        0e   LayerNorm over the channels (the mean subtracted, divided by the RMS), as PhysDock / AF3
+        0o   RMS over the channels, NOT centred
+        1o, 1e   divided by the root of the mean over the channels of the squared lengths, not centred
+
+    Why the odd kinds are not centred: the mean over the channels of a pseudoscalar is a pseudoscalar, so centring would be allowed, but it removes the common mode, and a handedness
+    that all channels agree on (every 0o channel of an atom +, the mirror image every channel -) is exactly that common mode; for vectors the mean over the channels is the direction
+    they share. There is no shift (a shift of an odd kind is forbidden; the following layers have the 0e bias). `eps_odd` (for 0o, 1o, 1e) is large on purpose: the odd features can be
+    all zero (no structure yet), and the gradient of x / sqrt(mean(x^2) + eps) at 0 is 1 / sqrt(eps)."""
+
+    def __init__(self, mult: Mult, affine: bool = True, eps_0e: float = 1e-5, eps_odd: float = 1e-3) -> None:
         super().__init__()
         self.eps_0e, self.eps_odd = eps_0e, eps_odd
-        self.weight = nn.ParameterDict({k: nn.Parameter(torch.ones(c)) for k, c in mult.items() if c})
+        self.kinds = [k for k, c in mult.items() if c]
+        self.weight = nn.ParameterDict({k: nn.Parameter(torch.ones(c)) for k, c in mult.items() if c}) if affine else None
 
     def forward(self, x: Feats) -> Feats:
         out = {}
         for k, v in x.items():
             dt = torch.promote_types(v.dtype, torch.float32)
             u = v.to(dt)
-            eps = self.eps_0e if k == "0e" else self.eps_odd
-            if k in G.SCALAR_KINDS:
-                y = u * torch.rsqrt(u.square().mean(-1, keepdim=True) + eps) * self.weight[k]
+            if k == "0e":
+                u = u - u.mean(-1, keepdim=True)
+                y = u * torch.rsqrt(u.square().mean(-1, keepdim=True) + self.eps_0e)
+            elif k in G.SCALAR_KINDS:
+                y = u * torch.rsqrt(u.square().mean(-1, keepdim=True) + self.eps_odd)
             else:
-                y = u * torch.rsqrt(u.square().sum(-1).mean(-1, keepdim=True) + eps)[..., None] * self.weight[k][:, None]
+                y = u * torch.rsqrt(u.square().sum(-1).mean(-1, keepdim=True) + self.eps_odd)[..., None]
+            if self.weight is not None:
+                y = y * (self.weight[k] if k in G.SCALAR_KINDS else self.weight[k][:, None])
             out[k] = y.to(v.dtype)
         return out
+
+
+class NormLinear(nn.Module):
+    """TypedNorm then TypedLinear: how a layer reads a stream it does not own (an encoder output, the stream of another scale), as PhysDock's RMSNorm + Linear"""
+
+    def __init__(self, mult_in: Mult, mult_out: Mult, bias: bool = True) -> None:
+        super().__init__()
+        self.norm, self.lin = TypedNorm(mult_in), TypedLinear(mult_in, mult_out, bias=bias)
+
+    def forward(self, x: Feats) -> Feats:
+        return self.lin(self.norm(x))
 
 
 class Gate(nn.Module):
@@ -180,7 +203,7 @@ class GeometricProduct(nn.Module):
         self.terms = select_terms(self.mult_in, want)
         used_a = [k for k in G.KINDS if any(k in t[1] for t in self.terms)]
         used_b = [k for k in G.KINDS if any(k in t[2] for t in self.terms)]
-        self.norm = TypedRMSNorm(self.mult_in)
+        self.norm = TypedNorm(self.mult_in)
         self.proj_a = TypedLinear(self.mult_in, {k: channels for k in used_a})
         self.proj_b = TypedLinear(self.mult_in, {k: channels for k in used_b})
         self.proj_c = TypedLinear(self.mult_in, {"1o": channels}, bias=False) if any(t[3] for t in self.terms) else None
@@ -190,8 +213,9 @@ class GeometricProduct(nn.Module):
         self.mult_cat = mult_cat
         self.out = TypedLinear(mult_cat, {k: c for k, c in mult_out.items() if c}, zero_init=zero_init)
 
-    def forward(self, x: Feats) -> Feats:
-        x = self.norm(x)
+    def forward(self, x: Feats, normed: bool = False) -> Feats:
+        """normed: x is normalised already (by the AdaLN of a DiT block)"""
+        x = x if normed else self.norm(x)
         a, b = self.proj_a(x), self.proj_b(x)
         c = self.proj_c(x)["1o"] if self.proj_c is not None else None
         cat: Dict[str, list] = {}
@@ -203,13 +227,14 @@ class GeometricProduct(nn.Module):
 
 
 class TypedPool(nn.Module):
-    """atoms -> units: a typed linear map (SiLU on the 0e part), then the mean over the atoms of a unit (the pool matrix [Nu, Na])"""
+    """atoms -> tokens: the norm, a typed linear map (SiLU on the 0e part), then the mean over the atoms of a token (the pool matrix [Nt, Na])"""
 
     def __init__(self, mult_a: Mult, mult_s: Mult) -> None:
         super().__init__()
+        self.norm = TypedNorm(mult_a)
         self.lin = TypedLinear(mult_a, mult_s)
 
     def forward(self, a: Feats, pool: torch.Tensor) -> Feats:
-        h = self.lin(a)
+        h = self.lin(self.norm(a))
         h["0e"] = F.silu(h["0e"])
         return {k: torch.einsum("ua,a...->u...", pool, v) for k, v in h.items()}

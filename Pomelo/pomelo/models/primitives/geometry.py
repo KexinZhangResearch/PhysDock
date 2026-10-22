@@ -65,6 +65,11 @@ def triple(u: torch.Tensor, ku: str, v: torch.Tensor, kv: str, w: torch.Tensor, 
     return dot(u, ku, c, kc)
 
 
+def squash(v: torch.Tensor, length: float) -> torch.Tensor:
+    """v [..., 3] -> v * l / sqrt(l^2 + |v|^2): the same direction, |v| for a short vector, at most l for a long one (a function of the length times the vector: the kind is kept)"""
+    return v * (length / torch.sqrt(length ** 2 + v.square().sum(-1, keepdim=True)))
+
+
 def scale(x: torch.Tensor, kx: str, g: torch.Tensor, kg: str):
     """a feature times a scalar-like feature of the same channels: g [..., C] (kind "0e" or "0o"), x [..., C] or [..., C, 3]; the kinds multiply
     (0o * 1o = 1e, 0o * 1e = 1o, 0o * 0o = 0e, ...). With g a gate computed from "0e" features only (a sigmoid, an MLP) the kind of x is unchanged"""

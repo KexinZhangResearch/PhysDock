@@ -1,11 +1,12 @@
-"""A PhysDock / AF3-like decoder with NO symmetry built in, to compare with the equivariant PomeloDiT on the same data, inputs, loss, EDM preconditioning and sampler.
+"""PhysDock / AF3-like models with NO symmetry built in, to compare with Pomelo on the same data, inputs, loss, EDM preconditioning and sampler.
 
-The same multi-scale layout (atoms -> units -> atoms) and the same static inputs (Embedder: the six stored features, the atom and atom-pair features, the stereo labels as plain numbers),
-but the layers are the ordinary ones: the noisy coordinates enter through a linear layer, features of all kinds are channels of one tensor, LayerNorm with AdaLN-Zero (shift, scale,
-gate from the noise level), qk-normalised multi-head attention with a pair bias and a sigmoid output gate, SwiGLU transitions, a coordinate head from the atoms plus one from the units.
-It learns the rotations from data: training uses a random rotation of every noisy sample (diffusion.random_rotations). It has to learn the hand of the molecules from the labels.
-`geometry=True` also gives it the derived invariants that PomeloDiT computes (the signed volumes, tag x volume, the distance RBF of the pair bias), to separate the effect of the inputs
-from that of the architecture.
+The same inputs (pomelo.models.encoders.InputEmbedder: the conformer features; no stereo label) and the same multi-scale layout (atoms -> tokens -> atoms), but the layers are the
+ordinary ones: the reference conformer enters as plain numbers, as in PhysDock's ref_feat (ref - conformer centre; the frame of every conformer is random, so the model has to learn
+to ignore it), and as AF3's atom pair features inside a conformer (the offset ref_j - ref_i and the distance RBF); the noisy coordinates enter through a linear layer; LayerNorm with
+AdaLN-Zero (shift, scale, gate from the noise level), qk-normalised multi-head attention with a pair bias and a sigmoid output gate, SwiGLU transitions, a coordinate head from the atoms
+plus one from the tokens. It learns the rotations from data: training uses a random rotation of every noisy sample. `geometry=True` also gives the pair bias the RBF of the noisy
+distances (as the equivariant decoder has).
+BasebaselineDenoiser puts a PhysDock-like Pairformer trunk in front.
 """
 import math
 from typing import Dict
@@ -15,9 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pomelo.configs import Config
-from pomelo.data.molecule import signed_volume
 from pomelo.models.decoders import GEOM, TimeEmbedding
-from pomelo.models.encoders import Embedder
+from pomelo.models.encoders import REF_SCALE, InputEmbedder
 from pomelo.utils.tensor_utils import N_RBF, rbf
 
 
@@ -74,50 +74,70 @@ class Block(nn.Module):
         return x + self.trans(x, t)
 
 
+def reference_inputs(mol, st):
+    """PhysDock's reference inputs as plain numbers: ref - conformer centre [Na, 3] (in units of 4 A), and for the atom pairs inside a conformer the offset and the distance RBF
+    [Na, Na, 3 + N_RBF] (zero between conformers)"""
+    ref, conf, nc = mol["ref_pos"], st["atom_to_conformer"], st["n_conformers"]
+    mean = torch.zeros(nc, 3, dtype=ref.dtype, device=ref.device).index_add(0, conf, ref) / torch.bincount(conf, minlength=nc).clamp(min=1)[:, None].to(ref.dtype)
+    rel = (ref - mean[conf]) * REF_SCALE
+    same = (conf[:, None] == conf[None, :])[..., None].to(ref.dtype)
+    off = rel[None, :] - rel[:, None]
+    return rel, torch.cat([off, rbf(off.norm(dim=-1))], -1) * same
+
+
 class BaselineDiT(nn.Module):
-    def __init__(self, cfg: Config, c_atom: int = 128, c_unit: int = 160, geometry: bool = False, cs_in: int = None, cz_in: int = None) -> None:
+    def __init__(self, cfg: Config, c_atom: int = 128, c_token: int = 160, geometry: bool = False, cs_in: int = None, cz_in: int = None) -> None:
         super().__init__()
         self.cfg, self.geometry = cfg, geometry
-        cs_in = cs_in or cfg.mult_s["0e"] + cfg.mult_s["0o"]                  # the width of the unit features that condition it: the stored s, z of the embedder, or a trunk's
-        cz_in = cz_in or cfg.mult_z["0e"] + cfg.mult_z["0o"]
-        self.cap_in = cfg.pair_static + 2 + (N_RBF if geometry else 0)
+        cs_in = cs_in or cfg.mult_s["0e"]                  # the width of the token features that condition it: the static s0e, z0e of the embedder, or a trunk's
+        cz_in = cz_in or cfg.mult_z["0e"]
+        self.cap_in = cfg.pair_static + 3 + N_RBF + (N_RBF if geometry else 0)
         self.time = TimeEmbedding(cfg.t_dim)
-        self.a_in = nn.Linear(cfg.atom_static + 1 + (2 if geometry else 0), c_atom)
+        self.a_in = nn.Linear(cfg.atom_static + 3, c_atom)
         self.x_in = nn.Linear(3, c_atom, bias=False)
-        self.cond_s = nn.Linear(cs_in, c_unit)
+        self.cond_s = nn.Linear(cs_in, c_token)
         self.enc = nn.ModuleList([Block(c_atom, self.cap_in, cfg.heads, cfg.t_dim) for _ in range(cfg.n_atom_blocks)])
-        self.pool = nn.Linear(c_atom, c_unit)
-        self.units = nn.ModuleList([Block(c_unit, cz_in, cfg.heads, cfg.t_dim) for _ in range(cfg.n_unit_blocks)])
-        self.unpool = nn.Linear(c_unit, c_atom)
+        self.pool = nn.Linear(c_atom, c_token)
+        self.tokens = nn.ModuleList([Block(c_token, cz_in, cfg.heads, cfg.t_dim) for _ in range(cfg.n_token_blocks)])
+        self.unpool = nn.Linear(c_token, c_atom)
         self.dec = nn.ModuleList([Block(c_atom, self.cap_in, cfg.heads, cfg.t_dim) for _ in range(cfg.n_atom_blocks)])
         self.norm_out = nn.LayerNorm(c_atom)
-        self.head_atom, self.head_unit = nn.Linear(c_atom, 3), nn.Linear(c_unit, 3)
+        self.head_atom, self.head_token = nn.Linear(c_atom, 3), nn.Linear(c_token, 3)
 
     def forward(self, x: torch.Tensor, c_noise: torch.Tensor, st: Dict[str, object]) -> torch.Tensor:
         """x [B, Na, 3] centred noisy coordinates times c_in, c_noise [B] -> F [B, Na, 3]"""
-        b, n = x.shape[:2]
+        b = x.shape[0]
         t = self.time(c_noise)
-        pool, a2u, tag = st["pool"], st["atom_to_unit"], st["tag"]
-        feats = [st["a0e"].expand(b, -1, -1), tag[None, :, None].expand(b, -1, -1)]
+        pool, a2t = st["pool"], st["atom_to_token"]
+        a = self.a_in(torch.cat([st["a0e"], st["ref_rel"]], -1))[None] + self.x_in(x * GEOM)
+        ap = torch.cat([st["ap0e"], st["ref_pair"]], -1)                                                        # [N, N, C] shared by the samples
         if self.geometry:
-            vol = (st["scatter"] @ signed_volume(x, st["stereo_center"], st["stereo_nbrs"]).T).T if st["stereo_center"].numel() else torch.zeros(b, n, device=x.device, dtype=x.dtype)
-            feats += [vol[..., None], (tag[None] * vol)[..., None]]
-        a = self.a_in(torch.cat(feats, -1)) + self.x_in(x * GEOM)
-        ap = torch.cat([st["ap0e"], tag[:, None, None].expand(n, n, 1), tag[None, :, None].expand(n, n, 1)], -1)          # [N, N, C] shared by the samples
-        if self.geometry:
-            ap = torch.cat([ap[None].expand(b, -1, -1, -1), rbf(torch.cdist(x, x) * GEOM)], -1)                           # per sample
+            ap = torch.cat([ap[None].expand(b, -1, -1, -1), rbf(torch.cdist(x, x) * GEOM)], -1)                 # per sample
         for blk in self.enc:
             a = blk(a, ap, t)
         s = torch.einsum("ua,bac->buc", pool, F.silu(self.pool(a)))
-        s_cond = st["s_plain"] if "s_plain" in st else torch.cat([st["s"]["0e"], st["s"]["0o"]], -1)
-        z = st["z_plain"] if "z_plain" in st else torch.cat([st["z"]["0e"], st["z"]["0o"]], -1)
-        s = s + self.cond_s(s_cond)[None]
-        for blk in self.units:
+        s = s + self.cond_s(st.get("s_plain", st["s0e"]))[None]
+        z = st.get("z_plain", st["z0e"])
+        for blk in self.tokens:
             s = blk(s, z, t)
-        a = a + self.unpool(s)[:, a2u]
+        a = a + self.unpool(s)[:, a2t]
         for blk in self.dec:
             a = blk(a, ap, t)
-        return self.head_atom(self.norm_out(a)) + self.head_unit(s)[:, a2u]
+        return self.head_atom(self.norm_out(a)) + self.head_token(s)[:, a2t]
+
+
+def static_inputs(embedder: InputEmbedder, mol) -> Dict[str, object]:
+    st = embedder(mol)
+    rel, pair = reference_inputs(st["mol"], st)
+    return {**st, "ref_rel": rel, "ref_pair": pair}
+
+
+def edm(dit, st, x_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    xbar = x_t.mean(1, keepdim=True)
+    xc = x_t - xbar
+    sg = sigma[:, None, None]
+    c_in, c_skip, c_out = (sg ** 2 + 1) ** -0.5, 1 / (1 + sg ** 2), sg * (sg ** 2 + 1) ** -0.5
+    return xbar + c_skip * xc + c_out * dit(c_in * xc, torch.log(sigma) / 4, st)
 
 
 # ---------------------------------------------------------------------------------------------------------------- the trunk of the second baseline
@@ -204,44 +224,32 @@ class PairformerBlock(nn.Module):
 
 
 class BasebaselineDenoiser(nn.Module):
-    """The second baseline: a PhysDock-like trunk too. The six stored features of the embedder (the stereo labels as plain numbers) are concatenated into one s and one z, run through
-    `n_trunk` standard Pairformer blocks, and the result conditions the PhysDock-like DiT of BaselineDenoiser. Nothing in it is equivariant (trained with random rotations)."""
+    """The second baseline: a PhysDock-like trunk too. The static token features of the embedder (s0e, z0e) run through `n_trunk` standard Pairformer blocks, and the result conditions
+    the PhysDock-like DiT of BaselineDenoiser. Nothing in it is equivariant (trained with random rotations)."""
 
-    def __init__(self, cfg: Config, c_atom: int, c_unit: int, c_s: int = 64, c_z: int = 32, n_trunk: int = 2, geometry: bool = False) -> None:
+    def __init__(self, cfg: Config, c_atom: int, c_token: int, c_s: int = 64, c_z: int = 32, n_trunk: int = 2, geometry: bool = False) -> None:
         super().__init__()
-        self.embedder = Embedder(cfg.mult_s, cfg.mult_z, cfg.atom_static, cfg.pair_static, cfg.relpos, cfg.max_unit_size)
-        self.in_s = nn.Linear(cfg.mult_s["0e"] + cfg.mult_s["0o"], c_s)
-        self.in_z = nn.Linear(cfg.mult_z["0e"] + cfg.mult_z["0o"], c_z)
+        self.embedder = InputEmbedder(cfg)
+        self.in_s = nn.Linear(cfg.mult_s["0e"], c_s)
+        self.in_z = nn.Linear(cfg.mult_z["0e"], c_z)
         self.trunk = nn.ModuleList([PairformerBlock(c_s, c_z, cfg.heads) for _ in range(n_trunk)])
-        self.dit = BaselineDiT(cfg, c_atom, c_unit, geometry, cs_in=c_s, cz_in=c_z)
+        self.dit = BaselineDiT(cfg, c_atom, c_token, geometry, cs_in=c_s, cz_in=c_z)
 
     def forward(self, mol, x_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        st = self.embedder(mol)
-        s = self.in_s(torch.cat([st["s"]["0e"], st["s"]["0o"]], -1))
-        z = self.in_z(torch.cat([st["z"]["0e"], st["z"]["0o"]], -1))
+        st = static_inputs(self.embedder, mol)
+        s, z = self.in_s(st["s0e"]), self.in_z(st["z0e"])
         for blk in self.trunk:
             s, z = blk(s, z)
-        st = {**st, "s_plain": s, "z_plain": z}
-        xbar = x_t.mean(1, keepdim=True)
-        xc = x_t - xbar
-        sg = sigma[:, None, None]
-        c_in, c_skip, c_out = (sg ** 2 + 1) ** -0.5, 1 / (1 + sg ** 2), sg * (sg ** 2 + 1) ** -0.5
-        return xbar + c_skip * xc + c_out * self.dit(c_in * xc, torch.log(sigma) / 4, st)
+        return edm(self.dit, {**st, "s_plain": s, "z_plain": z}, x_t, sigma)
 
 
 class BaselineDenoiser(nn.Module):
-    """same interface as pomelo.dit.Denoiser: D(mol, x_t [B, N, 3], sigma [B]) with the EDM preconditioning of the centred coordinates"""
+    """same interface as pomelo.models.model.Denoiser: D(mol, x_t [B, N, 3], sigma [B]) with the EDM preconditioning of the centred coordinates"""
 
-    def __init__(self, cfg: Config, c_atom: int = 128, c_unit: int = 160, geometry: bool = False) -> None:
+    def __init__(self, cfg: Config, c_atom: int = 128, c_token: int = 160, geometry: bool = False) -> None:
         super().__init__()
-        self.embedder = Embedder(cfg.mult_s, cfg.mult_z, cfg.atom_static, cfg.pair_static, cfg.relpos, cfg.max_unit_size)
-        self.dit = BaselineDiT(cfg, c_atom, c_unit, geometry)
+        self.embedder = InputEmbedder(cfg)
+        self.dit = BaselineDiT(cfg, c_atom, c_token, geometry)
 
     def forward(self, mol, x_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        st = self.embedder(mol)
-        xbar = x_t.mean(1, keepdim=True)
-        xc = x_t - xbar
-        s = sigma[:, None, None]
-        c_in, c_skip, c_out = (s ** 2 + 1) ** -0.5, 1 / (1 + s ** 2), s * (s ** 2 + 1) ** -0.5
-        raw = self.dit(c_in * xc, torch.log(sigma) / 4, st)
-        return xbar + c_skip * xc + c_out * raw
+        return edm(self.dit, static_inputs(self.embedder, mol), x_t, sigma)

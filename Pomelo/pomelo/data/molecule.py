@@ -1,16 +1,22 @@
-"""Synthetic data for the first tests of the model: small molecules with stereochemistry (RDKit conformers), cut into units (fragments), with the stereo table.
+"""Synthetic data for the first tests of the model: small molecules with stereochemistry (RDKit conformers), as PhysDock sees a ligand: every heavy atom is a token, the molecule is
+one conformer (one reference frame).
 
-A molecule is a dict of tensors (atoms are the heavy atoms):
-    z, charge, aromatic, hyb, degree, n_h, in_ring   [Na]   element / charge / aromatic / hybridisation / heavy degree / hydrogens / ring flags
-    bonds [Nb, 3] (i, j, type: 1 single, 2 double, 3 triple, 4 aromatic), unit [Na] (the unit of every atom)
-    coords [Na, 3] (Angstrom, centred), unit_of_atom is `unit`
-    stereo_center [Ns], stereo_nbrs [Ns, 4] (the heavy neighbours sorted by atom index, -1 pads a missing fourth: the implicit hydrogen), stereo_sign [Ns] (+1 / -1)
+A system is a dict of tensors, with the names of PhysDock's features (pomelo.data.protein builds the same dict for proteins):
 
-The stereo label is the sign of the signed volume of the ordered neighbours (signed_volume below), measured on the true structure: a pseudoscalar, so the label of the mirror image
-is the opposite one. Nothing refers to R / S or to a canonical numbering: the label belongs to the tuple, in the order of the atom numbering of this molecule.
+  atoms [Na]   ref_element, ref_charge, ref_is_aromatic, ref_hybridization, ref_n_h, ref_in_ring   the features of the atom in its reference conformer (the conformer features)
+               ref_pos [Na, 3]       the reference conformer (Angstrom; every conformer in a random frame of its own: nothing relates the frames of two conformers)
+               atom_to_conformer     the conformer of every atom (AF3's ref_space_uid: a residue, a ligand)
+               atom_to_token         the token of every atom (a standard residue is one token, every atom of a ligand is one token)
+               x_gt [Na, 3]          the structure (Angstrom, centred): the target, never an input
+  tokens [Nt]  restype (0 .. 19 the standard amino acids, 20 a ligand), residue_index, asym_id (the chain / molecule)
+  bonds [Nb, 3]  (i, j, type: 1 single, 2 double, 3 triple, 4 aromatic), all covalent bonds of the system
 
-The units follow the rules of the design: rings are never cut, no bond of a stereocentre is cut (the centre and all its neighbours are in one unit), only single bonds between two atoms of
-degree > 1 outside rings are cut, pieces of one or two atoms are merged into their largest neighbour.
+and, computed once by add_features: ref_degree [Na], ref_spd / ref_bond [Na, Na] (graph distance and bond type inside a conformer, FAR / 0 between conformers, as PhysDock's bond
+features exist only inside a conformer), token_spd [Nt, Nt] (the smallest ref_spd over the atoms of two tokens), token_to_conformer [Nt].
+
+The stereo table (stereo_center [Ns], stereo_nbrs [Ns, 4]: the heavy neighbours sorted by atom index, -1 pads a missing fourth, stereo_sign [Ns]: the sign of the signed volume of the
+ordered neighbours in the true structure) is for the evaluation only (does a sampled structure have the hand of the truth?): no model reads it. The hand of a molecule is in its reference
+conformer.
 """
 from typing import Dict, List
 
@@ -21,7 +27,7 @@ from rdkit.Chem import AllChem
 
 RDLogger.DisableLog("rdApp.*")
 
-# L- and D-tryptophan have the same graph: only the stereo labels (and the structure) differ
+# L- and D-tryptophan have the same graph: only the reference conformer (and the structure) differ
 SMILES = {
     "Ala-Phe": "C[C@H](N)C(=O)N[C@@H](Cc1ccccc1)C(=O)O",
     "Leu-Ala": "CC(C)C[C@H](NC(=O)[C@@H](N)C)C(=O)O",
@@ -39,6 +45,10 @@ ELEMENTS = {6: 0, 7: 1, 8: 2, 16: 3, 9: 4, 17: 5, 35: 6, 15: 7, 53: 8}          
 N_ELEMENTS = 10
 HYBRIDISATION = {Chem.HybridizationType.SP: 0, Chem.HybridizationType.SP2: 1, Chem.HybridizationType.SP3: 2}
 BOND_TYPES = {Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3, Chem.BondType.AROMATIC: 4}
+LIGAND = 20                  # restype of a ligand token (0 .. 19: the standard amino acids of pomelo.data.protein.STANDARD)
+N_RESTYPE = 21
+ATOM_KEYS = ("ref_element", "ref_charge", "ref_is_aromatic", "ref_hybridization", "ref_n_h", "ref_in_ring")
+TOKEN_KEYS = ("restype", "residue_index", "asym_id")
 
 
 def signed_volume(x: torch.Tensor, center: torch.Tensor, nbrs: torch.Tensor) -> torch.Tensor:
@@ -55,7 +65,7 @@ def signed_volume(x: torch.Tensor, center: torch.Tensor, nbrs: torch.Tensor) -> 
     return (vecs[0] * torch.linalg.cross(vecs[1], vecs[2], dim=-1)).sum(-1)
 
 
-FAR = 9                      # graph distances 0 .. 8 and "far"
+FAR = 9                      # graph distances 0 .. 8 and "far" (also: another conformer)
 
 
 def graph_distance(n: int, bonds: torch.Tensor) -> torch.Tensor:
@@ -73,55 +83,30 @@ def graph_distance(n: int, bonds: torch.Tensor) -> torch.Tensor:
     return spd
 
 
-def unit_distance(spd: torch.Tensor, unit: torch.Tensor) -> torch.Tensor:
-    """[Nu, Nu] the smallest graph distance between an atom of one unit and an atom of the other (FAR beyond 8), by two scatter-min reductions (no [Nu, Nu, Na, Na] tensor)"""
-    nu = int(unit.max()) + 1
-    rows = torch.full((nu, spd.shape[1]), FAR, dtype=spd.dtype).scatter_reduce(0, unit[:, None].expand_as(spd), spd, "amin", include_self=True)
-    return torch.full((nu, nu), FAR, dtype=spd.dtype).scatter_reduce(1, unit[None, :].expand(nu, -1), rows, "amin", include_self=True)
+def token_distance(spd: torch.Tensor, atom_to_token: torch.Tensor) -> torch.Tensor:
+    """[Nt, Nt] the smallest graph distance between an atom of one token and an atom of the other (FAR beyond 8), by two scatter-min reductions (no [Nt, Nt, Na, Na] tensor)"""
+    nt = int(atom_to_token.max()) + 1
+    rows = torch.full((nt, spd.shape[1]), FAR, dtype=spd.dtype).scatter_reduce(0, atom_to_token[:, None].expand_as(spd), spd, "amin", include_self=True)
+    return torch.full((nt, nt), FAR, dtype=spd.dtype).scatter_reduce(1, atom_to_token[None, :].expand(nt, -1), rows, "amin", include_self=True)
 
 
-def add_graph_features(mol: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """the static graph features of a molecule, computed once: spd [Na, Na] (graph distance), bond [Na, Na] (bond type, 0 none), unit_spd [Nu, Nu]"""
-    n = mol["z"].shape[0]
-    spd = graph_distance(n, mol["bonds"])
+def add_features(mol: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """the static features that follow from the conformers, computed once: the bonds inside a conformer (ref_bond, ref_spd, ref_degree; a bond between two conformers, the peptide
+    bond, is not a feature, as in PhysDock), token_spd, token_to_conformer"""
+    n, conf = mol["ref_element"].shape[0], mol["atom_to_conformer"]
+    b = mol["bonds"]
+    inner = b[conf[b[:, 0]] == conf[b[:, 1]]] if len(b) else b
     bond = torch.zeros(n, n, dtype=torch.long)
-    if len(mol["bonds"]):
-        bond[mol["bonds"][:, 0], mol["bonds"][:, 1]] = mol["bonds"][:, 2]
-        bond[mol["bonds"][:, 1], mol["bonds"][:, 0]] = mol["bonds"][:, 2]
-    mol.update({"spd": spd, "bond": bond, "unit_spd": unit_distance(spd, mol["unit"])})
+    if len(inner):
+        bond[inner[:, 0], inner[:, 1]] = inner[:, 2]
+        bond[inner[:, 1], inner[:, 0]] = inner[:, 2]
+    spd = graph_distance(n, inner)
+    a2t = mol["atom_to_token"]
+    nt = int(a2t.max()) + 1
+    t2c = torch.zeros(nt, dtype=torch.long).scatter_(0, a2t, conf)
+    assert torch.equal(t2c[a2t], conf), "the atoms of a token must be in one conformer"
+    mol.update({"ref_bond": bond, "ref_spd": spd, "ref_degree": (bond > 0).sum(1), "token_spd": token_distance(spd, a2t), "token_to_conformer": t2c})
     return mol
-
-
-def fragment(mol: Chem.Mol, stereo_atoms: set) -> np.ndarray:
-    """unit index of every atom: union-find over the bonds that are not cut"""
-    n = mol.GetNumAtoms()
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-    for b in mol.GetBonds():
-        i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
-        cut = (b.GetBondType() == Chem.BondType.SINGLE and not b.IsInRing() and mol.GetAtomWithIdx(i).GetDegree() > 1 and mol.GetAtomWithIdx(j).GetDegree() > 1
-               and i not in stereo_atoms and j not in stereo_atoms)
-        if not cut:
-            parent[find(i)] = find(j)
-    for _ in range(n):                                                                 # merge the pieces of at most two atoms into their largest neighbour
-        comp: Dict[int, List[int]] = {}
-        for a in range(n):
-            comp.setdefault(find(a), []).append(a)
-        small = [atoms for atoms in sorted(comp.values(), key=len) if len(atoms) <= 2 and len(comp) > 1]
-        if not small:
-            break
-        atoms = small[0]
-        nbr = {find(x.GetIdx()) for a in atoms for x in mol.GetAtomWithIdx(a).GetNeighbors()} - {find(atoms[0])}
-        if not nbr:
-            break
-        parent[find(atoms[0])] = max(nbr, key=lambda r: len(comp[r]))
-    roots = sorted({find(a) for a in range(n)}, key=lambda r: min(a for a in range(n) if find(a) == r))
-    return np.array([roots.index(find(a)) for a in range(n)], dtype=np.int64)
 
 
 def random_frame(generator: torch.Generator, scale: float = 20.0):
@@ -132,21 +117,15 @@ def random_frame(generator: torch.Generator, scale: float = 20.0):
     return q, torch.randn(3, generator=generator) * scale
 
 
-def add_reference(mol: Dict[str, torch.Tensor], ref_pos: torch.Tensor, conformer: torch.Tensor, seed: int = 0) -> Dict[str, torch.Tensor]:
-    """the reference conformers of a molecule, as AF3 / PhysDock give them: ref_pos [Na, 3] (Angstrom, in any frame) and conformer [Na] (the conformer of every atom: the atoms of
-    a conformer share one frame). Every conformer is put into a frame of its own (a random rotation and translation), because nothing relates the frames of two conformers.
-    Adds ref_pos, conformer, and unit_conformer [Nu]."""
+def random_frames(ref_pos: torch.Tensor, conformer: torch.Tensor, seed: int = 0) -> torch.Tensor:
+    """every conformer of ref_pos [Na, 3] centred and put into a frame of its own (a random rotation and translation), because nothing relates the frames of two conformers"""
     g = torch.Generator().manual_seed(1000 + seed)
     ref = ref_pos.clone()
     for c in conformer.unique():
         sel = conformer == c
         q, t = random_frame(g)
         ref[sel] = (ref_pos[sel] - ref_pos[sel].mean(0)) @ q.T + t
-    nu = int(mol["unit"].max()) + 1
-    unit_conformer = torch.zeros(nu, dtype=torch.long).scatter_(0, mol["unit"], conformer)
-    assert torch.equal(unit_conformer[mol["unit"]], conformer), "the atoms of a unit must be in one conformer"
-    mol.update({"ref_pos": ref, "conformer": conformer, "unit_conformer": unit_conformer})
-    return mol
+    return ref
 
 
 def reference_conformer(smiles: str, seed: int) -> torch.Tensor:
@@ -160,31 +139,30 @@ def reference_conformer(smiles: str, seed: int) -> torch.Tensor:
 
 
 def combine(mols: List[Dict[str, torch.Tensor]], spacing: float = 12.0) -> Dict[str, torch.Tensor]:
-    """several molecules as one system: the atoms, bonds, units and stereo tables concatenated, every molecule one conformer (its own reference frame), the structures side by side
-    along x (the structure itself is one frame: the coordinates of the denoiser)"""
-    off_a = off_u = 0
-    out = {k: [] for k in ("z", "charge", "aromatic", "hyb", "degree", "n_h", "in_ring", "unit", "coords", "stereo_center", "stereo_nbrs", "stereo_sign", "ref_pos", "conformer")}
-    bonds = []
+    """several systems as one: the atoms, tokens, bonds, conformers and stereo tables concatenated, every system its own chain (asym_id), the structures side by side along x (the
+    structure is one frame: the coordinates of the denoiser)"""
+    keys = ATOM_KEYS + TOKEN_KEYS + ("ref_pos", "x_gt", "atom_to_conformer", "atom_to_token", "stereo_center", "stereo_nbrs", "stereo_sign", "bonds")
+    out = {k: [] for k in keys}
+    off_a = off_t = off_c = off_chain = 0
     for i, m in enumerate(mols):
-        for k in ("z", "charge", "aromatic", "hyb", "degree", "n_h", "in_ring", "stereo_sign"):
+        for k in ATOM_KEYS + ("restype", "residue_index", "ref_pos", "stereo_sign"):
             out[k].append(m[k])
-        out["unit"].append(m["unit"] + off_u)
-        out["coords"].append(m["coords"] + torch.tensor([i * spacing, 0.0, 0.0]))
+        out["asym_id"].append(m["asym_id"] + off_chain)
+        out["x_gt"].append(m["x_gt"] + torch.tensor([i * spacing, 0.0, 0.0]))
+        out["atom_to_conformer"].append(m["atom_to_conformer"] + off_c)
+        out["atom_to_token"].append(m["atom_to_token"] + off_t)
         out["stereo_center"].append(m["stereo_center"] + off_a)
         out["stereo_nbrs"].append(torch.where(m["stereo_nbrs"] >= 0, m["stereo_nbrs"] + off_a, m["stereo_nbrs"]))
-        out["ref_pos"].append(m["ref_pos"])
-        out["conformer"].append(m["conformer"] + (out["conformer"][-1].max() + 1 if out["conformer"] else 0))
-        bonds.append(m["bonds"] + torch.tensor([off_a, off_a, 0]))
-        off_a += m["z"].shape[0]
-        off_u += int(m["unit"].max()) + 1
-    mol = {k: torch.cat(v) for k, v in out.items()}
-    mol["bonds"] = torch.cat(bonds)
-    nu = int(mol["unit"].max()) + 1
-    mol["unit_conformer"] = torch.zeros(nu, dtype=torch.long).scatter_(0, mol["unit"], mol["conformer"])
-    return add_graph_features(mol)
+        out["bonds"].append(m["bonds"] + torch.tensor([off_a, off_a, 0]))
+        off_a += m["ref_element"].shape[0]
+        off_t += int(m["atom_to_token"].max()) + 1
+        off_c += int(m["atom_to_conformer"].max()) + 1
+        off_chain += int(m["asym_id"].max()) + 1
+    return add_features({k: torch.cat(v) for k, v in out.items()})
 
 
 def build(smiles: str, seed: int = 0) -> Dict[str, torch.Tensor]:
+    """a molecule as a ligand: one token per heavy atom, one conformer, the structure from an RDKit conformer (seed), the reference conformer from another one (seed + 101)"""
     mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
     if AllChem.EmbedMolecule(mol, randomSeed=seed) != 0:
         raise RuntimeError(f"no conformer for {smiles}")
@@ -195,7 +173,6 @@ def build(smiles: str, seed: int = 0) -> Dict[str, torch.Tensor]:
     stereo = [i.centeredOn for i in Chem.FindPotentialStereo(heavy) if i.type == Chem.StereoType.Atom_Tetrahedral and i.specified == Chem.StereoSpecified.Specified]
     n = heavy.GetNumAtoms()
     atoms = [heavy.GetAtomWithIdx(i) for i in range(n)]
-    ring = np.array([a.IsInRing() for a in atoms])
     nbrs = np.full((len(stereo), 4), -1, dtype=np.int64)
     for k, c in enumerate(stereo):
         nb = sorted(x.GetIdx() for x in heavy.GetAtomWithIdx(c).GetNeighbors())
@@ -204,18 +181,16 @@ def build(smiles: str, seed: int = 0) -> Dict[str, torch.Tensor]:
     nbrs_t = torch.from_numpy(nbrs)
     x = torch.from_numpy(coords)
     sign = torch.sign(signed_volume(x, center, nbrs_t)).to(torch.float32) if stereo else torch.zeros(0)
-    unit = fragment(heavy, set(stereo))
-    return _with_reference(add_graph_features({
-        "z": torch.tensor([ELEMENTS.get(a.GetAtomicNum(), 9) for a in atoms]), "charge": torch.tensor([a.GetFormalCharge() for a in atoms]),
-        "aromatic": torch.tensor([int(a.GetIsAromatic()) for a in atoms]), "hyb": torch.tensor([HYBRIDISATION.get(a.GetHybridization(), 3) for a in atoms]),
-        "degree": torch.tensor([a.GetDegree() for a in atoms]), "n_h": torch.tensor([a.GetTotalNumHs() for a in atoms]), "in_ring": torch.from_numpy(ring).long(),
+    conformer = torch.zeros(n, dtype=torch.long)
+    return add_features({
+        "ref_element": torch.tensor([ELEMENTS.get(a.GetAtomicNum(), 9) for a in atoms]), "ref_charge": torch.tensor([a.GetFormalCharge() for a in atoms]),
+        "ref_is_aromatic": torch.tensor([int(a.GetIsAromatic()) for a in atoms]), "ref_hybridization": torch.tensor([HYBRIDISATION.get(a.GetHybridization(), 3) for a in atoms]),
+        "ref_n_h": torch.tensor([a.GetTotalNumHs() for a in atoms]), "ref_in_ring": torch.tensor([int(a.IsInRing()) for a in atoms]),
+        "ref_pos": random_frames(reference_conformer(smiles, seed), conformer, seed), "atom_to_conformer": conformer, "atom_to_token": torch.arange(n),
+        "restype": torch.full((n,), LIGAND), "residue_index": torch.zeros(n, dtype=torch.long), "asym_id": torch.zeros(n, dtype=torch.long),
         "bonds": torch.tensor([[b.GetBeginAtomIdx(), b.GetEndAtomIdx(), BOND_TYPES.get(b.GetBondType(), 1)] for b in heavy.GetBonds()]),
-        "unit": torch.from_numpy(unit), "coords": x, "stereo_center": center, "stereo_nbrs": nbrs_t, "stereo_sign": sign,
-    }), reference_conformer(smiles, seed))
-
-
-def _with_reference(mol, ref_pos):
-    return add_reference(mol, ref_pos, torch.zeros(mol["z"].shape[0], dtype=torch.long))
+        "x_gt": x, "stereo_center": center, "stereo_nbrs": nbrs_t, "stereo_sign": sign,
+    })
 
 
 def make_dataset(names=None, seed: int = 0) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -223,10 +198,10 @@ def make_dataset(names=None, seed: int = 0) -> Dict[str, Dict[str, torch.Tensor]
 
 
 def mirror(mol: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """the mirror image: the structure reflected, every stereo label of the opposite sign (the graph is the same)"""
+    """the mirror image: the structure and the reference conformers reflected (the reference of the enantiomer is the mirror image of it), the stereo labels of the evaluation of the
+    opposite sign (the graph is the same)"""
     out = dict(mol)
-    out["coords"] = mol["coords"] * torch.tensor([-1.0, 1.0, 1.0])
+    m = torch.tensor([-1.0, 1.0, 1.0])
+    out["x_gt"], out["ref_pos"] = mol["x_gt"] * m.to(mol["x_gt"]), mol["ref_pos"] * m.to(mol["ref_pos"])
     out["stereo_sign"] = -mol["stereo_sign"]
-    if "ref_pos" in mol:                                                                  # the reference conformer of the enantiomer is the mirror image of it
-        out["ref_pos"] = mol["ref_pos"] * torch.tensor([-1.0, 1.0, 1.0])
     return out

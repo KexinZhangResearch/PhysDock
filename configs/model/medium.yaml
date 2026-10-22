@@ -22,6 +22,7 @@ encoder:                        # MSATemplEncoder (DiffusionConditioning)
   templ_dim: 40                 # template features [distogram 39, mask 1]
   key_res_dim: 7                # key-residue (PLIP) flags
   ligand_pair_dim: 42           # ligand pair features
+  outer_product: false          # the single stream writes to the pair stream at the start of every Pairformer block (optional; off in the released parameters)
   c_a: ${global.c_a}
   c_ap: ${global.c_ap}
   c_s: ${global.c_s}

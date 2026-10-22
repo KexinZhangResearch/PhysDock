@@ -1,11 +1,13 @@
-"""Real proteins for the model: a window of `crop` consecutive residues of a protein chain of the training set (data/v1/train_val), as a molecule dict of pomelo.data.
+"""Real proteins for the model: a window of `crop` consecutive residues of a protein chain of the training set (data/v1/train_val), as a system dict of pomelo.data.molecule.
 
-One unit per residue. The atoms are the heavy atoms that are resolved in the structure (the order of the CCD library, so the coordinates, the reference molecule of the residue
-and its bonds line up), the bonds are those of the residues plus the peptide bonds, the features come from the reference molecules of the CCD library, the degree from the bonds of
-the chain, the number of hydrogens of the backbone nitrogen is lowered by one inside the chain. The stereo table: the C-alpha of every residue but glycine and the C-beta of
-isoleucine and threonine (RDKit's potential stereocentres of the reference molecules), each with its three heavy neighbours and the implicit hydrogen; the label is the sign of the
-signed volume of the ordered neighbours in the real structure (pomelo.data.signed_volume), so all L residues carry the same label and the mirror image the opposite one.
-Extra keys: residue_index [Na-units] (position in the chain of the unit), chain (0), and the name of the residues.
+As in PhysDock, a standard residue is one token and one conformer: its reference conformer is the CCD one (pomelo.data.molecule.random_frames puts every residue into a frame of its
+own), its atom features are those of the atoms in the CCD reference molecule, the bonds inside a residue are features, the peptide bonds are bonds of the system but no feature (they join
+two conformers; the chain is in residue_index). The atoms are the heavy atoms that are resolved in the structure, in the order of the CCD library (so the coordinates, the reference
+molecule of the residue and its bonds line up).
+
+The stereo table of the evaluation: the C-alpha of every residue but glycine and the C-beta of isoleucine and threonine (RDKit's potential stereocentres of the reference molecules), each
+with its three heavy neighbours and the implicit hydrogen; the label is the sign of the signed volume of the ordered neighbours in the real structure, so all L residues carry the same
+label and the mirror image the opposite one.
 """
 import gzip
 import json
@@ -19,7 +21,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 
-from pomelo.data.molecule import BOND_TYPES, ELEMENTS, HYBRIDISATION, add_graph_features, add_reference, signed_volume
+from pomelo.data.molecule import ATOM_KEYS, BOND_TYPES, ELEMENTS, HYBRIDISATION, add_features, random_frames, signed_volume
 
 ROOT = Path(os.environ.get("PHYSDOCK_ROOT", Path(__file__).resolve().parents[3]))          # the PhysDock repository (the data lives there)
 STANDARD = "ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split()
@@ -73,7 +75,7 @@ def stereo_atoms(ccd: str) -> List[int]:
 
 def build_window(ccds, pos, mask, start: int, crop: int = 128) -> Dict[str, torch.Tensor]:
     lib = ccd_library()
-    feats = {k: [] for k in ("z", "charge", "aromatic", "hyb", "degree", "n_h", "in_ring", "unit")}
+    feats = {k: [] for k in ATOM_KEYS + ("atom_to_token",)}
     coords, refs, bonds, glob = [], [], [], {}
     centres_local = []
     for u, r in enumerate(range(start, start + crop)):
@@ -84,38 +86,35 @@ def build_window(ccds, pos, mask, start: int, crop: int = 128) -> Dict[str, torc
             glob[(u, a)] = len(coords)
             coords.append(pos[r][a])
             refs.append(np.asarray(lib[ccds[r]]["ref_pos"][a], dtype=np.float32))                    # the reference conformer of the residue (CCD), its own frame
-            n_h = at.GetTotalNumHs() - (1 if (a == 0 and u > 0) else 0)                         # the backbone N of a residue inside the chain has one hydrogen less
-            for k, v in (("z", ELEMENTS.get(at.GetAtomicNum(), 9)), ("charge", at.GetFormalCharge()), ("aromatic", int(at.GetIsAromatic())),
-                         ("hyb", HYBRIDISATION.get(at.GetHybridization(), 3)), ("n_h", max(n_h, 0)), ("in_ring", int(at.IsInRing())), ("unit", u)):
-                feats[k].append(v)
+            for k, v in (("ref_element", ELEMENTS.get(at.GetAtomicNum(), 9)), ("ref_charge", at.GetFormalCharge()), ("ref_is_aromatic", int(at.GetIsAromatic())),
+                         ("ref_hybridization", HYBRIDISATION.get(at.GetHybridization(), 3)), ("ref_n_h", at.GetTotalNumHs()), ("ref_in_ring", int(at.IsInRing())),
+                         ("atom_to_token", u)):
+                feats[k].append(v)                                                               # the features of the atom in the reference molecule (the free amino acid)
         for b in m.GetBonds():
             i, j = (u, b.GetBeginAtomIdx()), (u, b.GetEndAtomIdx())
             if i in glob and j in glob:
                 bonds.append((glob[i], glob[j], BOND_TYPES.get(b.GetBondType(), 1)))
         if u > 0 and (u - 1, 2) in glob and (u, 0) in glob:
-            bonds.append((glob[(u - 1, 2)], glob[(u, 0)], 1))                                    # the peptide bond C(i-1) - N(i)
+            bonds.append((glob[(u - 1, 2)], glob[(u, 0)], 1))                                    # the peptide bond C(i-1) - N(i): a bond of the system, not a feature (two conformers)
         centres_local.append([(glob[(u, c)], [glob[(u, x.GetIdx())] for x in m.GetAtomWithIdx(c).GetNeighbors() if (u, x.GetIdx()) in glob])
                               for c in stereo_atoms(ccds[r]) if (u, c) in glob])
-    n = len(coords)
-    degree = np.zeros(n, dtype=np.int64)
-    for i, j, _ in bonds:
-        degree[i] += 1
-        degree[j] += 1
     x = torch.from_numpy(np.stack(coords)).float()
     x = x - x.mean(0)
     centre, nbrs = [], []
-    for per_unit in centres_local:
-        for c, nb in per_unit:
+    for per_res in centres_local:
+        for c, nb in per_res:
             if len(nb) in (3, 4):
                 centre.append(c)
                 nbrs.append(sorted(nb) + [-1] * (4 - len(nb)))
     centre_t, nbrs_t = torch.tensor(centre, dtype=torch.int64), torch.tensor(nbrs, dtype=torch.int64)
     sign = torch.sign(signed_volume(x, centre_t, nbrs_t)).float()
-    out = {k: torch.tensor(v) for k, v in feats.items() if k != "degree"}
-    out.update({"degree": torch.from_numpy(degree), "bonds": torch.tensor(bonds), "coords": x, "stereo_center": centre_t, "stereo_nbrs": nbrs_t, "stereo_sign": sign,
-               "residue_index": torch.arange(start, start + crop), "chain": torch.zeros(crop, dtype=torch.int64)})
-    out = add_graph_features(out)
-    return add_reference(out, torch.from_numpy(np.stack(refs)).float(), out["unit"].clone(), seed=start)      # a residue is a conformer: one frame per residue
+    out = {k: torch.tensor(v) for k, v in feats.items()}
+    conformer = out["atom_to_token"].clone()                                                     # a residue is a token and a conformer: one frame per residue
+    out.update({"bonds": torch.tensor(bonds), "x_gt": x, "stereo_center": centre_t, "stereo_nbrs": nbrs_t, "stereo_sign": sign, "atom_to_conformer": conformer,
+                "ref_pos": random_frames(torch.from_numpy(np.stack(refs)).float(), conformer, seed=start),
+                "restype": torch.tensor([STANDARD.index(ccds[r]) for r in range(start, start + crop)]),
+                "residue_index": torch.arange(start, start + crop), "asym_id": torch.zeros(crop, dtype=torch.int64)})
+    return add_features(out)
 
 
 def window_meta(ccds, mask, start: int, crop: int) -> List[Tuple[str, str, int, str]]:

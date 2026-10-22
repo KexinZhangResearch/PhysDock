@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 from pomelo.models.primitives import geometry as G
-from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear, TypedRMSNorm, mask_pairs
+from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear, TypedNorm, mask_pairs
 
 KINDS = G.KINDS
 FLIP = {"0e": "0o", "0o": "0e", "1o": "1e", "1e": "1o"}
@@ -44,10 +44,30 @@ def weighted_sum(beta: torch.Tensor, v: torch.Tensor, kind: str) -> torch.Tensor
     return torch.einsum("hij,jhd->ihd", beta, v) if kind in G.SCALAR_KINDS else torch.einsum("hij,jhdc->ihdc", beta, v)
 
 
+def head_norm(h: Dict[str, torch.Tensor], weight: nn.ParameterDict, eps: float = 1e-5) -> Dict[str, torch.Tensor]:
+    """the query / key norm of a typed attention (PhysDock's RMSNorm of q and k per head): in every head the scalars (0e, 0o) divided by their RMS, the vectors (1o, 1e) by the RMS of
+    their components, apart (so that the scalar logit of a pair does not depend on the vectors, which only count between tokens of one frame), then a learned scale per channel (the
+    three components of a vector share it). h {kind: [..., H, d(, 3)]}"""
+    out = {}
+    for kinds in (G.SCALAR_KINDS, G.VECTOR_KINDS):
+        part = {k: h[k] for k in kinds if k in h}
+        if not part:
+            continue
+        ss = sum(v.square().sum(-1) if k in G.SCALAR_KINDS else v.square().sum((-1, -2)) for k, v in part.items())
+        n = sum(v.shape[-1] if k in G.SCALAR_KINDS else 3 * v.shape[-2] for k, v in part.items())
+        r = torch.rsqrt(ss / n + eps)                                                               # [..., H]
+        out.update({k: v * (r[..., None] if k in G.SCALAR_KINDS else r[..., None, None]) * (weight[k] if k in G.SCALAR_KINDS else weight[k][:, None]) for k, v in part.items()})
+    return out
+
+
+DIRECTION_LENGTH = 2.0              # the direction messages are squashed to at most 2 (8 Angstrom in the units of the coordinates of the model, 4 Angstrom)
+
+
 def direction_message(beta: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
     """sum_j beta[h, i, j] (c_j - c_i) -> [N, H, 3], without the [N, N, 3] relative positions: sum_j beta_ij c_j - c_i sum_j beta_ij.
     The centres should be centred (the layer does it) so that the two terms are of the size of the differences."""
-    return torch.einsum("hij,jc->ihc", beta, centers) - centers[:, None, :] * beta.sum(-1).T[..., None]
+    m = torch.einsum("hij,jc->ihc", beta, centers) - centers[:, None, :] * beta.sum(-1).T[..., None]
+    return G.squash(m, DIRECTION_LENGTH)                    # a weighted mean of displacements is as long as the molecule: bounded, as every input of a layer
 
 
 class TypedAttention(nn.Module):
@@ -61,12 +81,15 @@ class TypedAttention(nn.Module):
         if any(c % heads for c in mult_s.values()):
             raise ValueError(f"every channel count {dict(mult_s)} must be divisible by the number of heads {heads}")
         self.mult_s, self.heads = dict(mult_s), heads
-        self.norm = TypedRMSNorm(self.mult_s)
+        self.norm = TypedNorm(self.mult_s)
+        self.norm_z = TypedNorm({k: mult_z[k] for k in ("0e", "0o")}, affine=False)               # the pair state of the logits and gates (PhysDock's LayerNormPairBias)
         self.q = TypedLinear(self.mult_s, self.mult_s, bias=False)
         self.k = TypedLinear(self.mult_s, self.mult_s, bias=False)
         self.v0, self.ve = TypedLinear(self.mult_s, self.mult_s), TypedLinear(self.mult_s, self.mult_s)
         self.vo = TypedLinear(self.mult_s, {FLIP[k]: c for k, c in self.mult_s.items()})        # values of the opposite parity, for the odd gate
         self.dim = sum(c // heads * (1 if k in G.SCALAR_KINDS else 3) for k, c in self.mult_s.items())     # D of q . k
+        self.q_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in self.mult_s.items()})
+        self.k_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in self.mult_s.items()})
         self.d_0o = self.mult_s["0o"] // heads
         self.bias_e = nn.Linear(mult_z["0e"], heads, bias=False)                                  # b_h(z_0e)
         self.key_o = nn.Linear(mult_z["0o"], heads * self.d_0o, bias=False)                         # 0o -> 0o: no bias
@@ -76,8 +99,9 @@ class TypedAttention(nn.Module):
         self.gate = nn.Linear(self.mult_s["0e"], sum(self.mult_cat.values()))                      # output gates (even), one per channel
         self.out = TypedLinear(self.mult_cat, self.mult_s, zero_init=zero_init)
 
-    def forward(self, s: Feats, z: Feats, centers: torch.Tensor, mask: torch.Tensor, same: torch.Tensor = None, attn_mask: torch.Tensor = None) -> Feats:
-        """
+    def forward(self, s: Feats, z: Feats, centers: torch.Tensor, mask: torch.Tensor, same: torch.Tensor = None, attn_mask: torch.Tensor = None, normed: bool = False) -> Feats:
+        """normed: s is normalised already (by the AdaLN of a DiT block). z is normalised here (no affine: the linear maps that read it have their own scale).
+
         s: {kind: [N, C(, 3)]}; z: {"0e": [N, N, Cz0e], "0o": [N, N, Cz0o]}; centers [N, 3] (the centre of every unit; equivariant: Q c + t); mask [N] (1 = real).
         same [N, N] (bool): the pairs of units that are in the same frame (the same conformer). The vectors of two units can only be combined (dot products in the logit,
         aggregation of vector values, direction messages) when they are in one frame, so every vector term is multiplied by `same`; the scalars (0e, 0o) of all pairs are used.
@@ -93,11 +117,12 @@ class TypedAttention(nn.Module):
         c = torch.where(valid[:, None], centers, torch.zeros_like(centers))
         c = c - c.sum(0) / valid.sum().clamp(min=1)                                               # the centre of the real units at 0
         c = torch.where(valid[:, None], c, torch.zeros_like(c))
-        x = {k: torch.where(valid.reshape(N, *([1] * (v.dim() - 1))), v, torch.zeros_like(v)) for k, v in self.norm(s).items()}
+        x = {k: torch.where(valid.reshape(N, *([1] * (v.dim() - 1))), v, torch.zeros_like(v)) for k, v in (s if normed else self.norm(s)).items()}
+        z = mask_pairs(self.norm_z(mask_pairs({k: z[k] for k in ("0e", "0o")}, valid)), valid)
 
         q, k = self.q(x), self.k(x)
-        qh = {kind: split_heads(q[kind], kind, H) for kind in KINDS}
-        kh = {kind: split_heads(k[kind], kind, H) for kind in KINDS}
+        qh = head_norm({kind: split_heads(q[kind], kind, H) for kind in KINDS}, self.q_norm)
+        kh = head_norm({kind: split_heads(k[kind], kind, H) for kind in KINDS}, self.k_norm)
         flat = lambda h, kinds: torch.cat([h[kind].flatten(2) for kind in kinds], -1)                  # [N, H, D_kinds]
         zo = self.key_o(z["0o"]).reshape(N, N, H, self.d_0o)
         logit = ((torch.einsum("ihd,jhd->hij", flat(qh, G.SCALAR_KINDS), flat(kh, G.SCALAR_KINDS))
@@ -142,8 +167,10 @@ class TypedTriangleAttention(nn.Module):
             raise ValueError("the pair representation needs 0e and 0o with channels divisible by the heads")
         self.heads, self.starting, self.d_o = heads, starting, co // heads
         self.dim = (c0 + co) // heads
-        self.norm = TypedRMSNorm(mult_z)
+        self.norm = TypedNorm(mult_z)
         self.q, self.k = TypedLinear(mult_z, mult_z, bias=False), TypedLinear(mult_z, mult_z, bias=False)
+        self.q_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in mult_z.items()})
+        self.k_norm = nn.ParameterDict({k: nn.Parameter(torch.ones(c // heads)) for k, c in mult_z.items()})
         self.v0, self.ve = TypedLinear(mult_z, mult_z, bias=False), TypedLinear(mult_z, mult_z, bias=False)
         self.vo = TypedLinear(mult_z, {"0o": c0, "0e": co}, bias=False)
         self.bias_e = nn.Linear(c0, heads, bias=False)
@@ -160,13 +187,15 @@ class TypedTriangleAttention(nn.Module):
         if not self.starting:
             z = {k: v.transpose(0, 1) for k, v in z.items()}
         x = mask_pairs(self.norm(z), valid)
-        q, k = self.q(x), self.k(x)
         heads = lambda t: t.reshape(N, N, H, -1)
-        q_cat = torch.cat([heads(q["0e"]), heads(q["0o"])], -1)                                 # [i, j, H, D]
-        k_cat = torch.cat([heads(k["0e"]), heads(k["0o"])], -1)                                 # [i, k, H, D]
+        q, k = self.q(x), self.k(x)
+        q = head_norm({kind: heads(v) for kind, v in q.items()}, self.q_norm)
+        k = head_norm({kind: heads(v) for kind, v in k.items()}, self.k_norm)
+        q_cat = torch.cat([q["0e"], q["0o"]], -1)                                               # [i, j, H, D]
+        k_cat = torch.cat([k["0e"], k["0o"]], -1)                                               # [i, k, H, D]
         logit = (torch.einsum("ijhd,ikhd->hijk", q_cat, k_cat) * self.dim ** -0.5
                  + self.bias_e(x["0e"]).permute(2, 0, 1)[:, None]                                # the bias of the edge jk
-                 + torch.einsum("ijhd,jkhd->hijk", heads(q["0o"]), self.key_o(x["0o"]).reshape(N, N, H, self.d_o)))
+                 + torch.einsum("ijhd,jkhd->hijk", q["0o"], self.key_o(x["0o"]).reshape(N, N, H, self.d_o)))
         ok = (valid[:, None, None] & valid[None, :, None] & valid[None, None, :])[None]
         alpha = torch.where(ok, torch.softmax(logit.masked_fill(~ok, MASKED), -1), torch.zeros_like(logit))
         beta_e = alpha * torch.sigmoid(self.gate_e(x["0e"])).permute(2, 0, 1)[:, None]

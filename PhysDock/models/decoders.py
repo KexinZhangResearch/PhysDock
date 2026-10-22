@@ -61,8 +61,8 @@ class AllAtomDecoder(nn.Module):
             # rms ~3e3 and grows in training (16 -> 110 in 4500 steps), and its scale decides the token stream
             self.cond_s = nn.Sequential(RMSNorm(c_s, eps), Linear(c_s, c_s, bias=False))
             self.cond_z = nn.Sequential(RMSNorm(c_z, eps), Linear(c_z, c_z, bias=False))
-            # the token stream also predicts a displacement (copied to the atoms of its token) on top of the atom stream's: a coarse and a fine part,
-            # and a short path from the token DiT to the output; it starts as a no-op
+            # the token stream also predicts a displacement (copied to the atoms of its token) on top of the atom stream's: a coarse (per token) and a
+            # fine (per atom) part, and a short path from the token DiT to the output; it starts as a no-op
             self.token_out = nn.Sequential(RMSNorm(c_s, eps), Linear(c_s, 3, bias=False, init="final"))
         if atom_decay is not None:
             unknown = set(atom_decay) - {"radius", "strength", "learnable"}
@@ -113,6 +113,4 @@ class AllAtomDecoder(nn.Module):
             x = x + self.linear_upscale(xs)[:, batch["atom_to_token"]]                                     # to atoms
             x = self.atom_dit_decoder(x, cond.atom_bias_decoder, t, cond.atom_valid, pos, radius)
             out = self.linear_r(self.norm_r(x))
-            if not self.legacy:
-                out = out + self.token_out(xs)[:, batch["atom_to_token"]]
-            return out
+            return out if self.legacy else out + self.token_out(xs)[:, batch["atom_to_token"]]

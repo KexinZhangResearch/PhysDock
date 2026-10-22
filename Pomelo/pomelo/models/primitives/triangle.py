@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from pomelo.models.primitives import geometry as G
-from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear, TypedRMSNorm, mask_pairs, mask_rows, pair_valid
+from pomelo.models.primitives.irreps import Feats, Mult, TypedLinear, TypedNorm, mask_pairs, mask_rows, pair_valid
 
 def directions(centers: torch.Tensor, valid: torch.Tensor, length_scale: float, same: torch.Tensor = None) -> torch.Tensor:
     """w_hat[i, j] = (c_j - c_i) / sqrt(l^2 + |c_j - c_i|^2): [N, N, 3], a polar vector, bounded by 1, smooth at 0; zero for padded units, and for the pairs that are not in the same
@@ -38,7 +38,7 @@ class PairFromSingle(nn.Module):
         super().__init__()
         _need(mult_s, mult_z)
         self.length_scale = length_scale
-        self.norm = TypedRMSNorm(mult_s)
+        self.norm = TypedNorm(mult_s)
         proj = {k: channels for k in mult_s}
         self.proj_a, self.proj_b = TypedLinear(mult_s, proj), TypedLinear(mult_s, proj)
         self.out = TypedLinear({"0e": 6 * channels, "0o": 7 * channels}, mult_z, zero_init=zero_init)
@@ -82,7 +82,7 @@ class TypedTriangleMultiplication(nn.Module):
         _need(mult_s, mult_z)
         c, self.outgoing, self.length_scale = channels, outgoing, length_scale
         sc = {"0e": c, "0o": c}
-        self.norm_z, self.norm_u = TypedRMSNorm(mult_z), TypedRMSNorm({"1o": mult_s["1o"]})          # of s only the polar vectors are read
+        self.norm_z, self.norm_u = TypedNorm(mult_z), TypedNorm({"1o": mult_s["1o"]})          # of s only the polar vectors are read
         self.a_scalar, self.b_scalar = TypedLinear(mult_z, sc, bias=False), TypedLinear(mult_z, sc, bias=False)
         self.a_gate, self.b_gate = nn.Linear(mult_z["0e"], c), nn.Linear(mult_z["0e"], c)
         self.a_ce, self.b_ce = nn.Linear(mult_z["0e"], c, bias=False), nn.Linear(mult_z["0e"], c, bias=False)
@@ -90,7 +90,7 @@ class TypedTriangleMultiplication(nn.Module):
         self.b_cx = nn.Linear(mult_z["0e"], c, bias=False)
         self.proj_u = TypedLinear({"1o": mult_s["1o"]}, {"1o": c}, bias=False)
         cat = {"0e": 4 * c, "0o": 4 * c}
-        self.norm_out = TypedRMSNorm(cat)
+        self.norm_out = TypedNorm(cat)
         self.lin_out = TypedLinear(cat, mult_z, bias=False, zero_init=zero_init)
         self.gate_out = nn.Linear(mult_z["0e"], sum(mult_z.values()))
         self.split = list(mult_z.values())

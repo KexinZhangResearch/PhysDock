@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from pomelo.models.primitives import geometry as G
 from pomelo.models.primitives.attentions import TypedAttention, TypedTriangleAttention
-from pomelo.models.primitives.irreps import (Feats, GeometricProduct, Mult, TypedLinear, TypedRMSNorm, add, mask_pairs, mask_rows)
+from pomelo.models.primitives.irreps import (Feats, GeometricProduct, Mult, TypedLinear, TypedNorm, add, mask_pairs, mask_rows)
 from pomelo.models.primitives.triangle import PairFromSingle, TypedTriangleMultiplication
 
 
@@ -20,13 +20,14 @@ class TypedTransition(nn.Module):
     def __init__(self, mult: Mult, expansion: float = 8 / 3, zero_init: bool = False) -> None:
         super().__init__()
         self.hidden = {k: max(1, int(round(expansion * c))) for k, c in mult.items() if c}
-        self.norm = TypedRMSNorm(mult)
+        self.norm = TypedNorm(mult)
         self.w1 = TypedLinear(mult, self.hidden, bias=False)
         self.w3 = nn.Linear(mult["0e"], sum(self.hidden.values()), bias=False)            # the 0e half of the SwiGLU and the gates of the other kinds
         self.w2 = TypedLinear(self.hidden, mult, bias=False, zero_init=zero_init)
 
-    def forward(self, x: Feats) -> Feats:
-        x = self.norm(x)
+    def forward(self, x: Feats, normed: bool = False) -> Feats:
+        """normed: x is normalised already (by the AdaLN of a DiT block)"""
+        x = x if normed else self.norm(x)
         u = self.w1(x)
         b = self.w3(x["0e"]).split(list(self.hidden.values()), dim=-1)
         h = {}

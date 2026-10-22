@@ -182,15 +182,15 @@ class Evoformer(Stack):
 
 
 class PairFormerBlock(PairUpdate, nn.Module):
-    """outer_product: the single stream writes to the pair stream at the start of every block (z + the outer product of two projections of s,
-    OuterProductMean over a one-row "MSA"), so that what s learns from z in one block reaches z in the next; without it (the released
-    parameters) the information flows from z to s only (the attention bias)."""
+    """outer_product (optional, off in the released parameters and by default): the single stream writes to the pair stream at the start of the block
+    (z + the outer product of two projections of s, OuterProductMean over a one-row "MSA"); the output layer starts at zero, so the block starts as
+    without it. Otherwise the information flows from z to s only (the attention bias)."""
 
     def __init__(self, c_s: int, c_z: int, inf: float, eps: float, outer_product: bool = False) -> None:
         super().__init__()
         if outer_product:
             self.outer_product = OuterProductMean(c_s, c_z, eps)
-            self.outer_product.linear_o.weight.data.zero_()      # starts as a no-op (the output is RMS-normalised: with eps 1e-5 the backward gain is 300)
+            self.outer_product.linear_o.weight.data.zero_()      # the output is RMS-normalised: with eps 1e-5 the backward gain at zero is 300
         self.build_pair(c_z, inf, eps)
         self.attention = AttentionWithBias(c_s, c_z, inf, eps)
         self.transition = RMSNormSwiGLUFFN(c_s, eps)
