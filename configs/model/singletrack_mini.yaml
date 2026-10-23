@@ -1,0 +1,7 @@
+# SingleTrack (PhysDock/singletrack) in place of PhysDock's encoder and decoder: Pomelo's inputs flattened into one non-equivariant track (SimpleFold-like DiT),
+# at about the size of pomelo_mini. Everything outside the network is mini_p2's.   python scripts/train/train.py model=singletrack_mini
+defaults:
+  - mini_p2
+  - _self_
+
+singletrack: mini

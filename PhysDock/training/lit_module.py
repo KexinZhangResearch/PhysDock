@@ -58,6 +58,9 @@ class PhysDockLitModule(L.LightningModule):
         if model.get("pomelo"):
             from PhysDock.pomelo import Pomelo
             self.model = Pomelo(**model)
+        elif model.get("singletrack"):
+            from PhysDock.singletrack import SingleTrack
+            self.model = SingleTrack(**model)
         else:
             self.model = PhysDock(**model)
         if init_from:

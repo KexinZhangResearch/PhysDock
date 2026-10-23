@@ -9,6 +9,7 @@ weights:
 alpha_ligand: 10.0              # ligand weight in the x_mse superposition (1 + alpha_ligand)
 ligand_align_weight: 1000.0     # ligand_mse superposition: ligand atoms x, other atoms 1 / x
 max_clamp_distance: 15.0
+align_grad: true               # the gradient through the superposition of x_mse / ligand_mse (false: detached, AF3)
 distogram:
   min_bin: 3.25
   max_bin: 50.75

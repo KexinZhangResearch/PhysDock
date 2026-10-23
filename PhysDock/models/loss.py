@@ -25,7 +25,7 @@ def edm_weight(t_hat: torch.Tensor) -> torch.Tensor:
     return (t_hat ** 2 + 1) / t_hat ** 2 / 3
 
 
-def aligned_mse(x_denoised, x_gt, align_weights, mse_mask) -> torch.Tensor:
+def aligned_mse(x_denoised, x_gt, align_weights, mse_mask, align_grad: bool = True) -> torch.Tensor:
     """Squared error after superposing x_gt onto every sample, with the gradient through the superposition (PhysDock2): the superposition
     weights (1 + alpha_ligand on the ligand) differ from the uniform error weights, so the superposition is not the minimiser of the error and its
     gradient is not zero; detached (AF3), the 100-system overfit stalls at x_mse ~0.39 where this reaches 0.15 by step 1600.
@@ -35,11 +35,13 @@ def aligned_mse(x_denoised, x_gt, align_weights, mse_mask) -> torch.Tensor:
         x_gt: [N_atom, 3]
         align_weights: [N_atom] weights of the superposition
         mse_mask: [N_atom] atoms averaged in the error
+        align_grad: False: the superposition detached (AF3, the behaviour before the fix)
 
     Returns:
         [S] mean squared error per sample
     """
-    x_gt_aligned = weighted_rigid_align(x_denoised * (align_weights > 0)[..., None], x_gt, align_weights)
+    with torch.set_grad_enabled(align_grad and torch.is_grad_enabled()):
+        x_gt_aligned = weighted_rigid_align(x_denoised * (align_weights > 0)[..., None], x_gt, align_weights)
     sq = torch.norm(x_denoised - x_gt_aligned, dim=-1) ** 2
     return masked_mean(mse_mask[None], sq, dim=-1)
 
@@ -101,10 +103,11 @@ class PhysDockLoss(nn.Module):
         ligand_align_weight: ligand_mse superposes on the ligand (ligand atoms this weight, other atoms 1 / it)
         max_clamp_distance: smooth lDDT pair cutoff (Angstrom)
         distogram: {min_bin, max_bin, no_bins}
+        align_grad: the gradient through the superposition of the aligned MSE terms (False: detached, as AF3)
     """
 
     def __init__(self, sigma_data: float, weights, alpha_ligand: float, ligand_align_weight: float,
-                 max_clamp_distance: float, distogram) -> None:
+                 max_clamp_distance: float, distogram, align_grad: bool = True) -> None:
         super().__init__()
         self.sigma_data = sigma_data
         self.weights = dict(weights)
@@ -112,6 +115,7 @@ class PhysDockLoss(nn.Module):
         self.ligand_align_weight = ligand_align_weight
         self.max_clamp_distance = max_clamp_distance
         self.distogram = dict(distogram)
+        self.align_grad = align_grad
 
     def forward(self, outputs, batch):
         """
@@ -147,10 +151,10 @@ class PhysDockLoss(nn.Module):
             terms = {}
             if self.weights.get("x_mse"):
                 align = atom_mask * (1 + self.alpha_ligand * is_lig)
-                terms["x_mse"] = (aligned_mse(x, x_gt, align, atom_mask) * w_t).mean()
+                terms["x_mse"] = (aligned_mse(x, x_gt, align, atom_mask, self.align_grad) * w_t).mean()
             if self.weights.get("ligand_mse"):
                 align = atom_mask / self.ligand_align_weight + is_lig * self.ligand_align_weight
-                terms["ligand_mse"] = (aligned_mse(x, x_gt, align, is_lig) * w_t).mean()
+                terms["ligand_mse"] = (aligned_mse(x, x_gt, align, is_lig, self.align_grad) * w_t).mean()
             if self.weights.get("smooth_lddt") or self.weights.get("within_smooth_lddt"):
                 terms["smooth_lddt"], terms["within_smooth_lddt"] = smooth_lddt(
                     x * self.sigma_data, x_gt * self.sigma_data, atom_mask, batch["atom_to_conformer"], self.max_clamp_distance)
