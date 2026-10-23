@@ -11,6 +11,11 @@ pocket_dist_type: ligand        # ligand: distance to any ligand atom / ligand_c
 use_pocket: true
 use_key_res: true
 use_x_gt_ligand_as_ref_pos: false   # ablation only
+use_msa_profile: true           # false: target_feat without the MSA profile and deletion mean (restype one-hot only)
+single_ligand: false            # true: only the largest single-component ligand chain (other ligands and glycans dropped)
+templ_atom: pseudo_beta         # atom of the template distogram: pseudo_beta | centre (CA for amino acids)
+use_token_bonds: true           # false: token_bonds are 0
+use_sym_id: true                # false: sym_id is 0
 # training only (random pocket / key-residue settings, crop and template augmentation)
 train_pocket_type_atom_ratio: 0.5
 train_pocket_cutoff_ligand_min: 6.0
@@ -24,6 +29,7 @@ train_shuffle_sym_id: true
 train_spatial_crop_ligand_ratio: 0.2
 train_spatial_crop_interface_ratio: 0.4
 train_spatial_crop_interface_threshold: 15.0
+train_crop_ligand_centre: false # true: every training crop centred on the centre of the largest ligand
 train_charility_augmentation_ratio: 0.1
 train_use_template_ratio: 0.25  # prob. that the template is used
 train_template_mask_max_ratio: 0.4

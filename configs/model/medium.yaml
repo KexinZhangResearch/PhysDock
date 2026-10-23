@@ -60,6 +60,7 @@ diffusion:
   time_sampler:                   # training noise levels: ln(s) ~ N(mean, std^2)
     mean: -1.2
     std: 1.5
+    min_of: 1                     # > 1: the smallest of min_of draws (ablation: 2)
   noise_schedule:                 # Karras schedule of the sampler; s_min 4e-3 as in the released code
     s_min: 4.0e-3
     s_max: 160.0

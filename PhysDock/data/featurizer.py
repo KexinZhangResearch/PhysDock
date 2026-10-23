@@ -59,6 +59,11 @@ class FeatureConfig:
     use_pocket: bool = True
     use_key_res: bool = True
     use_x_gt_ligand_as_ref_pos: bool = False    # ablation only
+    use_msa_profile: bool = True                # False: the MSA profile and deletion mean of target_feat are 0 (the restype one-hot only)
+    single_ligand: bool = False                 # True: only the largest single-component ligand chain is kept (other ligands, glycans dropped)
+    templ_atom: str = "pseudo_beta"             # atom of every token in the template distogram: "pseudo_beta" or "centre" (CA for amino acids)
+    use_token_bonds: bool = True                # False: token_bonds are 0
+    use_sym_id: bool = True                     # False: sym_id is 0
     train_pocket_type_atom_ratio: float = 0.5
     train_pocket_cutoff_ligand_min: float = 6.0
     train_pocket_cutoff_ligand_max: float = 12.0
@@ -71,6 +76,7 @@ class FeatureConfig:
     train_spatial_crop_ligand_ratio: float = 0.2
     train_spatial_crop_interface_ratio: float = 0.4
     train_spatial_crop_interface_threshold: float = 15.0
+    train_crop_ligand_centre: bool = False      # True: every crop is centred on the centre of the largest ligand (no random crop centre)
     train_charility_augmentation_ratio: float = 0.1
     train_use_template_ratio: float = 0.25      # prob. that the template is used
     train_template_mask_max_ratio: float = 0.4
@@ -194,6 +200,9 @@ class SystemFeaturizer:
         _check_system(data, entry.path)
         receptor_ids = [c for c in data if not c.isdigit()]
         ligand_ids = [c for c in data if c.isdigit()]
+        if cfg.single_ligand:
+            single = [c for c in ligand_ids if len(data[c]["ccds"]) == 1 and len(_present_atoms(data[c]))]
+            ligand_ids = [max(single, key=lambda c: (len(_present_atoms(data[c])), c))] if single else []
 
         # 3. pocket of every receptor chain (from the reference ligand)
         ligand_atoms = [_present_atoms(data[c]) for c in ligand_ids]
@@ -395,6 +404,8 @@ class SystemFeaturizer:
             centre = centre_override
         elif not self.training and len(ligand_atoms) == 1:
             centre = np.mean(np.concatenate(ligand_atoms, axis=0), axis=0)[None]
+        elif self.training and cfg.train_crop_ligand_centre and ligand_atoms:
+            centre = np.mean(max(ligand_atoms, key=len), axis=0)[None]
         elif seed < (cfg.train_spatial_crop_ligand_ratio if self.training else 1.0) and ligand_atoms:
             centre = random.choice(np.concatenate(ligand_atoms, axis=0))[None]
         elif seed < cfg.train_spatial_crop_ligand_ratio + cfg.train_spatial_crop_interface_ratio and len(set(tok_asym)) > 1:
@@ -544,8 +555,10 @@ class SystemFeaturizer:
         """Target and MSA features, padding (training), template, final protein/ligand flags."""
         cfg = self.config
         t = {k: torch.from_numpy(v) for k, v in feats.items()}
-        t["target_feat"] = torch.cat([F.one_hot(t["restype"].long(), 32).float(), t.pop("profile"),
-                                      t.pop("deletion_mean")[..., None]], dim=-1)
+        profile, deletion_mean = t.pop("profile"), t.pop("deletion_mean")
+        if not cfg.use_msa_profile:
+            profile, deletion_mean = torch.zeros_like(profile), torch.zeros_like(deletion_mean)
+        t["target_feat"] = torch.cat([F.one_hot(t["restype"].long(), 32).float(), profile, deletion_mean[..., None]], dim=-1)
 
         msa, deletion = t.pop("msa"), t.pop("deletion_matrix")
         pi = torch.acos(torch.zeros(1)) * 2
@@ -566,7 +579,7 @@ class SystemFeaturizer:
 
         z_mask = t["token_mask"][None] * t["token_mask"][:, None]
         protein2d = t["is_protein"][None] * t["is_protein"][:, None]
-        x_beta = t["x_gt"][t["token_to_pseudo_beta_atom"]]
+        x_beta = t["x_gt"][t["token_to_pseudo_beta_atom" if cfg.templ_atom == "pseudo_beta" else "token_to_centre_atom"]]
         dgram = dgram_from_positions(x_beta, no_bins=39) * protein2d[..., None] * z_mask[..., None]
         templ_pair = z_mask * protein2d
         t["templ_mask"] = torch.tensor(1, dtype=torch.float32)
@@ -578,6 +591,10 @@ class SystemFeaturizer:
                 t["templ_mask"] = torch.tensor(0, dtype=torch.float32)
         t["templ_feat"] = torch.cat([dgram * templ_pair[..., None], templ_pair[..., None]], dim=-1)
 
+        if not cfg.use_token_bonds:
+            t["token_bonds"] = torch.zeros_like(t["token_bonds"])
+        if not cfg.use_sym_id:
+            t["sym_id"] = torch.zeros_like(t["sym_id"])
         is_short_poly = t.pop("is_short_poly")
         t["is_protein"] = t["is_protein"] + is_short_poly
         t["is_ligand"] = t["is_ligand"] - is_short_poly

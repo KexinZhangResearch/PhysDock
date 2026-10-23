@@ -80,6 +80,8 @@ def main(cfg: DictConfig) -> None:
         if cfg.compile:
             _compile_method(module.loss_fn, "terms")
     else:
+        if cfg.trainer.precision == "16-mixed":
+            module.model.dit.half = True                         # float16: the whole network under autocast (the decoder too), the loss in float32
         set_checkpointing(module.model, to_dict(cfg.checkpointing))
         if cfg.compile:
             compile_training(module.model, module.loss_fn)      # region by region, memory as eager

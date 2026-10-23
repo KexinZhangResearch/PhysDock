@@ -26,7 +26,9 @@ def edm_weight(t_hat: torch.Tensor) -> torch.Tensor:
 
 
 def aligned_mse(x_denoised, x_gt, align_weights, mse_mask) -> torch.Tensor:
-    """Squared error after superposing x_gt onto every sample (no gradient through the superposition).
+    """Squared error after superposing x_gt onto every sample, with the gradient through the superposition (PhysDock2): the superposition
+    weights (1 + alpha_ligand on the ligand) differ from the uniform error weights, so the superposition is not the minimiser of the error and its
+    gradient is not zero; detached (AF3), the 100-system overfit stalls at x_mse ~0.39 where this reaches 0.15 by step 1600.
 
     Args:
         x_denoised: [S, N_atom, 3]
@@ -37,8 +39,7 @@ def aligned_mse(x_denoised, x_gt, align_weights, mse_mask) -> torch.Tensor:
     Returns:
         [S] mean squared error per sample
     """
-    with torch.no_grad():
-        x_gt_aligned = weighted_rigid_align(x_denoised * (align_weights > 0)[..., None], x_gt, align_weights)
+    x_gt_aligned = weighted_rigid_align(x_denoised * (align_weights > 0)[..., None], x_gt, align_weights)
     sq = torch.norm(x_denoised - x_gt_aligned, dim=-1) ** 2
     return masked_mean(mse_mask[None], sq, dim=-1)
 

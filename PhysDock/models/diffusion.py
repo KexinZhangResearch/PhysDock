@@ -40,12 +40,14 @@ class KarrasNoiseSchedule:
 
 @dataclass(frozen=True)
 class LogNormalTimeSampler:
-    """Training noise levels: ln(s) ~ N(mean, std^2)."""
+    """Training noise levels: ln(s) ~ N(mean, std^2); min_of > 1: the smallest of min_of such draws (more weight on low noise)."""
     mean: float
     std: float
+    min_of: int = 1
 
     def __call__(self, shape, dtype, device) -> torch.Tensor:
-        return torch.exp(torch.normal(0, 1, shape, device=device, dtype=dtype) * self.std + self.mean)
+        z = torch.normal(0, 1, (self.min_of, *shape), device=device, dtype=dtype).amin(0)
+        return torch.exp(z * self.std + self.mean)
 
 
 @dataclass(frozen=True)
