@@ -7,13 +7,17 @@ features, no attention: as SimpleFold, everything is per atom and per token.
                    into the frame of every noisy sample by the proper Kabsch rotation of their conformer (PhysDock.pomelo.primitives.alignment)
   tokens  scalars  0e = linear(target_feat) + linear(key_res_feat) + linear(the flags) + the mean over the atoms of silu(linear(atom 0e))
                    (PhysDock's TokenEmbedder.embed);  0o = linear(the mean over the atoms of the atom 0o)
-          vectors  the template positions of the tokens (PhysDock's self-template: the pseudo-beta atom of x_gt, where templ_feat says the template is there; one frame for
-                   all of them): they enter the vector channels of the tokens in the DiT, rotated into the frame of every noisy sample by one Kabsch rotation
+          vectors  the template positions of the tokens (PhysDock's self-template: the pseudo-beta atom of x_gt, where templ_feat says the template is there; every chain
+                   in a frame of its own, chain_template): they enter the vector channels of the tokens in the DiT, rotated into the frame of every noisy sample by the
+                   Kabsch rotation of their chain
   flags    0 / 1 scalars of where an input is there (ATOM_FLAGS into the atom 0e, TOKEN_FLAGS into the token 0e): an absent vector (no template for a ligand
            token, no x - token centre for a one-atom token, no neighbour vectors / signed volume without bonded neighbours, no next / previous residue at a chain end)
            or scalar (no pocket, no key residues, no template in this structure) is a 0 that the network cannot tell from a measured 0 otherwise
+  bond graph  the ligands (every component tokenised per atom): RWSE, the bonds of every edge feature (bond type, order, ring, conjugated, aromatic) into the atom 0e,
+           then a few rounds of messages along the bonds (PhysDock.pomelo.relations)
   and what the attentions of the DiT need: the boolean key masks of the atoms and of the tokens [N, N] (the padding; the diagonal always kept), the RoPE angles (residue
-  index, chain) of the tokens and of the atoms (by their token), the pool matrix atoms -> tokens.
+  index, chain) of the tokens and of the atoms (by their token), the codes of the chain and the entity (the same chain / entity as
+  columns of q and k), the pool matrix atoms -> tokens.
 
 Padding: PhysDock pads the crop; a padded atom has atom_to_token 0 and atom_to_conformer 0, so every reduction goes through atom_mask / token_mask.
 """
@@ -25,8 +29,12 @@ import torch.nn.functional as F
 
 from PhysDock.pomelo.configs import Config
 from PhysDock.pomelo.primitives.attentions import rope_angles
+from PhysDock.pomelo.relations import BondMessagePassing, bond_graph, chain_entity_codes, graph_features, n_graph_features
+from PhysDock.utils.tensor_utils import group_random_augmentation
 
-REF_SCALE = 0.25                        # Angstrom -> units of 4 Angstrom (the unit of the positions of the DiT)
+TEMPL_TRANS = 1.0                       # Angstrom: std of the random translation of every chain of the template (as the reference conformers)
+REF_TRANS = 1.0                         # Angstrom: std of the random translation of every reference conformer
+REF_SCALE = 0.25                        # Angstrom -> units of 4 Angstrom (the unit of the positions of the DiT; the template)
 BOND_CUTOFF = 2.05                      # Angstrom: a covalent bond between heavy atoms in a reference conformer (C-Br 1.94; the shortest 1-3 distance is ~2.2)
 REF_DIM, POS, CHIRALITY = 167, slice(0, 3), slice(158, 161)
 USED = ["pocket_used", "key_res_used", "template_used"]                                              # of the structure: the input was given at all
@@ -42,6 +50,13 @@ def masked_group_mean(x: torch.Tensor, group: torch.Tensor, mask: torch.Tensor, 
     s = torch.zeros(*x.shape[:-2], n, 3, dtype=x.dtype, device=x.device).index_add(-2, group, x * m[:, None])
     c = torch.zeros(n, dtype=x.dtype, device=x.device).index_add(0, group, m)
     return (s / c.clamp(min=1)[:, None])[..., group, :]
+
+
+def chain_template(pos: torch.Tensor, chain: torch.Tensor, on: torch.Tensor, trans: float = TEMPL_TRANS) -> torch.Tensor:
+    """the template of every chain on its own: pos [Nt, 3] (Angstrom), chain [Nt] (asym_id, < Nt), on [Nt] (the tokens with a template) -> every chain centred on its
+    template tokens, rotated by a random rotation and shifted by N(0, trans^2) of its own [Nt, 3] (Angstrom, 0 where there is no template): the positions of the chains
+    relative to each other are not in it (as PhysDock's template distogram, within the chains only)"""
+    return group_random_augmentation(pos, chain, on, trans)
 
 
 def neighbours(ref_pos: torch.Tensor, conformer: torch.Tensor, atom_mask: torch.Tensor):
@@ -76,7 +91,9 @@ class ConditionEmbedder(nn.Module):
         super().__init__()
         self.cfg = cfg
         ma, ms = cfg.mult_a, cfg.mult_s
-        self.linear_c = nn.Linear(len(ATOM_COLUMNS) + N_ATOM_FLAGS, ma["0e"], bias=False)            # ref_feat and the atom flags
+        self.n_graph = n_graph_features(cfg.rwse_steps) if cfg.ligand_graph else 0
+        self.linear_c = nn.Linear(len(ATOM_COLUMNS) + N_ATOM_FLAGS + self.n_graph, ma["0e"], bias=False)  # ref_feat, the atom flags, the bond graph
+        self.bond_mp = BondMessagePassing(ma["0e"], cfg.bond_mp_rounds) if cfg.ligand_graph and cfg.bond_mp_rounds else None
         self.linear_v = nn.Linear(ma["0e"], ma["0o"], bias=False)                                     # times V_ref: 0e -> 0o (no bias)
         self.linear_a = nn.Linear(ma["0e"], ms["0e"])
         self.linear_ao = nn.Linear(ma["0o"], ms["0o"], bias=False)
@@ -86,11 +103,11 @@ class ConditionEmbedder(nn.Module):
     @staticmethod
     def template(b, tm: torch.Tensor):
         """the template positions [Nt, 3] (units of 4 A) and where there are (PhysDock's self-template: templ_feat[i, i, 39], templ_mask): b["templ_pos"] if given, else the
-        pseudo-beta atom of x_gt (the positions of PhysDock's template distogram)"""
+        pseudo-beta atom of x_gt (the positions of PhysDock's template distogram); every chain centred, randomly rotated and shifted on its own (chain_template)"""
         dt = tm.dtype
         pos = b["templ_pos"] if "templ_pos" in b else b["x_gt"][b["token_to_pseudo_beta_atom"]]
         on = (torch.diagonal(b["templ_feat"][..., 39]) > 0) & (tm > 0) & (b["templ_mask"] > 0)
-        return pos.to(dt) * REF_SCALE * on[:, None].to(dt), on
+        return chain_template(pos, b["asym_id"], on).to(dt) * REF_SCALE, on
 
     @staticmethod
     def flags(b, am, tm, a2t, conf, onehot, has3, nbr_mean, templ_on, nxt, prv):
@@ -116,9 +133,10 @@ class ConditionEmbedder(nn.Module):
         ref_p, conf_p, am_p, a2t_p = pad_rows(ref, npad), pad_rows(conf, npad), pad_rows(am, npad), pad_rows(a2t, npad)
         with torch.autocast(ref.device.type, enabled=False):                                         # the geometry in float32, under any autocast
             ref_p = ref_p.to(torch.promote_types(ref_p.dtype, torch.float32))
+            ref_p = group_random_augmentation(ref_p, conf_p, am_p, REF_TRANS)                       # every conformer centred, randomly rotated and shifted on its own (Angstrom)
             idx, has3, nbr_mean = neighbours(ref_p, conf_p, am_p)
             v_ref = signed_volume(ref_p, idx, has3)
-            ref_s = ref_p * REF_SCALE * am_p[:, None]
+            ref_s = ref_p / self.cfg.sigma_data_conformer * am_p[:, None]                              # units of sigma_data_conformer (4 A: the unit of the DiT)
             ref_nbr = torch.where(nbr_mean.sum(1, keepdim=True) > 0, ref_s - nbr_mean @ ref_s, torch.zeros_like(ref_s))    # r - mean of the bonded neighbours (frame-free difference)
         onehot = F.one_hot(a2t_p, nt).T.to(dt) * am_p[None]                                            # [Nt, Na]: the real atoms of every token
         pool = onehot / onehot.sum(1, keepdim=True).clamp(min=1)
@@ -127,15 +145,24 @@ class ConditionEmbedder(nn.Module):
         both = (chain[None] == chain[:, None]) & templ_on[None] & templ_on[:, None]
         nxt, prv = ((res[None] - res[:, None] == 1) & both).to(dt), ((res[None] - res[:, None] == -1) & both).to(dt)     # [i, j]: j is the next / previous residue of i
         flags_a, flags_s = self.flags(b, am_p, tm, a2t_p, conf_p, onehot, has3, nbr_mean, templ_on, nxt, prv)
-        a0e = self.linear_c(torch.cat([pad_rows(b["ref_feat"][:, ATOM_COLUMNS].to(dt), npad), flags_a], -1)) * am_p[:, None]
+        atom_in = [pad_rows(b["ref_feat"][:, ATOM_COLUMNS].to(dt), npad), flags_a]
+        if self.n_graph:                                                                               # the bond graph (per token: a ligand token is one atom)
+            adj, edges = bond_graph(b, tm)
+            atom_in.append(graph_features(adj, edges, self.cfg.rwse_steps).to(dt)[a2t_p] * am_p[:, None])
+        a0e = self.linear_c(torch.cat(atom_in, -1)) * am_p[:, None]
+        if self.bond_mp is not None:                                                                   # messages along the bonds (the tokens in the graph only)
+            h = pool @ a0e
+            a0e = a0e + (self.bond_mp(h, edges) - h)[a2t_p] * am_p[:, None]
         a0o = v_ref[:, None] * self.linear_v(a0e)
         s0e = (self.linear_target_feat(b["target_feat"].to(dt)) + self.linear_key_res_feat(b["key_res_feat"].to(dt)) + self.linear_flags_s(flags_s)
                + pool @ F.silu(self.linear_a(a0e))) * tm[:, None]
         s0o = self.linear_ao(pool @ a0o)
         angles = rope_angles(res, chain, self.cfg.rope_res, self.cfg.rope_chain, dt)
         eye = torch.eye(nt, dtype=torch.bool, device=tm.device)
+        codes = chain_entity_codes(b, tm, self.cfg.chain_codes).to(dt) if self.cfg.chain_codes else None
         return {"a": {"0e": a0e, "0o": a0o}, "s": {"0e": s0e, "0o": s0o}, "v_ref": v_ref, "idx": idx, "has3": has3, "nbr_mean": nbr_mean, "pool": pool,
                 "atom_to_token": a2t_p, "atom_to_conformer": conf_p, "atom_mask": am_p, "token_mask": tm, "n_atoms": na,
-                "ref": ref_s, "ref_nbr": ref_nbr, "templ_pos": templ_pos, "templ_on": templ_on, "templ_next": nxt, "templ_prev": prv,
-                "atom_geo": {"mask": (am_p > 0)[None].expand(na, na) | torch.eye(na, dtype=torch.bool, device=tm.device), "angles": angles[a2t_p]},
-                "token_geo": {"mask": (tm > 0)[None].expand(nt, nt) | eye, "angles": angles}}
+                "ref": ref_s, "ref_nbr": ref_nbr, "templ_pos": templ_pos, "templ_on": templ_on, "templ_chain": chain, "templ_next": nxt, "templ_prev": prv,
+                "atom_geo": {"mask": (am_p > 0)[None].expand(na, na) | torch.eye(na, dtype=torch.bool, device=tm.device), "angles": angles[a2t_p],
+                             **({"codes": codes[a2t_p] * am_p[:, None]} if codes is not None else {})},
+                "token_geo": {"mask": (tm > 0)[None].expand(nt, nt) | eye, "angles": angles, **({"codes": codes} if codes is not None else {})}}

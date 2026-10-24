@@ -1,3 +1,8 @@
+> [!WARNING]
+> **This repository is under active development.** New features (new networks, features and training settings) are being added on `master` and may change without notice.
+> The original PhysDock of the bioRxiv manuscript ([10.1101/2025.04.28.650887](https://doi.org/10.1101/2025.04.28.650887)) is the tag
+> [`Pub`](https://github.com/KexinZhangResearch/PhysDock/tree/Pub).
+
 <div align="center">
 
 # PhysDock

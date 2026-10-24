@@ -1,0 +1,8 @@
+# SingleTrackFold (PhysDock/singletrack/fold.py): SimpleFold's inputs and layout without the protein language model (Fourier xyz of the noisy sample and of ref_pos,
+# axial RoPE on (conformer, ref_pos) and (residue, entity, chain, sym), length condition). Everything outside the network is mini_p2's.
+#   python scripts/train/train.py model=singletrack_fold_mini     (ref_pos: every conformer augmented in the model, / sigma_data_conformer 4 A)
+defaults:
+  - mini_p2
+  - _self_
+
+singletrack_fold: fold_mini

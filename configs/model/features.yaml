@@ -1,4 +1,5 @@
-# Featurisation (PhysDock.data.FeatureConfig). Defaults = released inference pipeline.
+# Featurisation (PhysDock.data.FeatureConfig). Defaults = released inference pipeline, except that the pocket and key residues are not given
+# (use_pocket / use_key_res false, train_use_pocket_ratio / train_use_key_res_ratio 0; the inference configs and scripts set them explicitly).
 crop_size: 256                  # max tokens of the spatial crop; null = no crop
 atom_crop_size: 2048            # max atoms of the crop
 msa_rows: 16384                 # rows of the merged MSA (padded by resampling rows)
@@ -8,14 +9,15 @@ key_res_random_mask_ratio: 0.5  # prob. that a key-residue flag is masked (also 
 pocket_type: atom               # atom: any atom within the cutoff / ca: CA within the cutoff
 pocket_cutoff: 6.0              # Angstrom
 pocket_dist_type: ligand        # ligand: distance to any ligand atom / ligand_centre: to the ligand centre
-use_pocket: true
-use_key_res: true
+use_pocket: false
+use_key_res: false
 use_x_gt_ligand_as_ref_pos: false   # ablation only
 use_msa_profile: true           # false: target_feat without the MSA profile and deletion mean (restype one-hot only)
 single_ligand: false            # true: only the largest single-component ligand chain (other ligands and glycans dropped)
 templ_atom: pseudo_beta         # atom of the template distogram: pseudo_beta | centre (CA for amino acids)
 use_token_bonds: true           # false: token_bonds are 0
 use_sym_id: true                # false: sym_id is 0
+augment_ref_pos: true           # false: the reference conformers in their library frame (SimpleFold), not rotated and shifted per conformer
 # training only (random pocket / key-residue settings, crop and template augmentation)
 train_pocket_type_atom_ratio: 0.5
 train_pocket_cutoff_ligand_min: 6.0
@@ -23,8 +25,8 @@ train_pocket_cutoff_ligand_max: 12.0
 train_pocket_cutoff_ligand_centre_min: 10.0
 train_pocket_cutoff_ligand_centre_max: 16.0
 train_pocket_dist_type_ligand_ratio: 0.5
-train_use_pocket_ratio: 0.5
-train_use_key_res_ratio: 0.5
+train_use_pocket_ratio: 0.0
+train_use_key_res_ratio: 0.0
 train_shuffle_sym_id: true
 train_spatial_crop_ligand_ratio: 0.2
 train_spatial_crop_interface_ratio: 0.4

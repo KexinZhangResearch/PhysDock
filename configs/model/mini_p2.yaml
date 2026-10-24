@@ -5,6 +5,7 @@ defaults:
 
 encoder:
   inf: 1.0e8
+  sigma_data_conformer: ${global.sigma_data_conformer}   # ref_pos out of ref_feat, every conformer centred, randomly rotated and shifted, / 4 A (as the other models)
   no_blocks_atom: 3
   no_blocks_evoformer: 0
   no_blocks_pairformer: 8

@@ -22,6 +22,7 @@ from torch.nn.attention import sdpa_kernel
 from PhysDock.pomelo.dit import GEOM, W0, W_MAX_LOG, PomeloDiT, TimestepEmbedding
 from PhysDock.pomelo.embedders import pad_rows
 from PhysDock.pomelo.primitives.attentions import BACKENDS, apply_rope, distance_columns, pad8
+from PhysDock.pomelo.relations import code_columns
 from PhysDock.singletrack.configs import Config
 
 ATOM_IN = {"0e": 2, "0o": 1, "1o": 6, "1e": 3}         # the noisy features of PomeloDiT.noisy_features
@@ -45,9 +46,11 @@ class Attention(nn.Module):
         self.out = nn.Linear(c, c, bias=False)
         self.scale = self.d ** -0.5
         self.backend = "math"
+        # w_h [same chain], w'_h [same entity] in the logits (PhysDock.pomelo.relations: codes in q and k); 0 at the start
+        self.code_weight = nn.Parameter(torch.zeros(heads, 2)) if cfg.chain_codes else None
 
     def forward(self, x: torch.Tensor, pos: torch.Tensor, w, geo) -> torch.Tensor:
-        """x [B, N, c] (normalised), pos [B, N, 3], w [B, H] or None, geo: angles [N, F], mask [N, N] bool -> [B, N, c]"""
+        """x [B, N, c] (normalised), pos [B, N, 3], w [B, H] or None, geo: angles [N, F], mask [N, N] bool, codes [N, 2 code_dim] (with chain_codes) -> [B, N, c]"""
         b, n, _ = x.shape
         q, k, v = self.qkv(x).unflatten(-1, (3, self.heads, self.d)).unbind(2)                  # [B, N, H, d]
         q, k = apply_rope(self.q_norm(q), geo["angles"]), apply_rope(self.k_norm(k), geo["angles"])
@@ -56,6 +59,9 @@ class Attention(nn.Module):
             p = pos[:, None].expand(b, self.heads, n, 3).to(q.dtype)
             qd, kd = distance_columns(p, p, w[:, :, None, None].to(q.dtype), self.scale)
             q, k = torch.cat([q, qd], -1), torch.cat([k, kd], -1)
+        if self.code_weight is not None:
+            qc, kc = code_columns(geo["codes"], self.code_weight, self.scale, b, q.dtype)
+            q, k = torch.cat([q, qc], -1), torch.cat([k, kc], -1)
         with sdpa_kernel(BACKENDS[self.backend]):
             o = F.scaled_dot_product_attention(pad8(q), pad8(k), pad8(v), attn_mask=geo["mask"], scale=self.scale)[..., :self.d]
         o = o.transpose(1, 2).flatten(-2)

@@ -8,4 +8,6 @@ c_z: 128                        # pair channels
 c_m: 256                        # MSA channels
 inf: 1.0e9                      # masked attention logits get -inf
 eps: 1.0e-5                     # norm epsilon (the released parameters: 1e-8, see model/released.yaml; a small eps amplifies the gradient of a near-zero row by 1 / sqrt(eps))
+sigma_data_conformer: 4.0       # Angstrom: scale of the reference conformers where a model config uses it (mini_p2; ligands: coordinate std ~3 A, radius of gyration
+                                # ~4 A, residues ~1.3 / 2 A); Pomelo / SingleTrack / SingleTrackFold: Config.sigma_data_conformer, the same 4
 distogram_bins: 39              # distogram head (model) and distogram loss

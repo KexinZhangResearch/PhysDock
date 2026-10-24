@@ -22,6 +22,13 @@ class Config:
     centroid_length: float = 16.0   # the input vector x - centroid squashed at this length (units of 4 A)
     direction_length: float = 8.0   # the direction messages squashed at this length (units of 4 A)
     zero_gates: bool = True         # the AdaLN gates start at about 0 (AdaLN-Zero, as PhysDock)
+    ligand_graph: bool = True       # the bond graph of the ligands as atom features (PhysDock.pomelo.relations): RWSE, the bonds of every edge feature, message passing
+    rwse_steps: int = 16            # RWSE: the return probabilities after 1 .. rwse_steps steps
+    bond_mp_rounds: int = 2         # rounds of the message passing along the bonds (0: none)
+    chain_codes: int = 16           # the same chain / the same entity as columns of q and k (random orthonormal codes of this size, exact up to this many chains /
+                                    # entities; 0: none); the chain index stays in the RoPE (rope_chain)
+    sigma_data_conformer: float = 4.0   # Angstrom: the scale of the reference conformers (ligands: coordinate std ~3 A, radius of gyration ~4 A; residues ~1.3 / 2 A);
+                                        # Pomelo / SingleTrack: keep 4, the unit of the positions of the DiT
 
     def __post_init__(self):
         self.mult_a = dict(self.mult_a or {"0e": 128, "0o": 32, "1o": 32, "1e": 16})

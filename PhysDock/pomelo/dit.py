@@ -14,7 +14,7 @@ The vectors of the inputs (every one squashed: bounded):
               (the reference conformer, rotated into the frame of the sample by the proper Kabsch rotation R_k of its conformer, PhysDock.pomelo.primitives.alignment)
           1e  the cross products (x - neighbour mean) x (x - conformer centre), (x - neighbour mean) x (x - token centre), R_k (r - neighbour mean) x R_k (r - centre)
           0o  V_x: the signed volume of the neighbour triple of every atom in the noisy sample;  0e  V_ref * V_x (does the sample have the hand of the reference?), |x - token centre|
-  tokens  1o  R_t (template - its centre), R_t (next - this), R_t (previous - this) (the template, rotated by one proper Kabsch rotation onto the token centres of the sample)
+  tokens  1o  R_c (template - its chain centre), R_c (next - this), R_c (previous - this) (the template, rotated by the proper Kabsch rotation of its chain onto the token centres of the sample)
           1e  their cross product (the normal of the local template frame)
 
 The exchange between the kinds (s -> s), in every block: GeometricProduct (all products of two kinds up to l = 1 and the signed volume, within a row), the attention (q . k over
@@ -62,7 +62,7 @@ class DiTBlock(nn.Module):
         self.mult = {k: c for k, c in mult.items() if c}
         self.product = GeometricProduct(self.mult, self.mult, product_channels)
         self.product.norm = None                                                                 # the AdaLN normalises (the sublayers are called normed)
-        self.attention = GlobalAttention(self.mult, heads, cfg.rope_res, cfg.rope_chain, cfg.direction_length)
+        self.attention = GlobalAttention(self.mult, heads, cfg.rope_res, cfg.rope_chain, cfg.direction_length, chain_codes=cfg.chain_codes)
         self.transition = TypedTransition(self.mult)
         self.transition.norm = None
         self.norm = TypedNorm(self.mult, affine=False)
@@ -158,12 +158,12 @@ class PomeloDiT(nn.Module):
 
     def template_features(self, centre_t: torch.Tensor, c: Dict[str, object]) -> Feats:
         """the token inputs from the template: centre_t [B, Nt, 3] (the token centres of the sample) -> {1o [B, Nt, 3, 3], 1e [B, Nt, 1, 3]}: the template positions rotated
-        into the frame of the sample by one proper Kabsch rotation (all template tokens: one frame), centred; the directions to the next and previous residue; their cross
-        product (the normal of the local template frame). 0 where there is no template"""
-        on, tp = c["templ_on"], c["templ_pos"]
+        into the frame of the sample by the proper Kabsch rotation of their chain (every chain a frame of its own: the chains relative to each other are not in it), centred
+        on their chain; the directions to the next and previous residue; their cross product (the normal of the local template frame). 0 where there is no template"""
+        on, tp, chain = c["templ_on"], c["templ_pos"], c["templ_chain"]
         nt = on.shape[0]
-        r, t_c = kabsch(centre_t, tp, torch.zeros(nt, dtype=torch.long, device=tp.device), on, 1)
-        rt = r[:, :1].expand(-1, nt, 3, 3)
+        r, t_c = kabsch(centre_t, tp, chain, on, nt)
+        rt = r[:, chain]
         step = lambda m: torch.where(m.sum(1, keepdim=True) > 0, (m @ tp) / m.sum(1, keepdim=True).clamp(min=1) - tp, torch.zeros_like(tp))    # the mean if an index repeats
         nxt, prv = step(c["templ_next"]), step(c["templ_prev"])
         vc, vn, vp = G.squash(rotate(rt, t_c), self.cfg.centroid_length), G.squash(rotate(rt, nxt), 1.0), G.squash(rotate(rt, prv), 1.0)

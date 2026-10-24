@@ -111,6 +111,28 @@ def uniform_random_rotation(size, device):
     return torch.stack([e0, e1, torch.cross(e0, e1, dim=-1)], dim=-2)
 
 
+def random_rotation(n: int, dtype, device) -> torch.Tensor:
+    """n uniformly random proper rotations [n, 3, 3] from unit quaternions, orthogonal to the precision of dtype"""
+    w, x, y, z = torch.nn.functional.normalize(torch.randn(n, 4, dtype=dtype, device=device), dim=-1).unbind(-1)
+    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).unflatten(-1, (3, 3))
+
+
+def group_random_augmentation(pos: torch.Tensor, group: torch.Tensor, mask: torch.Tensor, trans: float = 1.0) -> torch.Tensor:
+    """every group of rows on its own (the reference conformers, the chains of a template): centred on its rows in mask, rotated by a random rotation and shifted by
+    N(0, trans^2) of its own; 0 at the rows not in mask. pos [N, 3], group [N] (indices < N), mask [N] -> [N, 3], in float32 (float64 kept)"""
+    with torch.autocast(pos.device.type, enabled=False):
+        pos = pos.to(torch.promote_types(pos.dtype, torch.float32))
+        m = mask.to(pos.dtype)
+        n = pos.shape[0]
+        total = torch.zeros(n, 3, dtype=pos.dtype, device=pos.device).index_add(0, group, pos * m[:, None])
+        count = torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add(0, group, m)
+        centred = pos - (total / count.clamp(min=1)[:, None])[group]
+        shift = torch.randn(n, 3, dtype=pos.dtype, device=pos.device) * trans
+        return (torch.einsum("nij,nj->ni", random_rotation(n, pos.dtype, pos.device)[group], centred) + shift[group]) * m[:, None]
+
+
 def centre_random_augmentation(x: torch.Tensor, atom_mask: torch.Tensor, s: float = 1.0) -> torch.Tensor:
     """Centre on the masked mean, random rotation, random translation N(0, s^2) per sample, in float32 (a bf16
     rotation moves the atoms by ~0.06 Angstrom, the size of the smallest noise level).

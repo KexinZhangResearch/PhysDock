@@ -64,6 +64,7 @@ class FeatureConfig:
     templ_atom: str = "pseudo_beta"             # atom of every token in the template distogram: "pseudo_beta" or "centre" (CA for amino acids)
     use_token_bonds: bool = True                # False: token_bonds are 0
     use_sym_id: bool = True                     # False: sym_id is 0
+    augment_ref_pos: bool = True                # False: the reference conformers in their library frame (SimpleFold), not rotated and shifted per conformer
     train_pocket_type_atom_ratio: float = 0.5
     train_pocket_cutoff_ligand_min: float = 6.0
     train_pocket_cutoff_ligand_max: float = 12.0
@@ -520,7 +521,8 @@ class SystemFeaturizer:
         feats["msa"] = raw["msa"][:, token_to_conformer]
         feats["deletion_matrix"] = raw["deletion_matrix"][:, token_to_conformer]
 
-        ref_pos = centre_random_augmentation_np_apply(ref_pos, atom_to_conformer).astype(np.float32)
+        if self.config.augment_ref_pos:
+            ref_pos = centre_random_augmentation_np_apply(ref_pos, atom_to_conformer).astype(np.float32)
         ref_feat[:, :3] = ref_pos
 
         token_bonds = np.zeros([n_token, n_token], dtype=np.float32)

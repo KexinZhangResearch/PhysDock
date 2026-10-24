@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from PhysDock.models.primitives import (AtomTransformer, Evoformer, Linear, Pairformer, RMSNorm, SwiGLUFFN,
                                         Triangleformer)
-from PhysDock.utils.tensor_utils import pair_mask, segment_mean_pool
+from PhysDock.utils.tensor_utils import group_random_augmentation, pair_mask, segment_mean_pool
 
 
 class Conditions(NamedTuple):
@@ -89,12 +89,18 @@ class RelPosEmbedder(nn.Module):
 
 
 class AtomEmbedder(nn.Module):
-    """Embed the reference conformers into atom (a) and atom-pair (ap) features, then run the atom transformer."""
+    """Embed the reference conformers into atom (a) and atom-pair (ap) features, then run the atom transformer.
 
-    def __init__(self, ref_dim: int, c_a: int, c_ap: int, inf: float, eps: float, no_blocks_atom: int, legacy: bool = False) -> None:
+    sigma_data_conformer (default None: the released structure, ref_feat with the positions, the pair features in Angstrom): the positions are taken out of ref_feat, every
+    reference conformer is centred, randomly rotated and shifted (1 A) on its own and divided by sigma_data_conformer (Angstrom) for the pair features."""
+
+    REF_TRANS = 1.0                     # Angstrom: std of the random translation of every reference conformer (with sigma_data_conformer)
+
+    def __init__(self, ref_dim: int, c_a: int, c_ap: int, inf: float, eps: float, no_blocks_atom: int, legacy: bool = False,
+                 sigma_data_conformer: float = None) -> None:
         super().__init__()
-        self.legacy = legacy
-        self.linear_c = Linear(ref_dim, c_a, bias=False)
+        self.legacy, self.sigma_data_conformer = legacy, sigma_data_conformer
+        self.linear_c = Linear(ref_dim - 3 if sigma_data_conformer else ref_dim, c_a, bias=False)
         self.linear_p = Linear(3, c_ap, bias=False)
         self.linear_d = Linear(1, c_ap, bias=False)
         if legacy:                       # the released parameters: a constant vector for the pairs of one conformer (redundant with the other pair features)
@@ -122,13 +128,15 @@ class AtomEmbedder(nn.Module):
 
     def embed(self, batch):
         """Atom and atom-pair features before the atom transformer: a [N_atom, c_a], ap [N_atom, N_atom, c_ap]"""
-        ref_pos = batch["ref_pos"]
+        ref_pos, ref_feat, conf = batch["ref_pos"], batch["ref_feat"], batch["atom_to_conformer"]
         with torch.no_grad():
+            if self.sigma_data_conformer:
+                ref_pos = group_random_augmentation(ref_pos, conf, batch["atom_mask"], self.REF_TRANS).to(ref_pos.dtype) / self.sigma_data_conformer
+                ref_feat = ref_feat[:, 3:]                                                        # without the positions
             d = ref_pos[:, None, :] - ref_pos[None, :, :]
-            conf = batch["atom_to_conformer"]
             # 1 for atom pairs of the same conformer
             v = (conf[:, None] == conf[None, :]).float()[..., None]
-        a = self.linear_c(batch["ref_feat"])
+        a = self.linear_c(ref_feat)
         ap = self.linear_c_l(F.relu(a))[:, None] + \
             self.linear_c_m(F.relu(a))[None, :]
         ap = ap + (self.linear_p(d) * v + self.linear_d(1 / (1 + torch.norm(d, dim=-1)[..., None])) * v)
@@ -192,15 +200,16 @@ class MSATemplEncoder(nn.Module):
     """Encoder of one structure; its output conditions every sample and denoising step of the decoder. (Nature Communications DiffusionConditioning)
 
     legacy=True is the structure of the released parameters; the current one differs in the atom attention of the encoder (within a conformer, no
-    linear_v). outer_product (optional, default off): the single stream writes to the pair stream in every Pairformer block."""
+    linear_v). outer_product (optional, default off): the single stream writes to the pair stream in every Pairformer block. sigma_data_conformer (optional, default
+    off; configs/model/mini_p2.yaml): the reference conformers without the positions in ref_feat, augmented and scaled per conformer (AtomEmbedder)."""
 
     def __init__(self, ref_dim: int, target_dim: int, msa_dim: int, c_a: int, c_ap: int, c_s: int, c_m: int, c_z: int,
                  inf: float, eps: float, no_blocks_atom: int, no_blocks_evoformer: int, no_blocks_pairformer: int,
                  no_blocks_template: int, templ_dim: int, key_res_dim: int, r_max: int, s_max: int,
-                 ligand_pair_dim: int, legacy: bool = False, outer_product: bool = False) -> None:
+                 ligand_pair_dim: int, legacy: bool = False, outer_product: bool = False, sigma_data_conformer: float = None) -> None:
         super().__init__()
         self.atom_embedder = AtomEmbedder(
-            ref_dim, c_a, c_ap, inf, eps, no_blocks_atom, legacy)
+            ref_dim, c_a, c_ap, inf, eps, no_blocks_atom, legacy, sigma_data_conformer)
         self.token_embedder = TokenEmbedder(target_dim, msa_dim, c_a, c_s, c_m, c_z, inf, eps, no_blocks_evoformer,
                                             no_blocks_pairformer, no_blocks_template, templ_dim, key_res_dim,
                                             r_max, s_max, ligand_pair_dim, legacy, outer_product)

@@ -1,0 +1,11 @@
+# PhysDock-base of the 4-model comparison (PhysDock-base, Pomelo, SingleTrack, SingleTrackFold; ~70M parameters each): mini_p2 (no Evoformer, ref_pos out of ref_feat,
+# augmented per conformer, / sigma_data_conformer) with Pairformer 9 and token DiT 7 (mini_p2: 8 / 6, 62.0M -> 70.2M).
+#   python scripts/train/train.py model=physdock_base
+defaults:
+  - mini_p2
+  - _self_
+
+encoder:
+  no_blocks_pairformer: 9
+decoder:
+  no_blocks_dit: 7

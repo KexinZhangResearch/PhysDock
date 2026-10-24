@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from PhysDock.pomelo.primitives import geometry as G
+from PhysDock.pomelo.relations import code_columns
 from PhysDock.pomelo.primitives.irreps import Feats, Mult, TypedLinear
 
 KINDS = G.KINDS
@@ -83,7 +84,7 @@ def distance_columns(pq: torch.Tensor, pk: torch.Tensor, w: torch.Tensor, scale:
 class _TypedAttention(nn.Module):
     """the shared part: typed q, k, v (one matmul per kind), the q / k norms, RoPE, the distance columns, the output gates and projection"""
 
-    def __init__(self, mult: Mult, heads: int, rope_res: int, rope_chain: int, direction_length: float, zero_init: bool = False) -> None:
+    def __init__(self, mult: Mult, heads: int, rope_res: int, rope_chain: int, direction_length: float, zero_init: bool = False, chain_codes: int = 0) -> None:
         super().__init__()
         if set(mult) != set(KINDS) or any(c % heads for c in mult.values()):
             raise ValueError(f"the stream needs the four kinds with channels {dict(mult)} divisible by the heads {heads}")
@@ -100,9 +101,12 @@ class _TypedAttention(nn.Module):
         self.mult_cat = {k: c + (heads if k == "1o" else 0) for k, c in self.mult.items()}          # + the direction message of every head
         self.gate = nn.Linear(self.mult["0e"], sum(self.mult_cat.values()))
         self.out = TypedLinear(self.mult_cat, self.mult, zero_init=zero_init)
+        # w_h [same chain], w'_h [same entity] in the logits (PhysDock.pomelo.relations: codes in q and k); 0 at the start
+        self.code_weight = nn.Parameter(torch.zeros(heads, 2)) if chain_codes else None
 
-    def project(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, angles: torch.Tensor):
-        """-> q, k [B, H, N, D + 4] (the kinds flattened, 0e first, then the distance columns), v [B, H, N, Dv + 3] (then the positions)"""
+    def project(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, angles: torch.Tensor, codes: torch.Tensor = None):
+        """-> q, k [B, H, N, D + 4 (+ 2 code_dim)] (the kinds flattened, 0e first, then the distance columns, then the chain / entity codes), v [B, H, N, Dv + 3] (then
+        the positions)"""
         H = self.heads
         b, n = pos.shape[:2]
         qkv = self.qkv(x)
@@ -112,7 +116,11 @@ class _TypedAttention(nn.Module):
         flat = lambda h: torch.cat([h[kd] if kd in G.SCALAR_KINDS else h[kd].flatten(-2) for kd in KINDS], -1).transpose(1, 2)
         p = pos[:, None].expand(b, H, n, 3)
         qd, kd = distance_columns(p, p, w[:, :, None, None], self.scale)
-        return torch.cat([flat(q), qd], -1), torch.cat([flat(k), kd], -1), torch.cat([flat(v), p], -1)
+        q, k = torch.cat([flat(q), qd], -1), torch.cat([flat(k), kd], -1)
+        if self.code_weight is not None:
+            qc, kc = code_columns(codes, self.code_weight, self.scale, b, q.dtype)
+            q, k = torch.cat([q, qc], -1), torch.cat([k, kc], -1)
+        return q, k, torch.cat([flat(v), p], -1)
 
     def sdpa(self, q, k, v, mask) -> torch.Tensor:
         dv = v.shape[-1]
@@ -139,5 +147,5 @@ class GlobalAttention(_TypedAttention):
 
     def forward(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, geo: Dict[str, torch.Tensor]) -> Feats:
         """x {kind: [B, N, ...]} (normalised), pos [B, N, 3] (centred), w [B, H] >= 0, geo: angles [N, F], mask [N, N] bool -> the update"""
-        q, k, v = self.project(x, pos, w, geo["angles"])
+        q, k, v = self.project(x, pos, w, geo["angles"], geo.get("codes"))
         return self.finish(x, self.sdpa(q, k, v, geo["mask"]).transpose(1, 2), pos)

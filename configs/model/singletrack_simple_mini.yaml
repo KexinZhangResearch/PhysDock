@@ -1,0 +1,7 @@
+# SingleTrackSimple (PhysDock/singletrack/simple.py): the single-track DiT with SimpleFold's plain inputs (ref_feat, noisy xyz, template xyz, RoPE, t; no protein
+# language model). Everything outside the network is mini_p2's.   python scripts/train/train.py model=singletrack_simple_mini
+defaults:
+  - mini_p2
+  - _self_
+
+singletrack_simple: simple_mini
