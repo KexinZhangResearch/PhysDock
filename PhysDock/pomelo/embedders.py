@@ -160,9 +160,12 @@ class ConditionEmbedder(nn.Module):
         angles = rope_angles(res, chain, self.cfg.rope_res, self.cfg.rope_chain, dt)
         eye = torch.eye(nt, dtype=torch.bool, device=tm.device)
         codes = chain_entity_codes(b, tm, self.cfg.chain_codes).to(dt) if self.cfg.chain_codes else None
+        ids = torch.stack([b["asym_id"], b["entity_id"]], -1).to(torch.int32)                      # [Nt, 2]: the triton attention (same chain / entity in the kernel)
+        n_valid_a, n_valid_t = (am_p > 0).sum().to(torch.int32).reshape(1), (tm > 0).sum().to(torch.int32).reshape(1)   # the padding is at the end
         return {"a": {"0e": a0e, "0o": a0o}, "s": {"0e": s0e, "0o": s0o}, "v_ref": v_ref, "idx": idx, "has3": has3, "nbr_mean": nbr_mean, "pool": pool,
                 "atom_to_token": a2t_p, "atom_to_conformer": conf_p, "atom_mask": am_p, "token_mask": tm, "n_atoms": na,
                 "ref": ref_s, "ref_nbr": ref_nbr, "templ_pos": templ_pos, "templ_on": templ_on, "templ_chain": chain, "templ_next": nxt, "templ_prev": prv,
                 "atom_geo": {"mask": (am_p > 0)[None].expand(na, na) | torch.eye(na, dtype=torch.bool, device=tm.device), "angles": angles[a2t_p],
-                             **({"codes": codes[a2t_p] * am_p[:, None]} if codes is not None else {})},
-                "token_geo": {"mask": (tm > 0)[None].expand(nt, nt) | eye, "angles": angles, **({"codes": codes} if codes is not None else {})}}
+                             "n_valid": n_valid_a, "ids": ids[a2t_p], **({"codes": codes[a2t_p] * am_p[:, None]} if codes is not None else {})},
+                "token_geo": {"mask": (tm > 0)[None].expand(nt, nt) | eye, "angles": angles, "n_valid": n_valid_t, "ids": ids,
+                              **({"codes": codes} if codes is not None else {})}}

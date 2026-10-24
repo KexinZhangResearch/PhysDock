@@ -74,7 +74,7 @@ def main(cfg: DictConfig) -> None:
     module = PhysDockLitModule(model=to_dict(cfg.model), loss=to_dict(cfg.loss), optim=optim,
                                init_from=cfg.init_from, val=to_dict(cfg.val), grad_stats=cfg.grad_stats)
     if any(cfg.model.get(k) for k in ("pomelo", "singletrack", "singletrack_simple", "singletrack_fold")):  # Pomelo / SingleTrack(Simple): their own blocks (no Stack), compiled per block; no activation checkpointing
-        if cfg.trainer.precision in ("16-mixed", "bf16-mixed"):
+        if cfg.trainer.precision in ("16-mixed", "bf16-mixed") and getattr(module.model, "kernel_backend", "torch") != "triton":
             module.model.set_attention_backend("efficient", "efficient")      # half precision: the memory-efficient SDPA kernel (no [N, N] logits)
         module.model.prepare_training(compile=cfg.compile)
         if cfg.compile:

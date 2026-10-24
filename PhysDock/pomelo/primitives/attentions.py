@@ -25,6 +25,7 @@ from PhysDock.pomelo.primitives.irreps import Feats, Mult, TypedLinear
 KINDS = G.KINDS
 BACKENDS = {"efficient": [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],          # the memory-efficient kernel (fp32 on the CUDA cores)
             "math": [SDPBackend.MATH]}                                                 # matmul + softmax + matmul (TF32 tensor cores)
+# "triton": PhysDock.pomelo.kernels.pomelo_attention, the distance and the chain / entity terms computed in the kernel (no extra columns of q and k)
 
 
 def split_heads(x: torch.Tensor, kind: str, heads: int) -> torch.Tensor:
@@ -104,23 +105,29 @@ class _TypedAttention(nn.Module):
         # w_h [same chain], w'_h [same entity] in the logits (PhysDock.pomelo.relations: codes in q and k); 0 at the start
         self.code_weight = nn.Parameter(torch.zeros(heads, 2)) if chain_codes else None
 
-    def project(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, angles: torch.Tensor, codes: torch.Tensor = None):
-        """-> q, k [B, H, N, D + 4 (+ 2 code_dim)] (the kinds flattened, 0e first, then the distance columns, then the chain / entity codes), v [B, H, N, Dv + 3] (then
-        the positions)"""
+    def heads_qkv(self, x: Feats, angles: torch.Tensor):
+        """-> q, k [B, H, N, D], v [B, H, N, Dv]: the kinds flattened (0e first), after the q / k norms and the RoPE"""
         H = self.heads
-        b, n = pos.shape[:2]
         qkv = self.qkv(x)
         part = lambda i: {kind: split_heads(t.chunk(3, -1 if kind in G.SCALAR_KINDS else -2)[i], kind, H) for kind, t in qkv.items()}
         q, k, v = head_norm(part(0), self.q_norm), head_norm(part(1), self.k_norm), part(2)
         q["0e"], k["0e"] = apply_rope(q["0e"], angles), apply_rope(k["0e"], angles)
         flat = lambda h: torch.cat([h[kd] if kd in G.SCALAR_KINDS else h[kd].flatten(-2) for kd in KINDS], -1).transpose(1, 2)
+        return flat(q), flat(k), flat(v)
+
+    def project(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, angles: torch.Tensor, codes: torch.Tensor = None):
+        """-> q, k [B, H, N, D + 4 (+ 2 code_dim)] (the kinds flattened, 0e first, then the distance columns, then the chain / entity codes), v [B, H, N, Dv + 3] (then
+        the positions)"""
+        H = self.heads
+        b, n = pos.shape[:2]
+        q, k, v = self.heads_qkv(x, angles)
         p = pos[:, None].expand(b, H, n, 3)
         qd, kd = distance_columns(p, p, w[:, :, None, None], self.scale)
-        q, k = torch.cat([flat(q), qd], -1), torch.cat([flat(k), kd], -1)
+        q, k = torch.cat([q, qd], -1), torch.cat([k, kd], -1)
         if self.code_weight is not None:
             qc, kc = code_columns(codes, self.code_weight, self.scale, b, q.dtype)
             q, k = torch.cat([q, qc], -1), torch.cat([k, kc], -1)
-        return q, k, torch.cat([flat(v), p], -1)
+        return q, k, torch.cat([v, p.to(v.dtype)], -1)
 
     def sdpa(self, q, k, v, mask) -> torch.Tensor:
         dv = v.shape[-1]
@@ -146,6 +153,15 @@ class GlobalAttention(_TypedAttention):
     """all pairs (the atoms, the tokens)"""
 
     def forward(self, x: Feats, pos: torch.Tensor, w: torch.Tensor, geo: Dict[str, torch.Tensor]) -> Feats:
-        """x {kind: [B, N, ...]} (normalised), pos [B, N, 3] (centred), w [B, H] >= 0, geo: angles [N, F], mask [N, N] bool -> the update"""
+        """x {kind: [B, N, ...]} (normalised), pos [B, N, 3] (centred), w [B, H] >= 0, geo: angles [N, F], mask [N, N] bool (torch backends) or n_valid [1] and
+        ids [N, 2] (triton) -> the update"""
+        if self.backend == "triton":
+            from PhysDock.pomelo.kernels import pomelo_attention
+            q, k, v = self.heads_qkv(x, geo["angles"])
+            b, n = pos.shape[:2]
+            v = torch.cat([v, pos[:, None].expand(b, self.heads, n, 3).to(v.dtype)], -1)
+            codes = self.code_weight is not None
+            o = pomelo_attention(q, k, v, geo["n_valid"], self.scale, pos, w, geo["ids"] if codes else None, self.code_weight if codes else None)
+            return self.finish(x, o.transpose(1, 2), pos)
         q, k, v = self.project(x, pos, w, geo["angles"], geo.get("codes"))
         return self.finish(x, self.sdpa(q, k, v, geo["mask"]).transpose(1, 2), pos)

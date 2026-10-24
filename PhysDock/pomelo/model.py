@@ -19,7 +19,7 @@ class Pomelo(nn.Module):
     """Pomelo(**model_config): model_config is PhysDock's (configs/model/mini_p2.yaml: num_augmentation_sample, diffusion, sigma_data; its encoder / decoder sections are not
     used) plus `pomelo`: a preset name of PhysDock.pomelo.configs ("mini", "tiny") or a dict of Config fields with an optional "preset"."""
 
-    def __init__(self, num_augmentation_sample: int, diffusion: dict, sigma_data: float, pomelo="mini", **physdock_only) -> None:
+    def __init__(self, num_augmentation_sample: int, diffusion: dict, sigma_data: float, pomelo="mini", backend: str = "torch", **physdock_only) -> None:
         super().__init__()
         from PhysDock.models.diffusion import build_diffuser
         self.cfg = preset(pomelo)
@@ -27,6 +27,11 @@ class Pomelo(nn.Module):
         self.diffuser = build_diffuser(diffusion)
         self.diffusion_conditioning = ConditionEmbedder(self.cfg)
         self.dit = PomeloDiT(self.cfg)
+        if backend not in ("torch", "triton"):
+            raise ValueError(f"backend must be torch or triton, got {backend!r}")
+        self.kernel_backend = backend                       # triton: PhysDock.pomelo.kernels (the model config's backend, as PhysDock's model.backend=triton)
+        if backend == "triton":
+            self.set_attention_backend("triton", "triton")
 
     def forward(self, batch):
         """Training step on one (padded) structure. Returns (normalised by sigma_data): x_gt [N_atom, 3], x_denoised [S, N_atom, 3], x_hat [S, N_atom, 3], t_hat [S],
@@ -52,7 +57,7 @@ class Pomelo(nn.Module):
         return x * self.sigma_data
 
     def set_attention_backend(self, atom: str = "math", token: str = "math") -> None:
-        """the SDPA backend of the atom and of the token attentions (PhysDock.pomelo.primitives.attentions.BACKENDS)"""
+        """the backend of the atom and of the token attentions: an SDPA backend of PhysDock.pomelo.primitives.attentions.BACKENDS or "triton" """
         for blk in [*self.dit.atom_enc, *self.dit.atom_dec]:
             blk.attention.backend = atom
         for blk in self.dit.token_blocks:
