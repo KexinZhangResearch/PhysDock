@@ -64,6 +64,7 @@ class FeatureConfig:
     templ_atom: str = "pseudo_beta"             # atom of every token in the template distogram: "pseudo_beta" or "centre" (CA for amino acids)
     use_token_bonds: bool = True                # False: token_bonds are 0
     use_sym_id: bool = True                     # False: sym_id is 0
+    use_template: bool = True                   # False: no self-template (templ_mask 0, templ_feat 0), in training and at inference
     augment_ref_pos: bool = True                # False: the reference conformers in their library frame (SimpleFold), not rotated and shifted per conformer
     train_pocket_type_atom_ratio: float = 0.5
     train_pocket_cutoff_ligand_min: float = 6.0
@@ -591,6 +592,9 @@ class SystemFeaturizer:
                 templ_pair = (bert[None] * bert[:, None]) * z_mask * protein2d
             else:
                 t["templ_mask"] = torch.tensor(0, dtype=torch.float32)
+        if not cfg.use_template:                                        # after the draws above: the random stream stays aligned
+            t["templ_mask"] = torch.tensor(0, dtype=torch.float32)
+            templ_pair = torch.zeros_like(templ_pair)
         t["templ_feat"] = torch.cat([dgram * templ_pair[..., None], templ_pair[..., None]], dim=-1)
 
         if not cfg.use_token_bonds:

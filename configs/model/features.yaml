@@ -17,6 +17,7 @@ single_ligand: false            # true: only the largest single-component ligand
 templ_atom: pseudo_beta         # atom of the template distogram: pseudo_beta | centre (CA for amino acids)
 use_token_bonds: true           # false: token_bonds are 0
 use_sym_id: true                # false: sym_id is 0
+use_template: true              # false: no self-template (templ_mask 0, templ_feat 0), in training and at inference
 augment_ref_pos: true           # false: the reference conformers in their library frame (SimpleFold), not rotated and shifted per conformer
 # training only (random pocket / key-residue settings, crop and template augmentation)
 train_pocket_type_atom_ratio: 0.5
